@@ -115,6 +115,102 @@ const loadEpisodeDetails = async (episodeId) => {
   return normalizeEpisode(data.response.episode);
 };
 
+const fallbackText = (value, fallback = "Unknown") => {
+  const text = String(value ?? "").trim();
+  return text.length > 0 ? text : fallback;
+};
+
+const limitField = (value, maxLength = 1000) => {
+  const text = fallbackText(value);
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+};
+
+const detectDevice = (userAgent = "") => {
+  const ua = userAgent.toLowerCase();
+
+  if (/bot|crawl|spider|slurp|facebookexternalhit|discordbot/.test(ua)) {
+    return "Bot / crawler";
+  }
+
+  if (/ipad|tablet/.test(ua)) {
+    return "Tablet";
+  }
+
+  if (/mobi|iphone|android/.test(ua)) {
+    return "Mobile";
+  }
+
+  return "Desktop";
+};
+
+const getClientInfo = (request) => {
+  const headers = request.headers;
+  const cf = request.cf ?? {};
+  const userAgent = headers.get("user-agent") ?? "";
+
+  return {
+    device: detectDevice(userAgent),
+    country: cf.country ?? headers.get("cf-ipcountry"),
+    region: cf.region,
+    city: cf.city,
+    timezone: cf.timezone,
+    colo: cf.colo,
+    asn: cf.asn,
+    organization: cf.asOrganization,
+    ip: headers.get("cf-connecting-ip") ?? headers.get("x-forwarded-for"),
+    referrer: headers.get("referer"),
+    language: headers.get("accept-language"),
+    userAgent
+  };
+};
+
+const notifyEpisodeView = (env, request, episode) => {
+  if (!env.DISCORD_WEBHOOK_URL) {
+    return Promise.resolve();
+  }
+
+  const url = new URL(request.url);
+  const client = getClientInfo(request);
+  const payload = {
+    username: podcast.name,
+    content: `Episode detail page viewed: ${episode.title}`,
+    allowed_mentions: { parse: [] },
+    embeds: [
+      {
+        title: episode.title,
+        url: url.href,
+        description: episode.summary,
+        thumbnail: { url: episode.image },
+        fields: [
+          { name: "Published", value: episode.publishedAt, inline: true },
+          { name: "Episode ID", value: episode.id, inline: true },
+          { name: "Device", value: client.device, inline: true },
+          { name: "Country", value: fallbackText(client.country), inline: true },
+          { name: "Region", value: fallbackText(client.region), inline: true },
+          { name: "City", value: fallbackText(client.city), inline: true },
+          { name: "Timezone", value: fallbackText(client.timezone), inline: true },
+          { name: "Cloudflare Colo", value: fallbackText(client.colo), inline: true },
+          { name: "Network", value: limitField(client.organization), inline: true },
+          { name: "ASN", value: fallbackText(client.asn), inline: true },
+          { name: "IP", value: fallbackText(client.ip), inline: true },
+          { name: "Language", value: limitField(client.language), inline: false },
+          { name: "Referrer", value: limitField(client.referrer, 900), inline: false },
+          { name: "Landing URL", value: limitField(url.href, 900), inline: false },
+          { name: "User Agent", value: limitField(client.userAgent), inline: false }
+        ]
+      }
+    ]
+  };
+
+  return fetch(env.DISCORD_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  }).catch((error) => {
+    console.error("Discord webhook notification failed", error);
+  });
+};
+
 const renderLinks = (links) =>
   links
     .map(
@@ -779,7 +875,7 @@ const renderEpisodePage = (episode) => `<!doctype html>
 </html>`;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const cacheControl = `public, max-age=${podcast.spreaker.cacheSeconds}`;
 
@@ -799,6 +895,8 @@ export default {
         }
 
         const episode = await loadEpisodeDetails(listEpisode.id);
+        ctx.waitUntil(notifyEpisodeView(env, request, episode));
+
         return new Response(renderEpisodePage(episode), {
           headers: {
             "content-type": "text/html;charset=UTF-8",

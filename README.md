@@ -26,6 +26,16 @@ npx wrangler secret put DISCORD_WEBHOOK_URL
 
 Episode detail pages send the Discord notification in the background with `ctx.waitUntil`, so page rendering does not wait for Discord.
 
+## Playback Analytics
+
+The Spreaker player reports play and pause transitions to Google Analytics and Meta Pixel with country-specific event names such as `play_US` and `pause_GB`. Event parameters include the episode ID, title, country code, playback position, and duration.
+
+Google Analytics uses the configured measurement ID in `src/podcast.config.js`. To enable the matching Facebook custom events, set the Meta Pixel ID as a Worker secret or variable:
+
+```bash
+npx wrangler secret put FACEBOOK_PIXEL_ID
+```
+
 ## Episode Content
 
 The password-protected `/admin/content` page uploads images, PDFs, and other supporting files to Cloudflare R2. Each file has a display title and description and appears on its episode detail page.

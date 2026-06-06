@@ -16,6 +16,8 @@ const escapeXml = (value) =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
 
+const safeJson = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
+
 const SPREAKER_API_BASE = "https://api.spreaker.com/v2";
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
@@ -455,6 +457,14 @@ const getClientInfo = (request) => {
     language: headers.get("accept-language"),
     userAgent
   };
+};
+
+const getCountryCode = (request) => {
+  const country = String(
+    request.cf?.country ?? request.headers.get("cf-ipcountry") ?? "XX"
+  ).toUpperCase();
+
+  return /^[A-Z]{2}$/.test(country) ? country : "XX";
 };
 
 const notifyEpisodeView = (env, request, episode) => {
@@ -910,6 +920,7 @@ const renderSiteHeader = ({ home = false, query = "" } = {}) => `
 
 const renderSpreakerPlayer = (episode) => `
   <a
+    id="spreaker-player-${escapeHtml(episode.id)}"
     class="spreaker-player"
     href="${escapeHtml(episode.spreakerUrl)}"
     data-resource="${escapeHtml(episode.spreakerResource)}"
@@ -927,6 +938,98 @@ const renderSpreakerPlayer = (episode) => `
     data-hide-download="true"
     data-title="${escapeHtml(episode.title)}"
   >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
+
+const renderPlaybackTracking = (episodes, countryCode) => {
+  const players = episodes.map((episode) => ({
+    elementId: `spreaker-player-${episode.id}`,
+    episodeId: episode.id,
+    episodeTitle: episode.title
+  }));
+
+  if (!players.length) {
+    return "";
+  }
+
+  return `
+    <script>
+      window.addEventListener('load', function () {
+        if (!window.SP || typeof window.SP.getWidget !== 'function') return;
+
+        var countryCode = ${safeJson(countryCode)};
+        var players = ${safeJson(players)};
+
+        function sendPlaybackEvent(type, episode, position, duration) {
+          var eventName = type + '_' + countryCode;
+          var parameters = {
+            event_type: type,
+            country_code: countryCode,
+            episode_id: episode.episodeId,
+            episode_title: episode.episodeTitle,
+            playback_position_ms: Math.round(Number(position) || 0),
+            playback_duration_ms: Math.round(Number(duration) || 0)
+          };
+
+          if (typeof window.gtag === 'function') {
+            window.gtag('event', eventName, parameters);
+          }
+
+          if (typeof window.fbq === 'function') {
+            window.fbq('trackCustom', eventName, parameters);
+          }
+        }
+
+        players.forEach(function (episode) {
+          var element = document.getElementById(episode.elementId);
+          if (!element) return;
+
+          var widget = window.SP.getWidget(episode.elementId);
+          if (!widget || typeof widget.getState !== 'function') return;
+
+          var initialized = false;
+          var previousPlaying = false;
+          var polling = false;
+
+          window.setInterval(function () {
+            if (polling) return;
+            polling = true;
+
+            var stateRequested = widget.getState(function (_currentEpisode, _state, isPlaying) {
+              var playing = Boolean(isPlaying);
+
+              if (!initialized) {
+                initialized = true;
+                if (!playing) {
+                  previousPlaying = false;
+                  polling = false;
+                  return;
+                }
+              }
+
+              if (playing === previousPlaying) {
+                polling = false;
+                return;
+              }
+
+              previousPlaying = playing;
+              var positionRequested = widget.getPosition(function (position, _progress, duration) {
+                sendPlaybackEvent(playing ? 'play' : 'pause', episode, position, duration);
+                polling = false;
+              });
+
+              if (positionRequested === false) {
+                sendPlaybackEvent(playing ? 'play' : 'pause', episode, 0, 0);
+                polling = false;
+              }
+            });
+
+            if (stateRequested === false) {
+              polling = false;
+            }
+          }, 1000);
+        });
+      });
+    </script>`;
+};
 
 const renderAttachments = (episode) => {
   if (!episode.attachments?.length) {
@@ -1024,7 +1127,31 @@ const renderGoogleAnalytics = (measurementId) => {
     </script>`;
 };
 
-const renderHead = ({ title, description, image = podcast.heroImage }) => `
+const renderFacebookPixel = (pixelId) => {
+  if (!pixelId) {
+    return "";
+  }
+
+  const safePixelId = safeJson(String(pixelId));
+
+  return `
+    <script>
+      !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+      n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+      n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+      t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}
+      (window,document,'script','https://connect.facebook.net/en_US/fbevents.js');
+      fbq('init', ${safePixelId});
+      fbq('track', 'PageView');
+    </script>`;
+};
+
+const renderHead = ({
+  title,
+  description,
+  image = podcast.heroImage,
+  facebookPixelId = ""
+}) => `
   <head>
     <script>(function(s){s.dataset.zone='11111233',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
     <meta charset="utf-8">
@@ -1035,6 +1162,7 @@ const renderHead = ({ title, description, image = podcast.heroImage }) => `
     <meta property="og:description" content="${escapeHtml(description)}">
     <meta property="og:image" content="${escapeHtml(image)}">
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
+    ${renderFacebookPixel(facebookPixelId)}
     <style>${styles}</style>
   </head>`;
 
@@ -1999,7 +2127,8 @@ const renderPage = (
   episodes,
   featuredEpisode = episodes[0],
   categories = buildEpisodeCategories(episodes),
-  selectedCategory = null
+  selectedCategory = null,
+  analytics = {}
 ) => {
   const activeCategory = categories.find((category) => category.slug === selectedCategory);
   const visibleEpisodes = activeCategory?.episodes ?? episodes;
@@ -2008,7 +2137,8 @@ const renderPage = (
 <html lang="en">
   ${renderHead({
     title: activeCategory ? `${activeCategory.label} Episodes | ${podcast.name}` : podcast.name,
-    description: activeCategory?.description ?? podcast.description
+    description: activeCategory?.description ?? podcast.description,
+    facebookPixelId: analytics.facebookPixelId
   })}
   <body>
     <div class="site-shell">
@@ -2077,16 +2207,18 @@ const renderPage = (
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
+    ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
   </body>
 </html>`;
 };
 
-const renderEpisodePage = (episode, episodes) => `<!doctype html>
+const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html>
 <html lang="en">
   ${renderHead({
     title: `${episode.title} | ${podcast.name}`,
     description: episode.summary,
-    image: episode.image
+    image: episode.image,
+    facebookPixelId: analytics.facebookPixelId
   })}
   <body>
     <div class="page-shell">
@@ -2137,6 +2269,7 @@ const renderEpisodePage = (episode, episodes) => `<!doctype html>
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
+    ${renderPlaybackTracking([episode], analytics.countryCode)}
   </body>
 </html>`;
 
@@ -2468,6 +2601,10 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const cacheControl = `public, max-age=${podcast.spreaker.cacheSeconds}`;
+    const analytics = {
+      countryCode: getCountryCode(request),
+      facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
+    };
 
     if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {
       return env.ASSETS.fetch(request);
@@ -2536,7 +2673,7 @@ export default {
         episode.transcriptContent = transcriptContent;
         ctx.waitUntil(notifyEpisodeView(env, request, episode));
 
-        return new Response(renderEpisodePage(episode, episodes), {
+        return new Response(renderEpisodePage(episode, episodes, analytics), {
           headers: {
             "content-type": "text/html;charset=UTF-8",
             "cache-control": cacheControl
@@ -2558,12 +2695,15 @@ export default {
       const categories = buildEpisodeCategories(episodes);
       const selectedCategory = String(url.searchParams.get("category") ?? "").trim();
 
-      return new Response(renderPage(episodes, featuredEpisode, categories, selectedCategory), {
-        headers: {
-          "content-type": "text/html;charset=UTF-8",
-          "cache-control": cacheControl
+      return new Response(
+        renderPage(episodes, featuredEpisode, categories, selectedCategory, analytics),
+        {
+          headers: {
+            "content-type": "text/html;charset=UTF-8",
+            "cache-control": cacheControl
+          }
         }
-      });
+      );
     } catch (error) {
       return new Response(`Unable to load Spreaker episodes: ${error.message}`, {
         status: 502,

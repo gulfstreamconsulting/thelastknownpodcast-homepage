@@ -1,13 +1,24 @@
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "the-last-known-podcast",
-  "main": "src/index.js",
-  "compatibility_date": "2026-06-03",
-  "assets": {
-    "directory": "./public",
-    "binding": "ASSETS"
-  },
-  "observability": {
-    "enabled": true
-  }
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "the-last-known-podcast",
+	"main": "src/index.js",
+	"compatibility_date": "2026-06-03",
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS"
+	},
+	"r2_buckets": [
+		{
+			"binding": "EPISODE_CONTENT",
+			"bucket_name": "the-last-known-podcast-content"
+		},
+		{
+			"bucket_name": "the-last-known-podcast-content",
+			"binding": "the_last_known_podcast_content",
+			"remote": true
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
 }

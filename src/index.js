@@ -53,6 +53,77 @@ const formatPublishedDate = (value) => {
   }).format(date);
 };
 
+const toIsoDate = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(`${value.replace(" ", "T")}Z`);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const inferMediaType = (mimeType = "") => {
+  if (mimeType.startsWith("image/")) return "image";
+  if (mimeType.startsWith("audio/")) return "audio";
+  if (mimeType.startsWith("video/")) return "video";
+  if (
+    mimeType.includes("pdf") ||
+    mimeType.includes("subrip") ||
+    mimeType.startsWith("text/")
+  ) {
+    return "document";
+  }
+  return "file";
+};
+
+const buildEpisodeMedia = (episode) => {
+  const media = [];
+  const artwork = episode.image_original_url ?? episode.image_url;
+
+  if (artwork) {
+    media.push({
+      type: "image",
+      role: "artwork",
+      title: "Episode artwork",
+      url: artwork,
+      thumbnailUrl: episode.image_url ?? artwork,
+      mimeType: "image/jpeg"
+    });
+  }
+
+  if (episode.playback_url) {
+    media.push({
+      type: "audio",
+      role: "stream",
+      title: "Stream episode",
+      url: episode.playback_url,
+      mimeType: "audio/mpeg"
+    });
+  }
+
+  if (episode.download_url) {
+    media.push({
+      type: "audio",
+      role: "download",
+      title: "Download episode",
+      url: episode.download_url,
+      mimeType: "audio/mpeg"
+    });
+  }
+
+  for (const transcript of episode.transcripts_generated ?? []) {
+    media.push({
+      type: inferMediaType(transcript.transcript_type),
+      role: "transcript",
+      title: "Episode transcript",
+      url: transcript.transcript_url,
+      mimeType: transcript.transcript_type
+    });
+  }
+
+  return [...media, ...(podcast.episodeMedia?.[episode.slug] ?? [])];
+};
+
 const fetchSpreakerJson = async (path) => {
   const apiUrl = path.startsWith("http") ? path : `${SPREAKER_API_BASE}${path}`;
   const response = await fetch(apiUrl, {
@@ -85,10 +156,19 @@ const normalizeEpisode = (episode) => {
     summary,
     detail: summary,
     publishedAt: formatPublishedDate(episode.published_at),
+    publishedAtIso: toIsoDate(episode.published_at),
+    durationMs: episode.duration ?? null,
+    explicit: Boolean(episode.explicit),
+    seasonNumber: episode.season_number ?? null,
+    episodeNumber: episode.episode_number ?? null,
     href: episode.site_url,
     spreakerUrl: episode.site_url,
     spreakerResource: `episode_id=${episode.episode_id}`,
+    playbackUrl: episode.playback_url ?? null,
+    downloadUrl: episode.download_url ?? null,
     image: episode.image_original_url ?? episode.image_url ?? podcast.heroImage,
+    thumbnail: episode.image_url ?? episode.image_original_url ?? podcast.heroImage,
+    media: buildEpisodeMedia(episode),
     body: description
       .split(/\n+/)
       .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
@@ -237,6 +317,104 @@ const episodeSlugFromPath = (pathname) => {
 
   return match?.[1] ?? null;
 };
+
+const apiEpisodeSlugFromPath = (pathname) => {
+  const match = pathname.match(/^\/api\/episodes\/([^/]+)\/?$/);
+  return match?.[1] ?? null;
+};
+
+const absoluteUrl = (value, origin) => {
+  if (!value) {
+    return null;
+  }
+
+  return new URL(value, origin).href;
+};
+
+const serializeMedia = (media, origin) =>
+  media.map((item) => ({
+    type: item.type,
+    role: item.role ?? null,
+    title: item.title ?? null,
+    url: absoluteUrl(item.url, origin),
+    thumbnailUrl: absoluteUrl(item.thumbnailUrl, origin),
+    mimeType: item.mimeType ?? null
+  }));
+
+const serializeEpisode = (episode, origin, includeBody = false) => {
+  const serialized = {
+    id: episode.id,
+    slug: episode.slug,
+    title: episode.title,
+    summary: episode.summary,
+    publishedAt: episode.publishedAtIso,
+    publishedAtDisplay: episode.publishedAt,
+    durationMs: episode.durationMs,
+    explicit: episode.explicit,
+    seasonNumber: episode.seasonNumber,
+    episodeNumber: episode.episodeNumber,
+    detailPageUrl: `${origin}${episodePath(episode)}`,
+    spreakerUrl: episode.spreakerUrl,
+    artwork: {
+      originalUrl: absoluteUrl(episode.image, origin),
+      thumbnailUrl: absoluteUrl(episode.thumbnail, origin)
+    },
+    player: {
+      provider: "spreaker",
+      resource: episode.spreakerResource,
+      playbackUrl: episode.playbackUrl,
+      downloadUrl: episode.downloadUrl
+    },
+    media: serializeMedia(episode.media, origin)
+  };
+
+  if (includeBody) {
+    serialized.description = episode.body.join("\n\n");
+    serialized.body = episode.body;
+  }
+
+  return serialized;
+};
+
+const API_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, HEAD, OPTIONS",
+  "access-control-allow-headers": "Content-Type",
+  "content-type": "application/json;charset=UTF-8"
+};
+
+const jsonResponse = (data, status = 200, cacheControl = "no-store") =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...API_HEADERS,
+      "cache-control": cacheControl
+    }
+  });
+
+const renderPodcastApi = (episodes, origin) => ({
+  apiVersion: "1.0",
+  podcast: {
+    name: podcast.name,
+    tagline: podcast.tagline,
+    description: podcast.description,
+    host: podcast.host,
+    email: podcast.email,
+    heroImageUrl: absoluteUrl(podcast.heroImage, origin),
+    websiteUrl: origin,
+    links: podcast.links
+      .filter((link) => link.href && link.href !== "#")
+      .map((link) => ({
+        label: link.label,
+        url: absoluteUrl(link.href, origin)
+      }))
+  },
+  episodes: episodes.map((episode) => serializeEpisode(episode, origin)),
+  meta: {
+    episodeCount: episodes.length,
+    generatedAt: new Date().toISOString()
+  }
+});
 
 const renderCases = (cases) =>
   cases
@@ -878,12 +1056,76 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const cacheControl = `public, max-age=${podcast.spreaker.cacheSeconds}`;
+    const isApiRequest = url.pathname.startsWith("/api/");
+
+    if (request.method === "OPTIONS" && isApiRequest) {
+      return new Response(null, { status: 204, headers: API_HEADERS });
+    }
 
     if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {
       return env.ASSETS.fetch(request);
     }
 
     try {
+      if (isApiRequest && !["GET", "HEAD"].includes(request.method)) {
+        return jsonResponse(
+          { error: { code: "method_not_allowed", message: "Use GET for this endpoint." } },
+          405
+        );
+      }
+
+      if (url.pathname === "/api/podcast" || url.pathname === "/api/podcast/") {
+        const episodes = await loadEpisodes();
+        return jsonResponse(renderPodcastApi(episodes, url.origin), 200, cacheControl);
+      }
+
+      if (url.pathname === "/api/episodes" || url.pathname === "/api/episodes/") {
+        const episodes = await loadEpisodes();
+        return jsonResponse(
+          {
+            apiVersion: "1.0",
+            episodes: episodes.map((episode) => serializeEpisode(episode, url.origin)),
+            meta: {
+              episodeCount: episodes.length,
+              generatedAt: new Date().toISOString()
+            }
+          },
+          200,
+          cacheControl
+        );
+      }
+
+      const apiEpisodeSlug = apiEpisodeSlugFromPath(url.pathname);
+
+      if (apiEpisodeSlug) {
+        const episodes = await loadEpisodes();
+        const listEpisode = episodes.find((episode) => episode.slug === apiEpisodeSlug);
+
+        if (!listEpisode) {
+          return jsonResponse(
+            { error: { code: "episode_not_found", message: "Episode not found." } },
+            404
+          );
+        }
+
+        const episode = await loadEpisodeDetails(listEpisode.id);
+        return jsonResponse(
+          {
+            apiVersion: "1.0",
+            episode: serializeEpisode(episode, url.origin, true)
+          },
+          200,
+          cacheControl
+        );
+      }
+
+      if (isApiRequest) {
+        return jsonResponse(
+          { error: { code: "not_found", message: "API endpoint not found." } },
+          404
+        );
+      }
+
       const episodeSlug = episodeSlugFromPath(url.pathname);
 
       if (episodeSlug) {
@@ -924,6 +1166,18 @@ export default {
         }
       });
     } catch (error) {
+      if (isApiRequest) {
+        return jsonResponse(
+          {
+            error: {
+              code: "upstream_error",
+              message: "Unable to load podcast data."
+            }
+          },
+          502
+        );
+      }
+
       return new Response(`Unable to load Spreaker episodes: ${error.message}`, {
         status: 502,
         headers: {

@@ -12,6 +12,25 @@ export const podcast = {
     episodeLimit: 50,
     cacheSeconds: 300
   },
+  episodeMedia: {
+    // Add supplemental media by Spreaker episode slug:
+    // "brian-shaffer-the-man-who-never-left-the-bar": [
+    //   {
+    //     type: "document",
+    //     role: "case-file",
+    //     title: "Episode case file",
+    //     url: "https://example.com/brian-shaffer-case-file.pdf",
+    //     mimeType: "application/pdf"
+    //   },
+    //   {
+    //     type: "image",
+    //     role: "evidence",
+    //     title: "Timeline map",
+    //     url: "https://example.com/brian-shaffer-map.jpg",
+    //     mimeType: "image/jpeg"
+    //   }
+    // ]
+  },
   links: [
     {
       label: "Spreaker",

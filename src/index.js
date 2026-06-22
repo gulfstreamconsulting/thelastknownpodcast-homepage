@@ -280,34 +280,141 @@ const loadEpisodeCatalog = async () => {
 
 const attachmentManifestKey = (episodeId) => `episodes/${episodeId}/manifest.json`;
 
-const loadAttachments = async (env, episodeId) => {
+const emptyEpisodeContent = () => ({
+  attachments: [],
+  videoUrl: ""
+});
+
+const loadEpisodeContent = async (env, episodeId) => {
   if (!env.EPISODE_CONTENT) {
-    return [];
+    return emptyEpisodeContent();
   }
 
   const object = await env.EPISODE_CONTENT.get(attachmentManifestKey(episodeId));
 
   if (!object) {
-    return [];
+    return emptyEpisodeContent();
   }
 
   try {
     const manifest = await object.json();
-    return Array.isArray(manifest.attachments) ? manifest.attachments : [];
+    return {
+      attachments: Array.isArray(manifest.attachments) ? manifest.attachments : [],
+      videoUrl:
+        typeof manifest.videoUrl === "string"
+          ? manifest.videoUrl
+          : typeof manifest.youtubeUrl === "string"
+            ? manifest.youtubeUrl
+            : ""
+    };
   } catch (error) {
-    console.error(`Unable to read attachment manifest for episode ${episodeId}`, error);
-    return [];
+    console.error(`Unable to read episode content manifest for episode ${episodeId}`, error);
+    return emptyEpisodeContent();
   }
 };
 
-const saveAttachments = (env, episodeId, attachments) =>
+const saveEpisodeContent = (env, episodeId, content) =>
   env.EPISODE_CONTENT.put(
     attachmentManifestKey(episodeId),
-    JSON.stringify({ version: 1, attachments }, null, 2),
+    JSON.stringify(
+      {
+        version: 2,
+        attachments: content.attachments ?? [],
+        videoUrl: content.videoUrl ?? ""
+      },
+      null,
+      2
+    ),
     {
       httpMetadata: { contentType: "application/json;charset=UTF-8" }
     }
   );
+
+const loadAttachments = async (env, episodeId) =>
+  (await loadEpisodeContent(env, episodeId)).attachments;
+
+const saveAttachments = async (env, episodeId, attachments) => {
+  const content = await loadEpisodeContent(env, episodeId);
+  return saveEpisodeContent(env, episodeId, { ...content, attachments });
+};
+
+const parseVideoUrl = (value) => {
+  const input = String(value ?? "").trim();
+
+  if (!input) {
+    return null;
+  }
+
+  let url;
+
+  try {
+    url = new URL(input);
+  } catch {
+    return null;
+  }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return null;
+  }
+
+  if (url.protocol === "http:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+    return null;
+  }
+
+  if (!url.hostname) {
+    return null;
+  }
+
+  return {
+    url: url.href
+  };
+};
+
+const videoContentType = (url) => {
+  const pathname = new URL(url).pathname.toLowerCase();
+
+  if (pathname.endsWith(".m3u8")) {
+    return "application/x-mpegURL";
+  }
+
+  if (pathname.endsWith(".mp4")) {
+    return "video/mp4";
+  }
+
+  if (pathname.endsWith(".webm")) {
+    return "video/webm";
+  }
+
+  if (pathname.endsWith(".ogv") || pathname.endsWith(".ogg")) {
+    return "video/ogg";
+  }
+
+  return "";
+};
+
+const isHlsVideoUrl = (url) => new URL(url).pathname.toLowerCase().endsWith(".m3u8");
+
+const cloudflareStreamThumbnailUrl = (url) => {
+  const videoUrl = new URL(url);
+  const hostname = videoUrl.hostname.toLowerCase();
+
+  if (!hostname.endsWith(".cloudflarestream.com") && hostname !== "videodelivery.net") {
+    return "";
+  }
+
+  const videoId = videoUrl.pathname.split("/").filter(Boolean)[0];
+
+  if (!videoId) {
+    return "";
+  }
+
+  const thumbnailUrl = new URL(`/${videoId}/thumbnails/thumbnail.jpg`, videoUrl.origin);
+  thumbnailUrl.searchParams.set("time", "0s");
+  thumbnailUrl.searchParams.set("height", "720");
+  thumbnailUrl.searchParams.set("fit", "scale");
+
+  return thumbnailUrl.href;
+};
 
 const sanitizeFilename = (value) => {
   const filename = String(value ?? "attachment")
@@ -513,17 +620,6 @@ const notifyEpisodeView = (env, request, episode) => {
     console.error("Discord webhook notification failed", error);
   });
 };
-
-const renderLinks = (links) =>
-  links
-    .map(
-      (link) => `
-        <a class="listen-link" href="${escapeHtml(link.href)}">
-          <span>${escapeHtml(link.label)}</span>
-          <span aria-hidden="true">+</span>
-        </a>`
-    )
-    .join("");
 
 const renderEpisodeImage = (episode, className = "episode-art") => `
   <img
@@ -940,34 +1036,55 @@ const renderSpreakerPlayer = (episode) => `
   >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
 
 const renderPlaybackTracking = (episodes, countryCode) => {
-  const players = episodes.map((episode) => ({
+  const audioPlayers = episodes.map((episode) => ({
     elementId: `spreaker-player-${episode.id}`,
     episodeId: episode.id,
     episodeTitle: episode.title
   }));
+  const videoPlayers = episodes
+    .filter((episode) => parseVideoUrl(episode.videoUrl))
+    .map((episode) => ({
+      elementId: `overview-video-${episode.id}`,
+      episodeId: episode.id,
+      episodeTitle: episode.title
+    }));
 
-  if (!players.length) {
+  if (!audioPlayers.length && !videoPlayers.length) {
     return "";
   }
 
   return `
     <script>
-      window.addEventListener('load', function () {
-        if (!window.SP || typeof window.SP.getWidget !== 'function') return;
-
+      (function () {
         var countryCode = ${safeJson(countryCode)};
-        var players = ${safeJson(players)};
+        var audioPlayers = ${safeJson(audioPlayers)};
+        var videoPlayers = ${safeJson(videoPlayers)};
+        var milestones = [20, 50, 75];
 
-        function sendPlaybackEvent(type, episode, position, duration) {
-          var eventName = type + '_' + countryCode;
+        function sendPlaybackEvent(type, episode, position, duration, mediaType, extraParameters) {
+          var numericPosition = Number(position) || 0;
+          var numericDuration = Number(duration) || 0;
+          var playbackPercent =
+            numericDuration > 0
+              ? Math.min(100, Math.max(0, Math.round((numericPosition / numericDuration) * 100)))
+              : 0;
+          var eventName = mediaType + '_' + type + '_' + countryCode;
           var parameters = {
             event_type: type,
             country_code: countryCode,
+            media_type: mediaType,
             episode_id: episode.episodeId,
             episode_title: episode.episodeTitle,
-            playback_position_ms: Math.round(Number(position) || 0),
-            playback_duration_ms: Math.round(Number(duration) || 0)
+            playback_position_ms: Math.round(numericPosition),
+            playback_duration_ms: Math.round(numericDuration),
+            playback_percent: playbackPercent
           };
+
+          if (extraParameters) {
+            Object.keys(extraParameters).forEach(function (key) {
+              parameters[key] = extraParameters[key];
+            });
+          }
 
           if (typeof window.gtag === 'function') {
             window.gtag('event', eventName, parameters);
@@ -978,57 +1095,217 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           }
         }
 
-        players.forEach(function (episode) {
+        function initializeAudioTracking(attempt) {
+          if (!window.SP || typeof window.SP.getWidget !== 'function') {
+            if (attempt < 20) {
+              window.setTimeout(function () {
+                initializeAudioTracking(attempt + 1);
+              }, 500);
+            }
+            return;
+          }
+
+          audioPlayers.forEach(function (episode) {
+            var element = document.getElementById(episode.elementId);
+            if (!element || element.dataset.analyticsInitialized === 'true') return;
+
+            var widget = window.SP.getWidget(episode.elementId);
+            if (!widget || typeof widget.getState !== 'function') return;
+
+            element.dataset.analyticsInitialized = 'true';
+            var initialized = false;
+            var previousPlaying = false;
+            var polling = false;
+            var completedMilestones = {};
+
+            window.setInterval(function () {
+              if (polling) return;
+              polling = true;
+
+              var stateRequested = widget.getState(function (_currentEpisode, _state, isPlaying) {
+                var playing = Boolean(isPlaying);
+                var positionRequested = widget.getPosition(function (position, _progress, duration) {
+                  if (!initialized) {
+                    initialized = true;
+                    if (playing) {
+                      sendPlaybackEvent('play', episode, position, duration, 'audio');
+                    }
+                  } else if (playing !== previousPlaying) {
+                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, position, duration, 'audio');
+                  }
+
+                  previousPlaying = playing;
+
+                  if (playing && Number(duration) > 0) {
+                    var progress = (Number(position) / Number(duration)) * 100;
+
+                    milestones.forEach(function (milestone) {
+                      if (completedMilestones[milestone] || progress < milestone) return;
+
+                      completedMilestones[milestone] = true;
+                      sendPlaybackEvent(
+                        'progress_' + milestone,
+                        episode,
+                        position,
+                        duration,
+                        'audio',
+                        { progress_percent: milestone }
+                      );
+                    });
+                  }
+
+                  polling = false;
+                });
+
+                if (positionRequested === false) {
+                  if (!initialized && playing) {
+                    sendPlaybackEvent('play', episode, 0, 0, 'audio');
+                  } else if (initialized && playing !== previousPlaying) {
+                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, 0, 0, 'audio');
+                  }
+
+                  initialized = true;
+                  previousPlaying = playing;
+                  polling = false;
+                }
+              });
+
+              if (stateRequested === false) {
+                polling = false;
+              }
+            }, 1000);
+          });
+        }
+
+        initializeAudioTracking(0);
+
+        videoPlayers.forEach(function (episode) {
           var element = document.getElementById(episode.elementId);
           if (!element) return;
 
-          var widget = window.SP.getWidget(episode.elementId);
-          if (!widget || typeof widget.getState !== 'function') return;
+          var completedMilestones = {};
 
-          var initialized = false;
-          var previousPlaying = false;
-          var polling = false;
+          function durationMs() {
+            return Number.isFinite(element.duration) ? element.duration * 1000 : 0;
+          }
 
-          window.setInterval(function () {
-            if (polling) return;
-            polling = true;
+          function positionMs() {
+            return Number.isFinite(element.currentTime) ? element.currentTime * 1000 : 0;
+          }
 
-            var stateRequested = widget.getState(function (_currentEpisode, _state, isPlaying) {
-              var playing = Boolean(isPlaying);
+          element.addEventListener('play', function () {
+            sendPlaybackEvent('play', episode, positionMs(), durationMs(), 'video');
+          });
 
-              if (!initialized) {
-                initialized = true;
-                if (!playing) {
-                  previousPlaying = false;
-                  polling = false;
-                  return;
-                }
-              }
+          element.addEventListener('pause', function () {
+            if (element.ended) return;
+            sendPlaybackEvent('pause', episode, positionMs(), durationMs(), 'video');
+          });
 
-              if (playing === previousPlaying) {
-                polling = false;
+          element.addEventListener('ended', function () {
+            sendPlaybackEvent(
+              'ended',
+              episode,
+              positionMs(),
+              durationMs(),
+              'video',
+              { progress_percent: 100 }
+            );
+          });
+
+          element.addEventListener('timeupdate', function () {
+            if (!Number.isFinite(element.duration) || element.duration <= 0) return;
+
+            var progress = (element.currentTime / element.duration) * 100;
+
+            milestones.forEach(function (milestone) {
+              if (completedMilestones[milestone] || progress < milestone) return;
+
+              completedMilestones[milestone] = true;
+              sendPlaybackEvent(
+                'progress_' + milestone,
+                episode,
+                positionMs(),
+                durationMs(),
+                'video',
+                { progress_percent: milestone }
+              );
+            });
+          });
+        });
+      })();
+    </script>`;
+};
+
+const renderHlsPlayback = (episodes) => {
+  const hasHlsVideo = episodes.some((episode) => {
+    const video = parseVideoUrl(episode.videoUrl);
+    return video && isHlsVideoUrl(video.url);
+  });
+
+  if (!hasHlsVideo) {
+    return "";
+  }
+
+  return `
+    <script>
+      window.initializeHlsPlayers = function () {
+        document.querySelectorAll('video[data-hls-src]').forEach(function (element) {
+          if (element.dataset.hlsInitialized === 'true') return;
+
+          var source = element.getAttribute('data-hls-src');
+          if (!source) return;
+
+          if (window.Hls && window.Hls.isSupported()) {
+            var hls = new window.Hls();
+            element.dataset.hlsInitialized = 'true';
+            hls.loadSource(source);
+            hls.attachMedia(element);
+            element._hls = hls;
+
+            hls.on(window.Hls.Events.ERROR, function (_event, data) {
+              if (!data.fatal) return;
+
+              if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+                hls.startLoad();
                 return;
               }
 
-              previousPlaying = playing;
-              var positionRequested = widget.getPosition(function (position, _progress, duration) {
-                sendPlaybackEvent(playing ? 'play' : 'pause', episode, position, duration);
-                polling = false;
-              });
-
-              if (positionRequested === false) {
-                sendPlaybackEvent(playing ? 'play' : 'pause', episode, 0, 0);
-                polling = false;
+              if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+                hls.recoverMediaError();
+                return;
               }
-            });
 
-            if (stateRequested === false) {
-              polling = false;
-            }
-          }, 1000);
+              hls.destroy();
+              element.dataset.hlsInitialized = 'false';
+              var fallback = element.parentElement.querySelector('[data-hls-fallback]');
+              if (fallback) fallback.hidden = false;
+            });
+            return;
+          }
+
+          if (element.canPlayType('application/vnd.apple.mpegurl')) {
+            element.dataset.hlsInitialized = 'true';
+            element.src = source;
+            return;
+          }
+
+          var fallback = element.parentElement.querySelector('[data-hls-fallback]');
+          if (fallback) fallback.hidden = false;
         });
-      });
-    </script>`;
+      };
+
+      window.showHlsFallback = function () {
+        document.querySelectorAll('[data-hls-fallback]').forEach(function (fallback) {
+          fallback.hidden = false;
+        });
+      };
+    </script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"
+      onload="window.initializeHlsPlayers()"
+      onerror="window.showHlsFallback()"
+    ></script>`;
 };
 
 const renderAttachments = (episode) => {
@@ -1083,6 +1360,54 @@ const renderAttachments = (episode) => {
       <p class="section-kicker">Supporting material</p>
       <h2 id="episode-materials-title">Episode materials</h2>
       <div class="attachment-grid">${items}</div>
+    </section>`;
+};
+
+const renderVideoOverview = (episode) => {
+  const video = parseVideoUrl(episode.videoUrl);
+
+  if (!video) {
+    return "";
+  }
+
+  const contentType = videoContentType(video.url);
+  const posterUrl = cloudflareStreamThumbnailUrl(video.url);
+  const isHls = isHlsVideoUrl(video.url);
+
+  return `
+    <section class="episode-video" aria-labelledby="video-overview-title">
+      <p class="section-kicker">Watch</p>
+      <h2 id="video-overview-title">Video overview</h2>
+      <div class="video-player">
+        <video
+          id="overview-video-${escapeHtml(episode.id)}"
+          class="overview-video-player"
+          data-episode-id="${escapeHtml(episode.id)}"
+          data-episode-title="${escapeHtml(episode.title)}"
+          title="${escapeHtml(`${episode.title} video overview`)}"
+          controls
+          playsinline
+          preload="metadata"
+          ${isHls ? `data-hls-src="${escapeHtml(video.url)}"` : ""}
+          ${posterUrl ? `poster="${escapeHtml(posterUrl)}"` : ""}
+        >
+          ${
+            isHls
+              ? ""
+              : `<source src="${escapeHtml(video.url)}"${
+                  contentType ? ` type="${escapeHtml(contentType)}"` : ""
+                }>`
+          }
+          <a href="${escapeHtml(video.url)}">Watch the video overview</a>
+        </video>
+        ${
+          isHls
+            ? `<p data-hls-fallback hidden><a href="${escapeHtml(
+                video.url
+              )}">Open the video stream directly</a></p>`
+            : ""
+        }
+      </div>
     </section>`;
 };
 
@@ -1274,8 +1599,7 @@ const styles = `
     font-size: 0.92rem;
   }
 
-  .nav a:hover,
-  .listen-link:hover {
+  .nav a:hover {
     color: var(--paper);
   }
 
@@ -1472,6 +1796,32 @@ const styles = `
 
   .breadcrumbs a:hover {
     color: var(--paper);
+  }
+
+  .episode-video {
+    margin-bottom: 42px;
+    padding-bottom: 42px;
+    border-bottom: 1px solid #d8cab7;
+  }
+
+  .video-player {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    margin-top: 22px;
+    overflow: hidden;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #101215;
+    box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
+  }
+
+  .video-player video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #101215;
   }
 
   .episode-attachments {
@@ -1818,27 +2168,6 @@ const styles = `
     box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
   }
 
-  .links-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 10px;
-    margin-top: 22px;
-  }
-
-  .listen-link {
-    display: flex;
-    min-height: 48px;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 0 14px;
-    border: 1px solid #d8cab7;
-    border-radius: 8px;
-    background: #fffaf2;
-    color: #201c19;
-    font-weight: 800;
-  }
-
   .case-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -2067,7 +2396,6 @@ const styles = `
     .episode-hero,
     .case-grid,
     .category-grid,
-    .links-grid,
     .attachment-grid,
     .related-episode-grid {
       grid-template-columns: 1fr;
@@ -2175,9 +2503,6 @@ const renderPage = (
           <div class="player-wrap">
             ${renderSpreakerPlayer(featuredEpisode)}
           </div>
-          <div class="links-grid" aria-label="Podcast platform links">
-            ${renderLinks(podcast.links)}
-          </div>
         </div>
       </section>
 
@@ -2255,6 +2580,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
 
     <main>
       <article class="section episode-detail-layout">
+        ${renderVideoOverview(episode)}
         ${renderAttachments(episode)}
         <div class="episode-body">
           ${(episode.body?.length ? episode.body : [episode.summary])
@@ -2269,6 +2595,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
+    ${renderHlsPlayback([episode])}
     ${renderPlaybackTracking([episode], analytics.countryCode)}
   </body>
 </html>`;
@@ -2326,7 +2653,7 @@ const renderSearchPage = (query, results) => {
 </html>`;
 };
 
-const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
+const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
   const episodeOptions = episodes
     .map(
       (episode) =>
@@ -2334,11 +2661,31 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
     )
     .join("");
 
-  const attachmentLists = episodes
-    .filter((episode) => attachmentsByEpisode.get(episode.id)?.length)
+  const contentLists = episodes
+    .filter((episode) => {
+      const content = contentByEpisode.get(episode.id);
+      return content?.videoUrl || content?.attachments?.length;
+    })
     .map((episode) => {
-      const attachments = attachmentsByEpisode
-        .get(episode.id)
+      const content = contentByEpisode.get(episode.id) ?? emptyEpisodeContent();
+      const video = parseVideoUrl(content.videoUrl);
+      const videoOverview = video
+        ? `
+            <div class="admin-attachment">
+              <div>
+                <strong>Video overview</strong>
+                <div><a href="${escapeHtml(
+                  video.url
+                )}" target="_blank" rel="noopener">${escapeHtml(video.url)}</a></div>
+              </div>
+              <form method="post" action="/admin/content/video">
+                <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
+                <input type="hidden" name="videoUrl" value="">
+                <button class="danger-button" type="submit">Remove</button>
+              </form>
+            </div>`
+        : "";
+      const attachments = content.attachments
         .map(
           (attachment) => `
             <div class="admin-attachment">
@@ -2360,6 +2707,7 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
       return `
         <section class="admin-episode">
           <h3>${escapeHtml(episode.title)}</h3>
+          ${videoOverview}
           ${attachments}
         </section>`;
     })
@@ -2377,8 +2725,28 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
         <a class="back-link" href="/">Back to site</a>
         <p class="section-kicker">Administration</p>
         <h1>Episode content</h1>
-        <p>Upload images, PDFs, and other supporting files. The title and description appear on the episode detail page.</p>
+        <p>Add a video overview link or upload images, PDFs, and other supporting files for an episode.</p>
         ${notice ? `<p class="admin-notice">${escapeHtml(notice)}</p>` : ""}
+        <form class="admin-form" method="post" action="/admin/content/video">
+          <label>
+            Episode
+            <select name="episodeId" required>${episodeOptions}</select>
+          </label>
+          <label>
+            Video URL
+            <input
+              type="url"
+              name="videoUrl"
+              placeholder="https://customer-...cloudflarestream.com/.../manifest/video.m3u8"
+              required
+            >
+          </label>
+          <button class="button" type="submit">Save video overview</button>
+        </form>
+      </section>
+      <section class="admin-panel">
+        <p class="section-kicker">Supporting material</p>
+        <h2>Upload a file</h2>
         <form class="admin-form" method="post" action="/admin/content/upload" enctype="multipart/form-data">
           <label>
             Episode
@@ -2401,8 +2769,8 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
       </section>
       <section class="admin-panel">
         <p class="section-kicker">Current content</p>
-        <h2>Attached files</h2>
-        ${attachmentLists || "<p>No episode content has been uploaded yet.</p>"}
+        <h2>Episode videos and files</h2>
+        ${contentLists || "<p>No episode content has been added yet.</p>"}
       </section>
     </main>
   </body>
@@ -2481,17 +2849,19 @@ const handleAdminPage = async (request, env, url) => {
   }
 
   const episodes = await loadEpisodes();
-  const attachmentEntries = await Promise.all(
-    episodes.map(async (episode) => [episode.id, await loadAttachments(env, episode.id)])
+  const contentEntries = await Promise.all(
+    episodes.map(async (episode) => [episode.id, await loadEpisodeContent(env, episode.id)])
   );
   const notices = {
     uploaded: "Content uploaded successfully.",
     deleted: "Content deleted.",
+    videoSaved: "Video overview saved.",
+    videoRemoved: "Video overview removed.",
     missing: "The selected episode or file could not be found."
   };
 
   return new Response(
-    renderAdminPage(episodes, new Map(attachmentEntries), notices[url.searchParams.get("status")]),
+    renderAdminPage(episodes, new Map(contentEntries), notices[url.searchParams.get("status")]),
     {
       headers: {
         "content-type": "text/html;charset=UTF-8",
@@ -2568,6 +2938,46 @@ const handleUpload = async (request, env) => {
   return adminRedirect(request, "?status=uploaded");
 };
 
+const handleVideoOverview = async (request, env) => {
+  if (!isAdmin(request, env)) {
+    return adminUnauthorized();
+  }
+
+  if (!sameOriginRequest(request)) {
+    return new Response("Invalid request origin", { status: 403 });
+  }
+
+  if (!env.EPISODE_CONTENT) {
+    return new Response("Content storage is not configured", { status: 503 });
+  }
+
+  const form = await request.formData();
+  const episodeId = String(form.get("episodeId") ?? "").trim();
+  const videoInput = String(form.get("videoUrl") ?? form.get("youtubeUrl") ?? "").trim();
+  const video = videoInput ? parseVideoUrl(videoInput) : null;
+
+  if (!episodeId || (videoInput && !video)) {
+    return new Response("A valid HTTPS video URL is required", { status: 400 });
+  }
+
+  const episodes = await loadEpisodes();
+
+  if (!episodes.some((episode) => episode.id === episodeId)) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  const content = await loadEpisodeContent(env, episodeId);
+  await saveEpisodeContent(env, episodeId, {
+    ...content,
+    videoUrl: video?.url ?? ""
+  });
+
+  return adminRedirect(
+    request,
+    video ? "?status=videoSaved" : "?status=videoRemoved"
+  );
+};
+
 const handleDelete = async (request, env) => {
   if (!isAdmin(request, env)) {
     return adminUnauthorized();
@@ -2623,6 +3033,13 @@ export default {
         return handleUpload(request, env);
       }
 
+      if (
+        (url.pathname === "/admin/content/video" || url.pathname === "/admin/content/youtube") &&
+        request.method === "POST"
+      ) {
+        return handleVideoOverview(request, env);
+      }
+
       if (url.pathname === "/admin/content/delete" && request.method === "POST") {
         return handleDelete(request, env);
       }
@@ -2665,11 +3082,12 @@ export default {
         }
 
         const episode = await loadEpisodeDetails(listEpisode.id);
-        const [attachments, transcriptContent] = await Promise.all([
-          loadAttachments(env, episode.id),
+        const [episodeContent, transcriptContent] = await Promise.all([
+          loadEpisodeContent(env, episode.id),
           loadEpisodeTranscript(episode)
         ]);
-        episode.attachments = attachments;
+        episode.attachments = episodeContent.attachments;
+        episode.videoUrl = episodeContent.videoUrl;
         episode.transcriptContent = transcriptContent;
         ctx.waitUntil(notifyEpisodeView(env, request, episode));
 

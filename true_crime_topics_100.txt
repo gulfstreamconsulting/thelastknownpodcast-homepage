@@ -1,0 +1,101 @@
+No.	True Crime Topic	Episode Description
+1	The Zodiac Killer	Examine the coded letters, confirmed attacks, disputed victims, and suspects behind California’s unidentified Zodiac Killer.
+2	The Golden State Killer	Trace the decades-long investigation that connected burglaries, sexual assaults, and murders through genetic genealogy.
+3	BTK: Dennis Rader	Explore how Dennis Rader concealed his crimes for decades before his communications with police exposed him.
+4	The Green River Killer	Follow the investigation into Gary Ridgway and the many women whose disappearances were initially overlooked.
+5	The Manson Family Murders	Reconstruct the Tate–LaBianca murders, Charles Manson’s influence, and the prosecution that followed.
+6	JonBenét Ramsey	Review the ransom note, conflicting evidence, media frenzy, and unresolved killing of six-year-old JonBenét Ramsey.
+7	The Murder of Laci Peterson	Trace Laci Peterson’s disappearance, the discovery of her remains, and the circumstantial case against Scott Peterson.
+8	Hae Min Lee and the Adnan Syed Case	Examine Hae Min Lee’s murder, Adnan Syed’s prosecution, and the legal disputes that followed his conviction.
+9	The Disappearance of Susan Powell	Follow Susan Powell’s disappearance and the escalating events surrounding her husband, Josh Powell.
+10	Jennifer Kesse	Reconstruct Jennifer Kesse’s final known movements and the unidentified person recorded near her abandoned vehicle.
+11	Madeleine McCann	Examine the disappearance from a Portuguese resort, investigative failures, international suspects, and enduring unanswered questions.
+12	Natalee Holloway	Trace Natalee Holloway’s final night in Aruba and the years of investigations, statements, and legal developments.
+13	Andrew Gosden	Explore why a 14-year-old secretly traveled to London and seemingly vanished after leaving King’s Cross station.
+14	Sneha Anne Philip	Reconstruct the final confirmed day of a New York physician whose disappearance became entwined with September 11.
+15	Amy Lynn Bradley	Examine the disappearance of Amy Bradley from a Caribbean cruise ship and the reported sightings that followed.
+16	Jodi Huisentruit	Follow the disappearance of an Iowa television anchor from outside her apartment before an early-morning broadcast.
+17	Kristin Smart	Trace Kristin Smart’s disappearance, the decades-long investigation, and the eventual prosecution of Paul Flores.
+18	Gabby Petito	Reconstruct the cross-country trip, social-media trail, police encounter, disappearance, and nationwide search for Gabby Petito.
+19	Tara Calico	Examine Tara Calico’s disappearance and the disturbing Polaroid photograph once thought to depict her.
+20	The Fort Worth Missing Trio	Explore how three girls disappeared during a 1974 Christmas shopping trip without leaving a confirmed trail.
+21	The Beaumont Children	Reconstruct the disappearance of three siblings from an Australian beach and the suspects examined over six decades.
+22	The Missing Sodder Children	Investigate whether five children died in a 1945 house fire or escaped before the home collapsed.
+23	The Keddie Cabin Murders	Examine the brutal killings inside California’s Cabin 28 and the evidence that remained untested for years.
+24	The Austin Yogurt Shop Murders	Revisit the murder of four teenage girls, disputed confessions, overturned convictions, and unresolved DNA evidence.
+25	The Lane Bryant Shooting	Reconstruct the 2008 killing of five women inside an Illinois clothing store and the hunt for the gunman.
+26	The Burger Chef Murders	Trace the disappearance and murder of four restaurant employees after an apparent robbery in Indiana.
+27	The Colonial Parkway Murders	Examine the young couples attacked along Virginia’s Colonial Parkway and the debate over whether one offender was responsible.
+28	The Gilgo Beach Killings	Follow the discovery of human remains along Long Island and the investigation into multiple victims and possible offenders.
+29	The West Mesa Murders	Explore the identification of women buried on Albuquerque’s West Mesa and the search for the person responsible.
+30	The Cleveland Torso Murderer	Revisit the unidentified victims, dismembered remains, and controversial investigation associated with Eliot Ness.
+31	The Atlanta Child Murders	Examine the murders and disappearances of Black children and young adults and the disputed scope of Wayne Williams’s involvement.
+32	The Oakland County Child Killer	Trace four child murders in 1970s Michigan and the suspects investigated without a definitive prosecution.
+33	The Alphabet Murders	Explore the killings of three New York girls whose first and last initials shared the same letter.
+34	The Freeway Phantom	Examine the abduction and murder of six Black girls in Washington, D.C., and the evidence left behind.
+35	Bible John	Investigate the unidentified man linked to three Glasgow murders and the witness who spent an evening with him.
+36	The Monster of Florence	Trace the investigation into a series of murders targeting couples in the Italian countryside.
+37	The Brabant Killers	Examine the exceptionally violent Belgian robberies that killed 28 people and remain officially unresolved.
+38	The Doodler	Explore the San Francisco murders of gay men and why surviving witnesses struggled to participate in the investigation.
+39	The Texarkana Moonlight Murders	Reconstruct the 1946 attacks attributed to the unidentified “Phantom Killer” and the panic they created.
+40	The Servant Girl Annihilator	Examine a series of nighttime attacks in 1880s Austin that predated the Jack the Ripper murders.
+41	The Hinterkaifeck Murders	Reconstruct the killing of six people at an isolated German farm where the murderer may have remained afterward.
+42	The Setagaya Family Murders	Examine the extraordinary amount of evidence left by the unidentified killer of a Tokyo family.
+43	The Isdal Woman	Investigate the coded notes, false identities, removed labels, and unidentified life of a woman found dead in Norway.
+44	The Somerton Man	Explore the identification of the Somerton Man and the questions that remain about his unexplained death.
+45	The Oslo Plaza Woman	Examine the false identity and unusual circumstances surrounding a woman found dead in a luxury Oslo hotel.
+46	The Lady of the Dunes	Trace the decades-long effort to identify Ruth Marie Terry and the continuing investigation into her murder.
+47	The Bear Brook Murders	Follow the genetic-genealogy investigation that identified victims found inside barrels in New Hampshire.
+48	The Annecy Shootings	Reconstruct the shootings of a British-Iraqi family and a French cyclist on an isolated Alpine road.
+49	The Yuba County Five	Follow five men who inexplicably drove into the mountains and the discoveries made after the snow melted.
+50	The Jamison Family	Examine the Jamison family’s disappearance, their abandoned truck, security footage, and the later discovery of their remains.
+51	The McStay Family Murders	Trace the family’s unexplained disappearance and the evidence that eventually shifted suspicion toward a business associate.
+52	The Watts Family Murders	Examine Chris Watts’s changing story, surveillance evidence, and the murders of his wife and daughters.
+53	The Pike County Massacre	Reconstruct the coordinated murders of eight Rhoden family members across several rural Ohio properties.
+54	The Hart Family Murders	Examine the abuse allegations and warning signs preceding a fatal plunge from a California coastal cliff.
+55	Xavier Dupont de Ligonnès	Trace the discovery of five family members beneath a French terrace and the worldwide search for the missing father.
+56	The Menendez Brothers	Revisit the murders of José and Kitty Menendez, the brothers’ abuse claims, and their heavily publicized trials.
+57	The O.J. Simpson Case	Examine the murders of Nicole Brown Simpson and Ron Goldman, the criminal acquittal, and the civil verdict.
+58	The Casey Anthony Trial	Trace Caylee Anthony’s disappearance, the changing explanations, forensic disputes, and her mother’s acquittal.
+59	Jodi Arias and Travis Alexander	Reconstruct Travis Alexander’s murder, Jodi Arias’s shifting accounts, and the evidence presented at trial.
+60	The Pamela Smart Case	Examine the murder of Gregg Smart and the prosecution’s claim that Pamela Smart manipulated teenage accomplices.
+61	Diane Downs	Trace the roadside shooting of three children and the evidence that contradicted their mother’s account.
+62	Darlie Routier	Revisit the murder of two young boys and the disputed physical and behavioral evidence used against their mother.
+63	The Sam Sheppard Case	Examine the murder of Marilyn Sheppard, her husband’s overturned conviction, retrial, and unresolved alternative theories.
+64	Lizzie Borden	Reconstruct the Borden household murders, the sensational trial, and the evidence behind a lasting American mystery.
+65	The Moors Murders	Examine how Ian Brady and Myra Hindley abducted children and concealed their victims on Saddleworth Moor.
+66	Fred and Rose West	Trace the disappearances and murders uncovered beneath the West family’s home at 25 Cromwell Street.
+67	The Snowtown Murders	Examine how a group of killers targeted vulnerable people and concealed bodies inside barrels in South Australia.
+68	Katherine Knight	Reconstruct the murder of John Price and the history of violence that preceded Katherine Knight’s conviction.
+69	The Oklahoma Girl Scout Murders	Examine the killings of three girls during their first night at summer camp and the controversial prosecution.
+70	The Hello Kitty Murder	Trace the kidnapping and killing of Fan Man-yee and the testimony that exposed the crime.
+71	Sylvia Likens	Examine the prolonged abuse and murder of Sylvia Likens inside an Indianapolis home filled with witnesses.
+72	Shanda Sharer	Reconstruct the abduction and murder of 12-year-old Shanda Sharer by four teenage girls.
+73	Skylar Neese	Follow the disappearance of Skylar Neese and the social-media clues that gradually revealed her friends’ involvement.
+74	The Slender Man Stabbing	Examine how an internet character became central to the attempted murder of a Wisconsin schoolgirl.
+75	The Chowchilla School-Bus Kidnapping	Reconstruct the mass abduction of 26 children and their driver and their escape from an underground prison.
+76	The Lindbergh Baby Kidnapping	Revisit the ransom investigation, Bruno Hauptmann’s conviction, and the evidence still debated by historians.
+77	The Kidnapping of Elizabeth Smart	Trace Elizabeth Smart’s abduction, captivity, recovery, and the missed opportunities during the search.
+78	Jaycee Dugard	Examine Jaycee Dugard’s 18 years in captivity and the supervision failures that allowed her abductors to avoid detection.
+79	The Cleveland Kidnappings	Tell how Amanda Berry, Gina DeJesus, and Michelle Knight survived years of imprisonment inside Ariel Castro’s home.
+80	Colleen Stan: The Girl in the Box	Examine Colleen Stan’s abduction, psychological control, captivity, and eventual escape.
+81	Patty Hearst and the SLA	Trace Patty Hearst’s kidnapping, recorded declarations, participation in a bank robbery, and disputed coercion defense.
+82	Leopold and Loeb	Examine the wealthy students who attempted to commit a “perfect crime” by murdering 14-year-old Bobby Franks.
+83	The Hall–Mills Murders	Reconstruct the killing of a minister and choir singer and the society trial that ended without convictions.
+84	The West Memphis Three	Examine the child murders, controversial convictions, disputed forensic evidence, and eventual Alford pleas.
+85	The Central Park Five	Trace the coercive interrogations, wrongful convictions, exonerations, and failures surrounding the Central Park jogger case.
+86	The Norfolk Four	Examine how coercive interrogations produced incompatible confessions and wrongful convictions in a Virginia murder case.
+87	D.B. Cooper	Reconstruct the only unsolved commercial-airline hijacking in American history and the evidence Cooper left aboard the plane.
+88	The Isabella Stewart Gardner Museum Heist	Examine how fake police officers stole 13 artworks that have never been recovered.
+89	The Lufthansa Heist	Trace the multimillion-dollar JFK Airport robbery and the organized-crime killings that followed it.
+90	The Antwerp Diamond Heist	Examine how thieves bypassed layers of security to empty vault boxes in Antwerp’s diamond district.
+91	The Hatton Garden Heist	Tell how a group of older career criminals drilled into a London vault over a holiday weekend.
+92	The Great Train Robbery	Reconstruct the 1963 mail-train robbery, the massive police response, and the fugitives who escaped abroad.
+93	Theranos	Trace how claims about revolutionary blood-testing technology led to whistleblowers, investigations, and fraud convictions.
+94	Bernie Madoff	Examine how Madoff sustained history’s largest known Ponzi scheme and why regulators repeatedly missed warning signs.
+95	The Enron Scandal	Explain the accounting schemes, corporate culture, and collapse that destroyed Enron and employees’ savings.
+96	NXIVM	Trace how a self-improvement organization became a coercive hierarchy that resulted in racketeering and sex-trafficking convictions.
+97	Jonestown	Examine Jim Jones’s control over Peoples Temple and the events culminating in more than 900 deaths in Guyana.
+98	The Rajneeshee Bioterror Attack	Reconstruct how cult members contaminated Oregon salad bars in an attempt to influence a local election.
+99	The Unabomber	Follow the bombing campaign, manifesto, linguistic clues, and family tip that led investigators to Ted Kaczynski.
+100	The D.C. Sniper Attacks	Reconstruct the 2002 shootings, regional panic, misleading clues, and capture of John Allen Muhammad and Lee Boyd Malvo.

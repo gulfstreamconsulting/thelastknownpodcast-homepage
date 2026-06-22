@@ -58,6 +58,8 @@ episodeMedia: {
 
 The Spreaker player reports play and pause transitions to Google Analytics and Meta Pixel with country-specific event names such as `play_US` and `pause_GB`. Event parameters include the episode ID, title, country code, playback position, and duration.
 
+Exclusive-content views and downloads report country-specific events such as `exclusive_content_interaction_US`. Event parameters include the interaction type, episode, attachment ID, title, type, filename, size, and destination URL.
+
 Google Analytics uses the configured measurement ID in `src/podcast.config.js`. To enable the matching Facebook custom events, set the Meta Pixel ID as a Worker secret or variable:
 
 ```bash
@@ -66,7 +68,7 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 
 ## Episode Content
 
-The password-protected `/admin/content` page uploads images, PDFs, and other supporting files to Cloudflare R2. Each file has a display title and description and appears on its episode detail page.
+The password-protected `/admin/content` page uploads images, PDFs, and other supporting files to Cloudflare R2. Each file has a display title and description and appears on its episode detail page. The same page can save an episode-specific Spotify link, which appears as a `Video Overview` button on that episode detail page.
 
 Create the configured R2 bucket once:
 

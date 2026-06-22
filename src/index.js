@@ -21,6 +21,8 @@ const safeJson = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
 const SPREAKER_API_BASE = "https://api.spreaker.com/v2";
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
+const EPISODE_CACHE_PREFIX = "/__cache/episode-data";
+const EPISODES_PER_PAGE = 6;
 
 const stripHtml = (value = "") =>
   String(value)
@@ -360,24 +362,37 @@ const loadEpisodeCatalog = async () => {
 
 const attachmentManifestKey = (episodeId) => `episodes/${episodeId}/manifest.json`;
 
-const loadAttachments = async (env, episodeId) => {
+const emptyEpisodeContent = () => ({
+  attachments: [],
+  spotifyUrl: ""
+});
+
+const loadEpisodeContent = async (env, episodeId) => {
   if (!env.EPISODE_CONTENT) {
-    return [];
+    return emptyEpisodeContent();
   }
 
   const object = await env.EPISODE_CONTENT.get(attachmentManifestKey(episodeId));
 
   if (!object) {
-    return [];
+    return emptyEpisodeContent();
   }
 
   try {
     const manifest = await object.json();
-    return Array.isArray(manifest.attachments) ? manifest.attachments : [];
+    return {
+      attachments: Array.isArray(manifest.attachments) ? manifest.attachments : [],
+      spotifyUrl: typeof manifest.spotifyUrl === "string" ? manifest.spotifyUrl : ""
+    };
   } catch (error) {
-    console.error(`Unable to read attachment manifest for episode ${episodeId}`, error);
-    return [];
+    console.error(`Unable to read episode content manifest for episode ${episodeId}`, error);
+    return emptyEpisodeContent();
   }
+};
+
+const loadAttachments = async (env, episodeId) => {
+  const content = await loadEpisodeContent(env, episodeId);
+  return content.attachments;
 };
 
 const loadApiEpisodeCatalog = async (env) => {
@@ -385,21 +400,109 @@ const loadApiEpisodeCatalog = async (env) => {
 
   await Promise.all(
     episodes.map(async (episode) => {
-      episode.attachments = await loadAttachments(env, episode.id);
+      const content = await loadEpisodeContent(env, episode.id);
+      episode.attachments = content.attachments;
+      episode.spotifyUrl = content.spotifyUrl;
     })
   );
 
   return episodes;
 };
 
-const saveAttachments = (env, episodeId, attachments) =>
+const episodeDataCacheRequest = (request, episodeSlug) => {
+  const cacheUrl = new URL(request.url);
+  cacheUrl.pathname = `${EPISODE_CACHE_PREFIX}/${encodeURIComponent(episodeSlug)}`;
+  cacheUrl.search = "";
+  cacheUrl.hash = "";
+  return new Request(cacheUrl, { method: "GET" });
+};
+
+const loadEpisodePageData = async (request, env, ctx, episodeSlug) => {
+  const cache = caches.default;
+  const cacheRequest = episodeDataCacheRequest(request, episodeSlug);
+  const cachedResponse = await cache.match(cacheRequest);
+  let data;
+
+  if (cachedResponse) {
+    data = await cachedResponse.json();
+  } else {
+    const episodes = await loadEpisodes();
+    const listEpisode = episodes.find((episode) => episode.slug === episodeSlug);
+
+    if (!listEpisode) {
+      return null;
+    }
+
+    const episode = await loadEpisodeDetails(listEpisode.id);
+    episode.transcriptContent = await loadEpisodeTranscript(episode);
+    data = { episode, episodes };
+
+    const response = new Response(JSON.stringify(data), {
+      headers: {
+        "content-type": "application/json;charset=UTF-8",
+        "cache-control": `public, max-age=${podcast.spreaker.cacheSeconds}`
+      }
+    });
+    ctx.waitUntil(cache.put(cacheRequest, response));
+  }
+
+  const content = await loadEpisodeContent(env, data.episode.id);
+  data.episode.attachments = content.attachments;
+  data.episode.spotifyUrl = content.spotifyUrl;
+  return data;
+};
+
+const saveEpisodeContent = (env, episodeId, content) =>
   env.EPISODE_CONTENT.put(
     attachmentManifestKey(episodeId),
-    JSON.stringify({ version: 1, attachments }, null, 2),
+    JSON.stringify(
+      {
+        version: 1,
+        attachments: content.attachments ?? [],
+        spotifyUrl: content.spotifyUrl ?? ""
+      },
+      null,
+      2
+    ),
     {
       httpMetadata: { contentType: "application/json;charset=UTF-8" }
     }
   );
+
+const saveAttachments = async (env, episodeId, attachments) => {
+  const content = await loadEpisodeContent(env, episodeId);
+  await saveEpisodeContent(env, episodeId, { ...content, attachments });
+};
+
+const saveSpotifyUrl = async (env, episodeId, spotifyUrl) => {
+  const content = await loadEpisodeContent(env, episodeId);
+  await saveEpisodeContent(env, episodeId, { ...content, spotifyUrl });
+};
+
+const normalizeSpotifyUrl = (value = "") => {
+  const rawValue = String(value).trim();
+
+  if (!rawValue) {
+    return "";
+  }
+
+  try {
+    const url = new URL(rawValue);
+    const hostname = url.hostname.toLowerCase();
+
+    if (
+      url.protocol !== "https:" ||
+      !["open.spotify.com", "spotify.link"].includes(hostname)
+    ) {
+      return null;
+    }
+
+    url.hash = "";
+    return url.href;
+  } catch {
+    return null;
+  }
+};
 
 const sanitizeFilename = (value) => {
   const filename = String(value ?? "attachment")
@@ -689,6 +792,7 @@ const serializeEpisode = (episode, origin, includeBody = false) => {
     episodeNumber: episode.episodeNumber,
     detailPageUrl: `${origin}${episodePath(episode)}`,
     spreakerUrl: episode.spreakerUrl,
+    spotifyUrl: episode.spotifyUrl || null,
     artwork: {
       originalUrl: absoluteUrl(episode.image, origin),
       thumbnailUrl: absoluteUrl(episode.thumbnail, origin)
@@ -1011,6 +1115,58 @@ const renderCases = (cases) =>
     })
     .join("");
 
+const episodeArchiveUrl = (page, category) => {
+  const params = new URLSearchParams();
+
+  if (category) {
+    params.set("category", category);
+  }
+
+  if (page > 1) {
+    params.set("page", String(page));
+  }
+
+  const query = params.toString();
+  return `${query ? `/?${query}` : "/"}#cases`;
+};
+
+const renderEpisodePagination = (currentPage, totalPages, category) => {
+  if (totalPages <= 1) {
+    return "";
+  }
+
+  const pageLinks = Array.from({ length: totalPages }, (_, index) => index + 1)
+    .map(
+      (page) => `
+        <a
+          class="pagination-link${page === currentPage ? " active" : ""}"
+          href="${escapeHtml(episodeArchiveUrl(page, category))}"
+          ${page === currentPage ? 'aria-current="page"' : ""}
+          aria-label="Episode archive page ${page}"
+        >${page}</a>`
+    )
+    .join("");
+
+  return `
+    <nav class="pagination" aria-label="Episode archive pages">
+      ${
+        currentPage > 1
+          ? `<a class="pagination-link pagination-direction" href="${escapeHtml(
+              episodeArchiveUrl(currentPage - 1, category)
+            )}" rel="prev">Previous</a>`
+          : '<span class="pagination-link pagination-direction disabled" aria-disabled="true">Previous</span>'
+      }
+      <div class="pagination-pages">${pageLinks}</div>
+      ${
+        currentPage < totalPages
+          ? `<a class="pagination-link pagination-direction" href="${escapeHtml(
+              episodeArchiveUrl(currentPage + 1, category)
+            )}" rel="next">Next</a>`
+          : '<span class="pagination-link pagination-direction disabled" aria-disabled="true">Next</span>'
+      }
+    </nav>`;
+};
+
 const renderCategoryBrowser = (categories, selectedCategory, episodeCount) => `
   <section class="section category-section" id="categories">
     <p class="section-kicker">Explore by topic</p>
@@ -1241,6 +1397,47 @@ const renderPlaybackTracking = (episodes, countryCode) => {
     </script>`;
 };
 
+const renderExclusiveContentTracking = (episode, countryCode) => {
+  if (!episode.attachments?.length) {
+    return "";
+  }
+
+  return `
+    <script>
+      (function () {
+        var countryCode = ${safeJson(countryCode)};
+        var episodeId = ${safeJson(episode.id)};
+        var episodeTitle = ${safeJson(episode.title)};
+
+        document.querySelectorAll('[data-exclusive-content]').forEach(function (link) {
+          link.addEventListener('click', function () {
+            var parameters = {
+              interaction_type: link.dataset.interactionType,
+              country_code: countryCode,
+              episode_id: episodeId,
+              episode_title: episodeTitle,
+              attachment_id: link.dataset.attachmentId,
+              attachment_title: link.dataset.attachmentTitle,
+              attachment_type: link.dataset.attachmentType,
+              attachment_filename: link.dataset.attachmentFilename,
+              attachment_size_bytes: Number(link.dataset.attachmentSize) || 0,
+              link_url: link.href
+            };
+            var eventName = 'exclusive_content_interaction_' + countryCode;
+
+            if (typeof window.gtag === 'function') {
+              window.gtag('event', eventName, parameters);
+            }
+
+            if (typeof window.fbq === 'function') {
+              window.fbq('trackCustom', eventName, parameters);
+            }
+          });
+        });
+      })();
+    </script>`;
+};
+
 const renderAttachments = (episode) => {
   if (!episode.attachments?.length) {
     return "";
@@ -1256,7 +1453,18 @@ const renderAttachments = (episode) => {
       if (attachment.type === "image") {
         return `
           <figure class="attachment-card attachment-image">
-            <a href="${escapeHtml(url)}" target="_blank" rel="noopener">
+            <a
+              href="${escapeHtml(url)}"
+              target="_blank"
+              rel="noopener"
+              data-exclusive-content
+              data-interaction-type="view"
+              data-attachment-id="${escapeHtml(attachment.id)}"
+              data-attachment-title="${escapeHtml(attachment.title)}"
+              data-attachment-type="${escapeHtml(attachment.type)}"
+              data-attachment-filename="${escapeHtml(attachment.filename)}"
+              data-attachment-size="${escapeHtml(attachment.size)}"
+            >
               <img src="${escapeHtml(url)}" alt="${escapeHtml(
                 attachment.description || attachment.title
               )}" loading="lazy">
@@ -1264,7 +1472,18 @@ const renderAttachments = (episode) => {
             <figcaption>
               <h3>${escapeHtml(attachment.title)}</h3>
               ${description}
-              <a class="attachment-link" href="${escapeHtml(url)}" download>Download image</a>
+              <a
+                class="attachment-link"
+                href="${escapeHtml(url)}"
+                download
+                data-exclusive-content
+                data-interaction-type="download"
+                data-attachment-id="${escapeHtml(attachment.id)}"
+                data-attachment-title="${escapeHtml(attachment.title)}"
+                data-attachment-type="${escapeHtml(attachment.type)}"
+                data-attachment-filename="${escapeHtml(attachment.filename)}"
+                data-attachment-size="${escapeHtml(attachment.size)}"
+              >Download image</a>
             </figcaption>
           </figure>`;
       }
@@ -1281,9 +1500,22 @@ const renderAttachments = (episode) => {
           <p class="attachment-meta">${escapeHtml(attachment.filename)} · ${escapeHtml(
             formatFileSize(attachment.size)
           )}</p>
-          <a class="button secondary-dark" href="${escapeHtml(url)}"${
-            attachment.type === "pdf" ? ' target="_blank" rel="noopener"' : " download"
-          }>${label}</a>
+          <a
+            class="button secondary-dark"
+            href="${escapeHtml(url)}"
+            ${
+              attachment.type === "pdf"
+                ? 'target="_blank" rel="noopener"'
+                : "download"
+            }
+            data-exclusive-content
+            data-interaction-type="${attachment.type === "pdf" ? "view" : "download"}"
+            data-attachment-id="${escapeHtml(attachment.id)}"
+            data-attachment-title="${escapeHtml(attachment.title)}"
+            data-attachment-type="${escapeHtml(attachment.type)}"
+            data-attachment-filename="${escapeHtml(attachment.filename)}"
+            data-attachment-size="${escapeHtml(attachment.size)}"
+          >${label}</a>
         </article>`;
     })
     .join("");
@@ -1294,6 +1526,16 @@ const renderAttachments = (episode) => {
       <h2 id="episode-materials-title">Episode materials</h2>
       <div class="attachment-grid">${items}</div>
     </section>`;
+};
+
+const renderSpotifyEpisodeLink = (episode) => {
+  if (!episode.spotifyUrl) {
+    return "";
+  }
+
+  return `<a class="button spotify-button" href="${escapeHtml(
+    episode.spotifyUrl
+  )}" target="_blank" rel="noopener">Video Overview</a>`;
 };
 
 const renderTranscript = (episode) => {
@@ -1913,6 +2155,25 @@ const styles = `
     resize: vertical;
   }
 
+  .admin-form span {
+    color: #61584f;
+    font-size: 0.86rem;
+    font-weight: 700;
+  }
+
+  .spotify-admin-list {
+    display: grid;
+    gap: 16px;
+    margin-top: 22px;
+  }
+
+  .spotify-admin-form {
+    padding: 16px;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #f7efe5;
+  }
+
   .admin-notice {
     padding: 12px 14px;
     border-left: 4px solid var(--teal);
@@ -1991,6 +2252,12 @@ const styles = `
     border-color: rgba(244, 239, 231, 0.3);
     background: transparent;
     color: var(--paper);
+  }
+
+  .episode-play-panel .spotify-button {
+    border-color: #1db954;
+    background: #1db954;
+    color: #101215;
   }
 
   .episode-meta p {
@@ -2133,6 +2400,56 @@ const styles = `
   .clear-category {
     color: var(--rust);
     font-weight: 900;
+  }
+
+  .archive-count {
+    margin: 12px 0 0;
+    color: #61584f;
+    font-weight: 700;
+  }
+
+  .pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    margin-top: 32px;
+  }
+
+  .pagination-pages {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+  }
+
+  .pagination-link {
+    display: inline-grid;
+    min-width: 42px;
+    min-height: 42px;
+    place-items: center;
+    padding: 8px 12px;
+    border: 1px solid #cbbba7;
+    border-radius: 6px;
+    background: #fffaf2;
+    color: #201c19;
+    font-weight: 900;
+  }
+
+  .pagination-link:hover,
+  .pagination-link.active {
+    border-color: var(--rust);
+    background: var(--rust);
+    color: white;
+  }
+
+  .pagination-direction {
+    min-width: 96px;
+  }
+
+  .pagination-link.disabled {
+    opacity: 0.45;
+    pointer-events: none;
   }
 
   .case-card {
@@ -2330,6 +2647,15 @@ const styles = `
     .case-heading {
       display: grid;
     }
+
+    .pagination {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .pagination-direction {
+      width: 100%;
+    }
   }
 `;
 
@@ -2338,15 +2664,29 @@ const renderPage = (
   featuredEpisode = episodes[0],
   categories = buildEpisodeCategories(episodes),
   selectedCategory = null,
+  requestedPage = 1,
   analytics = {}
 ) => {
   const activeCategory = categories.find((category) => category.slug === selectedCategory);
   const visibleEpisodes = activeCategory?.episodes ?? episodes;
+  const totalPages = Math.max(1, Math.ceil(visibleEpisodes.length / EPISODES_PER_PAGE));
+  const currentPage = Math.min(Math.max(1, requestedPage), totalPages);
+  const pageStart = (currentPage - 1) * EPISODES_PER_PAGE;
+  const paginatedEpisodes = visibleEpisodes.slice(
+    pageStart,
+    pageStart + EPISODES_PER_PAGE
+  );
+  const pageEnd = Math.min(pageStart + paginatedEpisodes.length, visibleEpisodes.length);
+  const pageTitle = activeCategory
+    ? `${activeCategory.label} Episodes`
+    : podcast.name;
 
   return `<!doctype html>
 <html lang="en">
   ${renderHead({
-    title: activeCategory ? `${activeCategory.label} Episodes | ${podcast.name}` : podcast.name,
+    title: `${pageTitle}${currentPage > 1 ? ` - Page ${currentPage}` : ""}${
+      activeCategory ? ` | ${podcast.name}` : ""
+    }`,
     description: activeCategory?.description ?? podcast.description,
     facebookPixelId: analytics.facebookPixelId
   })}
@@ -2407,9 +2747,13 @@ const renderPage = (
               : ""
           }
         </div>
+        <p class="archive-count">Showing ${pageStart + 1}-${pageEnd} of ${
+          visibleEpisodes.length
+        } episodes</p>
         <div class="case-grid">
-          ${renderCases(visibleEpisodes)}
+          ${renderCases(paginatedEpisodes)}
         </div>
+        ${renderEpisodePagination(currentPage, totalPages, activeCategory?.slug ?? null)}
       </section>
 
       ${renderNativeAd()}
@@ -2451,6 +2795,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
           ${renderEpisodeImage(episode, "episode-meta-image")}
           <p class="section-kicker">${escapeHtml(episode.publishedAt ?? "Episode")}</p>
           <a class="button" href="${escapeHtml(episode.href)}">Listen on Spreaker</a>
+          ${renderSpotifyEpisodeLink(episode)}
           ${
             episode.transcriptContent
               ? '<a class="button transcript-button" href="#transcript">Read episode transcript</a>'
@@ -2480,6 +2825,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
     ${renderPlaybackTracking([episode], analytics.countryCode)}
+    ${renderExclusiveContentTracking(episode, analytics.countryCode)}
   </body>
 </html>`;
 
@@ -2536,7 +2882,7 @@ const renderSearchPage = (query, results) => {
 </html>`;
 };
 
-const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
+const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
   const episodeOptions = episodes
     .map(
       (episode) =>
@@ -2545,10 +2891,11 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
     .join("");
 
   const attachmentLists = episodes
-    .filter((episode) => attachmentsByEpisode.get(episode.id)?.length)
+    .filter((episode) => contentByEpisode.get(episode.id)?.attachments.length)
     .map((episode) => {
-      const attachments = attachmentsByEpisode
+      const attachments = contentByEpisode
         .get(episode.id)
+        .attachments
         .map(
           (attachment) => `
             <div class="admin-attachment">
@@ -2574,6 +2921,28 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
         </section>`;
     })
     .join("");
+  const spotifyForms = episodes
+    .map((episode) => {
+      const spotifyUrl = contentByEpisode.get(episode.id)?.spotifyUrl ?? "";
+
+      return `
+        <form class="admin-form spotify-admin-form" method="post" action="/admin/content/spotify">
+          <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
+          <label>
+            ${escapeHtml(episode.title)}
+            <span>Video Overview URL</span>
+            <input
+              name="spotifyUrl"
+              type="url"
+              inputmode="url"
+              placeholder="https://open.spotify.com/episode/..."
+              value="${escapeHtml(spotifyUrl)}"
+            >
+          </label>
+          <button class="button secondary-dark" type="submit">Save Video Overview</button>
+        </form>`;
+    })
+    .join("");
 
   return `<!doctype html>
 <html lang="en">
@@ -2587,7 +2956,7 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
         <a class="back-link" href="/">Back to site</a>
         <p class="section-kicker">Administration</p>
         <h1>Episode content</h1>
-        <p>Upload images, PDFs, and other supporting files. The title and description appear on the episode detail page.</p>
+        <p>Upload images, PDFs, and other supporting files, or add episode-specific Video Overview links. This content appears on the episode detail page.</p>
         ${notice ? `<p class="admin-notice">${escapeHtml(notice)}</p>` : ""}
         <form class="admin-form" method="post" action="/admin/content/upload" enctype="multipart/form-data">
           <label>
@@ -2608,6 +2977,12 @@ const renderAdminPage = (episodes, attachmentsByEpisode, notice = "") => {
           </label>
           <button class="button" type="submit">Upload content</button>
         </form>
+      </section>
+      <section class="admin-panel">
+        <p class="section-kicker">Video Overview</p>
+        <h2>Episode Video Overview links</h2>
+        <p>Paste a Spotify episode link for each Video Overview. Leave the field blank and save to remove the link.</p>
+        <div class="spotify-admin-list">${spotifyForms}</div>
       </section>
       <section class="admin-panel">
         <p class="section-kicker">Current content</p>
@@ -2691,17 +3066,19 @@ const handleAdminPage = async (request, env, url) => {
   }
 
   const episodes = await loadEpisodes();
-  const attachmentEntries = await Promise.all(
-    episodes.map(async (episode) => [episode.id, await loadAttachments(env, episode.id)])
+  const contentEntries = await Promise.all(
+    episodes.map(async (episode) => [episode.id, await loadEpisodeContent(env, episode.id)])
   );
   const notices = {
     uploaded: "Content uploaded successfully.",
     deleted: "Content deleted.",
-    missing: "The selected episode or file could not be found."
+    missing: "The selected episode or file could not be found.",
+    spotify: "Video Overview link saved.",
+    invalid_spotify: "Enter a valid Spotify URL for the Video Overview."
   };
 
   return new Response(
-    renderAdminPage(episodes, new Map(attachmentEntries), notices[url.searchParams.get("status")]),
+    renderAdminPage(episodes, new Map(contentEntries), notices[url.searchParams.get("status")]),
     {
       headers: {
         "content-type": "text/html;charset=UTF-8",
@@ -2776,6 +3153,38 @@ const handleUpload = async (request, env) => {
   }
 
   return adminRedirect(request, "?status=uploaded");
+};
+
+const handleSpotifyLink = async (request, env) => {
+  if (!isAdmin(request, env)) {
+    return adminUnauthorized();
+  }
+
+  if (!sameOriginRequest(request)) {
+    return new Response("Invalid request origin", { status: 403 });
+  }
+
+  if (!env.EPISODE_CONTENT) {
+    return new Response("Content storage is not configured", { status: 503 });
+  }
+
+  const form = await request.formData();
+  const episodeId = String(form.get("episodeId") ?? "").trim();
+  const spotifyUrl = normalizeSpotifyUrl(form.get("spotifyUrl"));
+
+  if (spotifyUrl === null) {
+    return adminRedirect(request, "?status=invalid_spotify");
+  }
+
+  const episodes = await loadEpisodes();
+
+  if (!episodes.some((episode) => episode.id === episodeId)) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  await saveSpotifyUrl(env, episodeId, spotifyUrl);
+
+  return adminRedirect(request, "?status=spotify");
 };
 
 const handleDelete = async (request, env) => {
@@ -2874,11 +3283,12 @@ export default {
         }
 
         const episode = await loadEpisodeDetails(listEpisode.id);
-        const [attachments, transcriptContent] = await Promise.all([
-          loadAttachments(env, episode.id),
+        const [content, transcriptContent] = await Promise.all([
+          loadEpisodeContent(env, episode.id),
           loadEpisodeTranscript(episode)
         ]);
-        episode.attachments = attachments;
+        episode.attachments = content.attachments;
+        episode.spotifyUrl = content.spotifyUrl;
         episode.transcriptContent = transcriptContent;
 
         return jsonResponse(
@@ -2909,6 +3319,10 @@ export default {
 
       if (url.pathname === "/admin/content/upload" && request.method === "POST") {
         return handleUpload(request, env);
+      }
+
+      if (url.pathname === "/admin/content/spotify" && request.method === "POST") {
+        return handleSpotifyLink(request, env);
       }
 
       if (url.pathname === "/admin/content/delete" && request.method === "POST") {
@@ -2945,26 +3359,19 @@ export default {
       const episodeSlug = episodeSlugFromPath(url.pathname);
 
       if (episodeSlug) {
-        const episodes = await loadEpisodes();
-        const listEpisode = episodes.find((episode) => episode.slug === episodeSlug);
+        const pageData = await loadEpisodePageData(request, env, ctx, episodeSlug);
 
-        if (!listEpisode) {
+        if (!pageData) {
           return new Response("Not found", { status: 404 });
         }
 
-        const episode = await loadEpisodeDetails(listEpisode.id);
-        const [attachments, transcriptContent] = await Promise.all([
-          loadAttachments(env, episode.id),
-          loadEpisodeTranscript(episode)
-        ]);
-        episode.attachments = attachments;
-        episode.transcriptContent = transcriptContent;
+        const { episode, episodes } = pageData;
         ctx.waitUntil(notifyEpisodeView(env, request, episode));
 
         return new Response(renderEpisodePage(episode, episodes, analytics), {
           headers: {
             "content-type": "text/html;charset=UTF-8",
-            "cache-control": cacheControl
+            "cache-control": "no-cache"
           }
         });
       }
@@ -2982,9 +3389,18 @@ export default {
       const featuredEpisode = episodes[0];
       const categories = buildEpisodeCategories(episodes);
       const selectedCategory = String(url.searchParams.get("category") ?? "").trim();
+      const pageValue = Number.parseInt(url.searchParams.get("page") ?? "1", 10);
+      const requestedPage = Number.isFinite(pageValue) && pageValue > 0 ? pageValue : 1;
 
       return new Response(
-        renderPage(episodes, featuredEpisode, categories, selectedCategory, analytics),
+        renderPage(
+          episodes,
+          featuredEpisode,
+          categories,
+          selectedCategory,
+          requestedPage,
+          analytics
+        ),
         {
           headers: {
             "content-type": "text/html;charset=UTF-8",

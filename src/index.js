@@ -21,8 +21,6 @@ const safeJson = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
 const SPREAKER_API_BASE = "https://api.spreaker.com/v2";
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
-const EPISODE_CACHE_PREFIX = "/__cache/episode-data";
-const EPISODES_PER_PAGE = 6;
 
 const stripHtml = (value = "") =>
   String(value)
@@ -84,77 +82,6 @@ const formatSitemapDate = (value) => {
   return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
 };
 
-const toIsoDate = (value) => {
-  if (!value) {
-    return null;
-  }
-
-  const date = new Date(`${value.replace(" ", "T")}Z`);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
-};
-
-const inferMediaType = (mimeType = "") => {
-  if (mimeType.startsWith("image/")) return "image";
-  if (mimeType.startsWith("audio/")) return "audio";
-  if (mimeType.startsWith("video/")) return "video";
-  if (
-    mimeType.includes("pdf") ||
-    mimeType.includes("subrip") ||
-    mimeType.startsWith("text/")
-  ) {
-    return "document";
-  }
-  return "file";
-};
-
-const buildEpisodeMedia = (episode) => {
-  const media = [];
-  const artwork = episode.image_original_url ?? episode.image_url;
-
-  if (artwork) {
-    media.push({
-      type: "image",
-      role: "artwork",
-      title: "Episode artwork",
-      url: artwork,
-      thumbnailUrl: episode.image_url ?? artwork,
-      mimeType: "image/jpeg"
-    });
-  }
-
-  if (episode.playback_url) {
-    media.push({
-      type: "audio",
-      role: "stream",
-      title: "Stream episode",
-      url: episode.playback_url,
-      mimeType: "audio/mpeg"
-    });
-  }
-
-  if (episode.download_url) {
-    media.push({
-      type: "audio",
-      role: "download",
-      title: "Download episode",
-      url: episode.download_url,
-      mimeType: "audio/mpeg"
-    });
-  }
-
-  for (const transcript of episode.transcripts_generated ?? []) {
-    media.push({
-      type: inferMediaType(transcript.transcript_type),
-      role: "transcript",
-      title: "Episode transcript",
-      url: transcript.transcript_url,
-      mimeType: transcript.transcript_type
-    });
-  }
-
-  return [...media, ...(podcast.episodeMedia?.[episode.slug] ?? [])];
-};
-
 const fetchSpreakerJson = async (path) => {
   const apiUrl = path.startsWith("http") ? path : `${SPREAKER_API_BASE}${path}`;
   const response = await fetch(apiUrl, {
@@ -213,20 +140,11 @@ const normalizeEpisode = (episode) => {
     detail: summary,
     publishedAt: formatPublishedDate(episode.published_at),
     publishedDate: formatSitemapDate(episode.published_at),
-    publishedAtIso: toIsoDate(episode.published_at),
-    durationMs: episode.duration ?? null,
-    explicit: Boolean(episode.explicit),
-    seasonNumber: episode.season_number ?? null,
-    episodeNumber: episode.episode_number ?? null,
     href: episode.site_url,
     spreakerUrl: episode.site_url,
     spreakerResource: `episode_id=${episode.episode_id}`,
-    playbackUrl: episode.playback_url ?? null,
-    downloadUrl: episode.download_url ?? null,
     transcript: selectTranscript(episode),
     image: episode.image_original_url ?? episode.image_url ?? podcast.heroImage,
-    thumbnail: episode.image_url ?? episode.image_original_url ?? podcast.heroImage,
-    media: buildEpisodeMedia(episode),
     body: description
       .split(/\n+/)
       .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
@@ -364,7 +282,7 @@ const attachmentManifestKey = (episodeId) => `episodes/${episodeId}/manifest.jso
 
 const emptyEpisodeContent = () => ({
   attachments: [],
-  spotifyUrl: ""
+  videoUrl: ""
 });
 
 const loadEpisodeContent = async (env, episodeId) => {
@@ -382,7 +300,12 @@ const loadEpisodeContent = async (env, episodeId) => {
     const manifest = await object.json();
     return {
       attachments: Array.isArray(manifest.attachments) ? manifest.attachments : [],
-      spotifyUrl: typeof manifest.spotifyUrl === "string" ? manifest.spotifyUrl : ""
+      videoUrl:
+        typeof manifest.videoUrl === "string"
+          ? manifest.videoUrl
+          : typeof manifest.youtubeUrl === "string"
+            ? manifest.youtubeUrl
+            : ""
     };
   } catch (error) {
     console.error(`Unable to read episode content manifest for episode ${episodeId}`, error);
@@ -390,76 +313,14 @@ const loadEpisodeContent = async (env, episodeId) => {
   }
 };
 
-const loadAttachments = async (env, episodeId) => {
-  const content = await loadEpisodeContent(env, episodeId);
-  return content.attachments;
-};
-
-const loadApiEpisodeCatalog = async (env) => {
-  const episodes = await loadEpisodeCatalog();
-
-  await Promise.all(
-    episodes.map(async (episode) => {
-      const content = await loadEpisodeContent(env, episode.id);
-      episode.attachments = content.attachments;
-      episode.spotifyUrl = content.spotifyUrl;
-    })
-  );
-
-  return episodes;
-};
-
-const episodeDataCacheRequest = (request, episodeSlug) => {
-  const cacheUrl = new URL(request.url);
-  cacheUrl.pathname = `${EPISODE_CACHE_PREFIX}/${encodeURIComponent(episodeSlug)}`;
-  cacheUrl.search = "";
-  cacheUrl.hash = "";
-  return new Request(cacheUrl, { method: "GET" });
-};
-
-const loadEpisodePageData = async (request, env, ctx, episodeSlug) => {
-  const cache = caches.default;
-  const cacheRequest = episodeDataCacheRequest(request, episodeSlug);
-  const cachedResponse = await cache.match(cacheRequest);
-  let data;
-
-  if (cachedResponse) {
-    data = await cachedResponse.json();
-  } else {
-    const episodes = await loadEpisodes();
-    const listEpisode = episodes.find((episode) => episode.slug === episodeSlug);
-
-    if (!listEpisode) {
-      return null;
-    }
-
-    const episode = await loadEpisodeDetails(listEpisode.id);
-    episode.transcriptContent = await loadEpisodeTranscript(episode);
-    data = { episode, episodes };
-
-    const response = new Response(JSON.stringify(data), {
-      headers: {
-        "content-type": "application/json;charset=UTF-8",
-        "cache-control": `public, max-age=${podcast.spreaker.cacheSeconds}`
-      }
-    });
-    ctx.waitUntil(cache.put(cacheRequest, response));
-  }
-
-  const content = await loadEpisodeContent(env, data.episode.id);
-  data.episode.attachments = content.attachments;
-  data.episode.spotifyUrl = content.spotifyUrl;
-  return data;
-};
-
 const saveEpisodeContent = (env, episodeId, content) =>
   env.EPISODE_CONTENT.put(
     attachmentManifestKey(episodeId),
     JSON.stringify(
       {
-        version: 1,
+        version: 2,
         attachments: content.attachments ?? [],
-        spotifyUrl: content.spotifyUrl ?? ""
+        videoUrl: content.videoUrl ?? ""
       },
       null,
       2
@@ -469,39 +330,90 @@ const saveEpisodeContent = (env, episodeId, content) =>
     }
   );
 
+const loadAttachments = async (env, episodeId) =>
+  (await loadEpisodeContent(env, episodeId)).attachments;
+
 const saveAttachments = async (env, episodeId, attachments) => {
   const content = await loadEpisodeContent(env, episodeId);
-  await saveEpisodeContent(env, episodeId, { ...content, attachments });
+  return saveEpisodeContent(env, episodeId, { ...content, attachments });
 };
 
-const saveSpotifyUrl = async (env, episodeId, spotifyUrl) => {
-  const content = await loadEpisodeContent(env, episodeId);
-  await saveEpisodeContent(env, episodeId, { ...content, spotifyUrl });
-};
+const parseVideoUrl = (value) => {
+  const input = String(value ?? "").trim();
 
-const normalizeSpotifyUrl = (value = "") => {
-  const rawValue = String(value).trim();
-
-  if (!rawValue) {
-    return "";
+  if (!input) {
+    return null;
   }
 
+  let url;
+
   try {
-    const url = new URL(rawValue);
-    const hostname = url.hostname.toLowerCase();
-
-    if (
-      url.protocol !== "https:" ||
-      !["open.spotify.com", "spotify.link"].includes(hostname)
-    ) {
-      return null;
-    }
-
-    url.hash = "";
-    return url.href;
+    url = new URL(input);
   } catch {
     return null;
   }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return null;
+  }
+
+  if (url.protocol === "http:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+    return null;
+  }
+
+  if (!url.hostname) {
+    return null;
+  }
+
+  return {
+    url: url.href
+  };
+};
+
+const videoContentType = (url) => {
+  const pathname = new URL(url).pathname.toLowerCase();
+
+  if (pathname.endsWith(".m3u8")) {
+    return "application/x-mpegURL";
+  }
+
+  if (pathname.endsWith(".mp4")) {
+    return "video/mp4";
+  }
+
+  if (pathname.endsWith(".webm")) {
+    return "video/webm";
+  }
+
+  if (pathname.endsWith(".ogv") || pathname.endsWith(".ogg")) {
+    return "video/ogg";
+  }
+
+  return "";
+};
+
+const isHlsVideoUrl = (url) => new URL(url).pathname.toLowerCase().endsWith(".m3u8");
+
+const cloudflareStreamThumbnailUrl = (url) => {
+  const videoUrl = new URL(url);
+  const hostname = videoUrl.hostname.toLowerCase();
+
+  if (!hostname.endsWith(".cloudflarestream.com") && hostname !== "videodelivery.net") {
+    return "";
+  }
+
+  const videoId = videoUrl.pathname.split("/").filter(Boolean)[0];
+
+  if (!videoId) {
+    return "";
+  }
+
+  const thumbnailUrl = new URL(`/${videoId}/thumbnails/thumbnail.jpg`, videoUrl.origin);
+  thumbnailUrl.searchParams.set("time", "0s");
+  thumbnailUrl.searchParams.set("height", "720");
+  thumbnailUrl.searchParams.set("fit", "scale");
+
+  return thumbnailUrl.href;
 };
 
 const sanitizeFilename = (value) => {
@@ -709,17 +621,6 @@ const notifyEpisodeView = (env, request, episode) => {
   });
 };
 
-const renderLinks = (links) =>
-  links
-    .map(
-      (link) => `
-        <a class="listen-link" href="${escapeHtml(link.href)}">
-          <span>${escapeHtml(link.label)}</span>
-          <span aria-hidden="true">+</span>
-        </a>`
-    )
-    .join("");
-
 const renderEpisodeImage = (episode, className = "episode-art") => `
   <img
     class="${escapeHtml(className)}"
@@ -735,125 +636,6 @@ const episodeSlugFromPath = (pathname) => {
 
   return match?.[1] ?? null;
 };
-
-const apiEpisodeSlugFromPath = (pathname) => {
-  const match = pathname.match(/^\/api\/episodes\/([^/]+)\/?$/);
-  return match?.[1] ?? null;
-};
-
-const absoluteUrl = (value, origin) => {
-  if (!value) {
-    return null;
-  }
-
-  return new URL(value, origin).href;
-};
-
-const serializeMedia = (media, origin) =>
-  media.map((item) => ({
-    type: item.type,
-    role: item.role ?? null,
-    title: item.title ?? null,
-    description: item.description ?? null,
-    url: absoluteUrl(item.url, origin),
-    thumbnailUrl: absoluteUrl(item.thumbnailUrl, origin),
-    mimeType: item.mimeType ?? null,
-    size: item.size ?? null,
-    uploadedAt: item.uploadedAt ?? null
-  }));
-
-const attachmentMedia = (episodeId, attachments) =>
-  attachments.map((attachment) => ({
-    type: attachment.type === "pdf" ? "document" : attachment.type,
-    role: "supplemental",
-    title: attachment.title || attachment.filename,
-    description: attachment.description || null,
-    url: attachmentPath(episodeId, attachment.id),
-    mimeType: attachment.contentType,
-    size: attachment.size,
-    uploadedAt: attachment.uploadedAt
-  }));
-
-const serializeEpisode = (episode, origin, includeBody = false) => {
-  const media = [
-    ...(episode.media ?? []),
-    ...attachmentMedia(episode.id, episode.attachments ?? [])
-  ];
-  const serialized = {
-    id: episode.id,
-    slug: episode.slug,
-    title: episode.title,
-    summary: episode.summary,
-    publishedAt: episode.publishedAtIso,
-    publishedAtDisplay: episode.publishedAt,
-    durationMs: episode.durationMs,
-    explicit: episode.explicit,
-    seasonNumber: episode.seasonNumber,
-    episodeNumber: episode.episodeNumber,
-    detailPageUrl: `${origin}${episodePath(episode)}`,
-    spreakerUrl: episode.spreakerUrl,
-    spotifyUrl: episode.spotifyUrl || null,
-    artwork: {
-      originalUrl: absoluteUrl(episode.image, origin),
-      thumbnailUrl: absoluteUrl(episode.thumbnail, origin)
-    },
-    player: {
-      provider: "spreaker",
-      resource: episode.spreakerResource,
-      playbackUrl: episode.playbackUrl,
-      downloadUrl: episode.downloadUrl
-    },
-    media: serializeMedia(media, origin)
-  };
-
-  if (includeBody) {
-    serialized.description = episode.body.join("\n\n");
-    serialized.body = episode.body;
-    serialized.transcript = episode.transcriptContent ?? null;
-  }
-
-  return serialized;
-};
-
-const API_HEADERS = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, HEAD, OPTIONS",
-  "access-control-allow-headers": "Content-Type",
-  "content-type": "application/json;charset=UTF-8"
-};
-
-const jsonResponse = (data, status = 200, cacheControl = "no-store", head = false) =>
-  new Response(head ? null : JSON.stringify(data), {
-    status,
-    headers: {
-      ...API_HEADERS,
-      "cache-control": cacheControl
-    }
-  });
-
-const renderPodcastApi = (episodes, origin) => ({
-  apiVersion: "1.0",
-  podcast: {
-    name: podcast.name,
-    tagline: podcast.tagline,
-    description: podcast.description,
-    host: podcast.host,
-    email: podcast.email,
-    heroImageUrl: absoluteUrl(podcast.heroImage, origin),
-    websiteUrl: origin,
-    links: podcast.links
-      .filter((link) => link.href && link.href !== "#")
-      .map((link) => ({
-        label: link.label,
-        url: absoluteUrl(link.href, origin)
-      }))
-  },
-  episodes: episodes.map((episode) => serializeEpisode(episode, origin)),
-  meta: {
-    episodeCount: episodes.length,
-    generatedAt: new Date().toISOString()
-  }
-});
 
 const searchEpisodes = (episodes, query) => {
   const normalizedQuery = normalizeSearchText(query);
@@ -1115,58 +897,6 @@ const renderCases = (cases) =>
     })
     .join("");
 
-const episodeArchiveUrl = (page, category) => {
-  const params = new URLSearchParams();
-
-  if (category) {
-    params.set("category", category);
-  }
-
-  if (page > 1) {
-    params.set("page", String(page));
-  }
-
-  const query = params.toString();
-  return `${query ? `/?${query}` : "/"}#cases`;
-};
-
-const renderEpisodePagination = (currentPage, totalPages, category) => {
-  if (totalPages <= 1) {
-    return "";
-  }
-
-  const pageLinks = Array.from({ length: totalPages }, (_, index) => index + 1)
-    .map(
-      (page) => `
-        <a
-          class="pagination-link${page === currentPage ? " active" : ""}"
-          href="${escapeHtml(episodeArchiveUrl(page, category))}"
-          ${page === currentPage ? 'aria-current="page"' : ""}
-          aria-label="Episode archive page ${page}"
-        >${page}</a>`
-    )
-    .join("");
-
-  return `
-    <nav class="pagination" aria-label="Episode archive pages">
-      ${
-        currentPage > 1
-          ? `<a class="pagination-link pagination-direction" href="${escapeHtml(
-              episodeArchiveUrl(currentPage - 1, category)
-            )}" rel="prev">Previous</a>`
-          : '<span class="pagination-link pagination-direction disabled" aria-disabled="true">Previous</span>'
-      }
-      <div class="pagination-pages">${pageLinks}</div>
-      ${
-        currentPage < totalPages
-          ? `<a class="pagination-link pagination-direction" href="${escapeHtml(
-              episodeArchiveUrl(currentPage + 1, category)
-            )}" rel="next">Next</a>`
-          : '<span class="pagination-link pagination-direction disabled" aria-disabled="true">Next</span>'
-      }
-    </nav>`;
-};
-
 const renderCategoryBrowser = (categories, selectedCategory, episodeCount) => `
   <section class="section category-section" id="categories">
     <p class="section-kicker">Explore by topic</p>
@@ -1306,34 +1036,55 @@ const renderSpreakerPlayer = (episode) => `
   >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
 
 const renderPlaybackTracking = (episodes, countryCode) => {
-  const players = episodes.map((episode) => ({
+  const audioPlayers = episodes.map((episode) => ({
     elementId: `spreaker-player-${episode.id}`,
     episodeId: episode.id,
     episodeTitle: episode.title
   }));
+  const videoPlayers = episodes
+    .filter((episode) => parseVideoUrl(episode.videoUrl))
+    .map((episode) => ({
+      elementId: `overview-video-${episode.id}`,
+      episodeId: episode.id,
+      episodeTitle: episode.title
+    }));
 
-  if (!players.length) {
+  if (!audioPlayers.length && !videoPlayers.length) {
     return "";
   }
 
   return `
     <script>
-      window.addEventListener('load', function () {
-        if (!window.SP || typeof window.SP.getWidget !== 'function') return;
-
+      (function () {
         var countryCode = ${safeJson(countryCode)};
-        var players = ${safeJson(players)};
+        var audioPlayers = ${safeJson(audioPlayers)};
+        var videoPlayers = ${safeJson(videoPlayers)};
+        var milestones = [20, 50, 75];
 
-        function sendPlaybackEvent(type, episode, position, duration) {
-          var eventName = type + '_' + countryCode;
+        function sendPlaybackEvent(type, episode, position, duration, mediaType, extraParameters) {
+          var numericPosition = Number(position) || 0;
+          var numericDuration = Number(duration) || 0;
+          var playbackPercent =
+            numericDuration > 0
+              ? Math.min(100, Math.max(0, Math.round((numericPosition / numericDuration) * 100)))
+              : 0;
+          var eventName = mediaType + '_' + type + '_' + countryCode;
           var parameters = {
             event_type: type,
             country_code: countryCode,
+            media_type: mediaType,
             episode_id: episode.episodeId,
             episode_title: episode.episodeTitle,
-            playback_position_ms: Math.round(Number(position) || 0),
-            playback_duration_ms: Math.round(Number(duration) || 0)
+            playback_position_ms: Math.round(numericPosition),
+            playback_duration_ms: Math.round(numericDuration),
+            playback_percent: playbackPercent
           };
+
+          if (extraParameters) {
+            Object.keys(extraParameters).forEach(function (key) {
+              parameters[key] = extraParameters[key];
+            });
+          }
 
           if (typeof window.gtag === 'function') {
             window.gtag('event', eventName, parameters);
@@ -1344,98 +1095,217 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           }
         }
 
-        players.forEach(function (episode) {
+        function initializeAudioTracking(attempt) {
+          if (!window.SP || typeof window.SP.getWidget !== 'function') {
+            if (attempt < 20) {
+              window.setTimeout(function () {
+                initializeAudioTracking(attempt + 1);
+              }, 500);
+            }
+            return;
+          }
+
+          audioPlayers.forEach(function (episode) {
+            var element = document.getElementById(episode.elementId);
+            if (!element || element.dataset.analyticsInitialized === 'true') return;
+
+            var widget = window.SP.getWidget(episode.elementId);
+            if (!widget || typeof widget.getState !== 'function') return;
+
+            element.dataset.analyticsInitialized = 'true';
+            var initialized = false;
+            var previousPlaying = false;
+            var polling = false;
+            var completedMilestones = {};
+
+            window.setInterval(function () {
+              if (polling) return;
+              polling = true;
+
+              var stateRequested = widget.getState(function (_currentEpisode, _state, isPlaying) {
+                var playing = Boolean(isPlaying);
+                var positionRequested = widget.getPosition(function (position, _progress, duration) {
+                  if (!initialized) {
+                    initialized = true;
+                    if (playing) {
+                      sendPlaybackEvent('play', episode, position, duration, 'audio');
+                    }
+                  } else if (playing !== previousPlaying) {
+                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, position, duration, 'audio');
+                  }
+
+                  previousPlaying = playing;
+
+                  if (playing && Number(duration) > 0) {
+                    var progress = (Number(position) / Number(duration)) * 100;
+
+                    milestones.forEach(function (milestone) {
+                      if (completedMilestones[milestone] || progress < milestone) return;
+
+                      completedMilestones[milestone] = true;
+                      sendPlaybackEvent(
+                        'progress_' + milestone,
+                        episode,
+                        position,
+                        duration,
+                        'audio',
+                        { progress_percent: milestone }
+                      );
+                    });
+                  }
+
+                  polling = false;
+                });
+
+                if (positionRequested === false) {
+                  if (!initialized && playing) {
+                    sendPlaybackEvent('play', episode, 0, 0, 'audio');
+                  } else if (initialized && playing !== previousPlaying) {
+                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, 0, 0, 'audio');
+                  }
+
+                  initialized = true;
+                  previousPlaying = playing;
+                  polling = false;
+                }
+              });
+
+              if (stateRequested === false) {
+                polling = false;
+              }
+            }, 1000);
+          });
+        }
+
+        initializeAudioTracking(0);
+
+        videoPlayers.forEach(function (episode) {
           var element = document.getElementById(episode.elementId);
           if (!element) return;
 
-          var widget = window.SP.getWidget(episode.elementId);
-          if (!widget || typeof widget.getState !== 'function') return;
+          var completedMilestones = {};
 
-          var initialized = false;
-          var previousPlaying = false;
-          var polling = false;
+          function durationMs() {
+            return Number.isFinite(element.duration) ? element.duration * 1000 : 0;
+          }
 
-          window.setInterval(function () {
-            if (polling) return;
-            polling = true;
+          function positionMs() {
+            return Number.isFinite(element.currentTime) ? element.currentTime * 1000 : 0;
+          }
 
-            var stateRequested = widget.getState(function (_currentEpisode, _state, isPlaying) {
-              var playing = Boolean(isPlaying);
+          element.addEventListener('play', function () {
+            sendPlaybackEvent('play', episode, positionMs(), durationMs(), 'video');
+          });
 
-              if (!initialized) {
-                initialized = true;
-                if (!playing) {
-                  previousPlaying = false;
-                  polling = false;
-                  return;
-                }
-              }
+          element.addEventListener('pause', function () {
+            if (element.ended) return;
+            sendPlaybackEvent('pause', episode, positionMs(), durationMs(), 'video');
+          });
 
-              if (playing === previousPlaying) {
-                polling = false;
-                return;
-              }
+          element.addEventListener('ended', function () {
+            sendPlaybackEvent(
+              'ended',
+              episode,
+              positionMs(),
+              durationMs(),
+              'video',
+              { progress_percent: 100 }
+            );
+          });
 
-              previousPlaying = playing;
-              var positionRequested = widget.getPosition(function (position, _progress, duration) {
-                sendPlaybackEvent(playing ? 'play' : 'pause', episode, position, duration);
-                polling = false;
-              });
+          element.addEventListener('timeupdate', function () {
+            if (!Number.isFinite(element.duration) || element.duration <= 0) return;
 
-              if (positionRequested === false) {
-                sendPlaybackEvent(playing ? 'play' : 'pause', episode, 0, 0);
-                polling = false;
-              }
+            var progress = (element.currentTime / element.duration) * 100;
+
+            milestones.forEach(function (milestone) {
+              if (completedMilestones[milestone] || progress < milestone) return;
+
+              completedMilestones[milestone] = true;
+              sendPlaybackEvent(
+                'progress_' + milestone,
+                episode,
+                positionMs(),
+                durationMs(),
+                'video',
+                { progress_percent: milestone }
+              );
             });
-
-            if (stateRequested === false) {
-              polling = false;
-            }
-          }, 1000);
+          });
         });
-      });
+      })();
     </script>`;
 };
 
-const renderExclusiveContentTracking = (episode, countryCode) => {
-  if (!episode.attachments?.length) {
+const renderHlsPlayback = (episodes) => {
+  const hasHlsVideo = episodes.some((episode) => {
+    const video = parseVideoUrl(episode.videoUrl);
+    return video && isHlsVideoUrl(video.url);
+  });
+
+  if (!hasHlsVideo) {
     return "";
   }
 
   return `
     <script>
-      (function () {
-        var countryCode = ${safeJson(countryCode)};
-        var episodeId = ${safeJson(episode.id)};
-        var episodeTitle = ${safeJson(episode.title)};
+      window.initializeHlsPlayers = function () {
+        document.querySelectorAll('video[data-hls-src]').forEach(function (element) {
+          if (element.dataset.hlsInitialized === 'true') return;
 
-        document.querySelectorAll('[data-exclusive-content]').forEach(function (link) {
-          link.addEventListener('click', function () {
-            var parameters = {
-              interaction_type: link.dataset.interactionType,
-              country_code: countryCode,
-              episode_id: episodeId,
-              episode_title: episodeTitle,
-              attachment_id: link.dataset.attachmentId,
-              attachment_title: link.dataset.attachmentTitle,
-              attachment_type: link.dataset.attachmentType,
-              attachment_filename: link.dataset.attachmentFilename,
-              attachment_size_bytes: Number(link.dataset.attachmentSize) || 0,
-              link_url: link.href
-            };
-            var eventName = 'exclusive_content_interaction_' + countryCode;
+          var source = element.getAttribute('data-hls-src');
+          if (!source) return;
 
-            if (typeof window.gtag === 'function') {
-              window.gtag('event', eventName, parameters);
-            }
+          if (window.Hls && window.Hls.isSupported()) {
+            var hls = new window.Hls();
+            element.dataset.hlsInitialized = 'true';
+            hls.loadSource(source);
+            hls.attachMedia(element);
+            element._hls = hls;
 
-            if (typeof window.fbq === 'function') {
-              window.fbq('trackCustom', eventName, parameters);
-            }
-          });
+            hls.on(window.Hls.Events.ERROR, function (_event, data) {
+              if (!data.fatal) return;
+
+              if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+                hls.startLoad();
+                return;
+              }
+
+              if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+                hls.recoverMediaError();
+                return;
+              }
+
+              hls.destroy();
+              element.dataset.hlsInitialized = 'false';
+              var fallback = element.parentElement.querySelector('[data-hls-fallback]');
+              if (fallback) fallback.hidden = false;
+            });
+            return;
+          }
+
+          if (element.canPlayType('application/vnd.apple.mpegurl')) {
+            element.dataset.hlsInitialized = 'true';
+            element.src = source;
+            return;
+          }
+
+          var fallback = element.parentElement.querySelector('[data-hls-fallback]');
+          if (fallback) fallback.hidden = false;
         });
-      })();
-    </script>`;
+      };
+
+      window.showHlsFallback = function () {
+        document.querySelectorAll('[data-hls-fallback]').forEach(function (fallback) {
+          fallback.hidden = false;
+        });
+      };
+    </script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"
+      onload="window.initializeHlsPlayers()"
+      onerror="window.showHlsFallback()"
+    ></script>`;
 };
 
 const renderAttachments = (episode) => {
@@ -1453,18 +1323,7 @@ const renderAttachments = (episode) => {
       if (attachment.type === "image") {
         return `
           <figure class="attachment-card attachment-image">
-            <a
-              href="${escapeHtml(url)}"
-              target="_blank"
-              rel="noopener"
-              data-exclusive-content
-              data-interaction-type="view"
-              data-attachment-id="${escapeHtml(attachment.id)}"
-              data-attachment-title="${escapeHtml(attachment.title)}"
-              data-attachment-type="${escapeHtml(attachment.type)}"
-              data-attachment-filename="${escapeHtml(attachment.filename)}"
-              data-attachment-size="${escapeHtml(attachment.size)}"
-            >
+            <a href="${escapeHtml(url)}" target="_blank" rel="noopener">
               <img src="${escapeHtml(url)}" alt="${escapeHtml(
                 attachment.description || attachment.title
               )}" loading="lazy">
@@ -1472,18 +1331,7 @@ const renderAttachments = (episode) => {
             <figcaption>
               <h3>${escapeHtml(attachment.title)}</h3>
               ${description}
-              <a
-                class="attachment-link"
-                href="${escapeHtml(url)}"
-                download
-                data-exclusive-content
-                data-interaction-type="download"
-                data-attachment-id="${escapeHtml(attachment.id)}"
-                data-attachment-title="${escapeHtml(attachment.title)}"
-                data-attachment-type="${escapeHtml(attachment.type)}"
-                data-attachment-filename="${escapeHtml(attachment.filename)}"
-                data-attachment-size="${escapeHtml(attachment.size)}"
-              >Download image</a>
+              <a class="attachment-link" href="${escapeHtml(url)}" download>Download image</a>
             </figcaption>
           </figure>`;
       }
@@ -1500,22 +1348,9 @@ const renderAttachments = (episode) => {
           <p class="attachment-meta">${escapeHtml(attachment.filename)} · ${escapeHtml(
             formatFileSize(attachment.size)
           )}</p>
-          <a
-            class="button secondary-dark"
-            href="${escapeHtml(url)}"
-            ${
-              attachment.type === "pdf"
-                ? 'target="_blank" rel="noopener"'
-                : "download"
-            }
-            data-exclusive-content
-            data-interaction-type="${attachment.type === "pdf" ? "view" : "download"}"
-            data-attachment-id="${escapeHtml(attachment.id)}"
-            data-attachment-title="${escapeHtml(attachment.title)}"
-            data-attachment-type="${escapeHtml(attachment.type)}"
-            data-attachment-filename="${escapeHtml(attachment.filename)}"
-            data-attachment-size="${escapeHtml(attachment.size)}"
-          >${label}</a>
+          <a class="button secondary-dark" href="${escapeHtml(url)}"${
+            attachment.type === "pdf" ? ' target="_blank" rel="noopener"' : " download"
+          }>${label}</a>
         </article>`;
     })
     .join("");
@@ -1528,14 +1363,52 @@ const renderAttachments = (episode) => {
     </section>`;
 };
 
-const renderSpotifyEpisodeLink = (episode) => {
-  if (!episode.spotifyUrl) {
+const renderVideoOverview = (episode) => {
+  const video = parseVideoUrl(episode.videoUrl);
+
+  if (!video) {
     return "";
   }
 
-  return `<a class="button spotify-button" href="${escapeHtml(
-    episode.spotifyUrl
-  )}" target="_blank" rel="noopener">Video Overview</a>`;
+  const contentType = videoContentType(video.url);
+  const posterUrl = cloudflareStreamThumbnailUrl(video.url);
+  const isHls = isHlsVideoUrl(video.url);
+
+  return `
+    <section class="episode-video" aria-labelledby="video-overview-title">
+      <p class="section-kicker">Watch</p>
+      <h2 id="video-overview-title">Video overview</h2>
+      <div class="video-player">
+        <video
+          id="overview-video-${escapeHtml(episode.id)}"
+          class="overview-video-player"
+          data-episode-id="${escapeHtml(episode.id)}"
+          data-episode-title="${escapeHtml(episode.title)}"
+          title="${escapeHtml(`${episode.title} video overview`)}"
+          controls
+          playsinline
+          preload="metadata"
+          ${isHls ? `data-hls-src="${escapeHtml(video.url)}"` : ""}
+          ${posterUrl ? `poster="${escapeHtml(posterUrl)}"` : ""}
+        >
+          ${
+            isHls
+              ? ""
+              : `<source src="${escapeHtml(video.url)}"${
+                  contentType ? ` type="${escapeHtml(contentType)}"` : ""
+                }>`
+          }
+          <a href="${escapeHtml(video.url)}">Watch the video overview</a>
+        </video>
+        ${
+          isHls
+            ? `<p data-hls-fallback hidden><a href="${escapeHtml(
+                video.url
+              )}">Open the video stream directly</a></p>`
+            : ""
+        }
+      </div>
+    </section>`;
 };
 
 const renderTranscript = (episode) => {
@@ -1726,8 +1599,7 @@ const styles = `
     font-size: 0.92rem;
   }
 
-  .nav a:hover,
-  .listen-link:hover {
+  .nav a:hover {
     color: var(--paper);
   }
 
@@ -1924,6 +1796,32 @@ const styles = `
 
   .breadcrumbs a:hover {
     color: var(--paper);
+  }
+
+  .episode-video {
+    margin-bottom: 42px;
+    padding-bottom: 42px;
+    border-bottom: 1px solid #d8cab7;
+  }
+
+  .video-player {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    margin-top: 22px;
+    overflow: hidden;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #101215;
+    box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
+  }
+
+  .video-player video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #101215;
   }
 
   .episode-attachments {
@@ -2155,25 +2053,6 @@ const styles = `
     resize: vertical;
   }
 
-  .admin-form span {
-    color: #61584f;
-    font-size: 0.86rem;
-    font-weight: 700;
-  }
-
-  .spotify-admin-list {
-    display: grid;
-    gap: 16px;
-    margin-top: 22px;
-  }
-
-  .spotify-admin-form {
-    padding: 16px;
-    border: 1px solid #d8cab7;
-    border-radius: 8px;
-    background: #f7efe5;
-  }
-
   .admin-notice {
     padding: 12px 14px;
     border-left: 4px solid var(--teal);
@@ -2254,12 +2133,6 @@ const styles = `
     color: var(--paper);
   }
 
-  .episode-play-panel .spotify-button {
-    border-color: #1db954;
-    background: #1db954;
-    color: #101215;
-  }
-
   .episode-meta p {
     margin: 0;
     color: #61584f;
@@ -2293,27 +2166,6 @@ const styles = `
     border-radius: 8px;
     background: #fffaf2;
     box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
-  }
-
-  .links-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 10px;
-    margin-top: 22px;
-  }
-
-  .listen-link {
-    display: flex;
-    min-height: 48px;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 0 14px;
-    border: 1px solid #d8cab7;
-    border-radius: 8px;
-    background: #fffaf2;
-    color: #201c19;
-    font-weight: 800;
   }
 
   .case-grid {
@@ -2400,56 +2252,6 @@ const styles = `
   .clear-category {
     color: var(--rust);
     font-weight: 900;
-  }
-
-  .archive-count {
-    margin: 12px 0 0;
-    color: #61584f;
-    font-weight: 700;
-  }
-
-  .pagination {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    margin-top: 32px;
-  }
-
-  .pagination-pages {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: center;
-    gap: 8px;
-  }
-
-  .pagination-link {
-    display: inline-grid;
-    min-width: 42px;
-    min-height: 42px;
-    place-items: center;
-    padding: 8px 12px;
-    border: 1px solid #cbbba7;
-    border-radius: 6px;
-    background: #fffaf2;
-    color: #201c19;
-    font-weight: 900;
-  }
-
-  .pagination-link:hover,
-  .pagination-link.active {
-    border-color: var(--rust);
-    background: var(--rust);
-    color: white;
-  }
-
-  .pagination-direction {
-    min-width: 96px;
-  }
-
-  .pagination-link.disabled {
-    opacity: 0.45;
-    pointer-events: none;
   }
 
   .case-card {
@@ -2594,7 +2396,6 @@ const styles = `
     .episode-hero,
     .case-grid,
     .category-grid,
-    .links-grid,
     .attachment-grid,
     .related-episode-grid {
       grid-template-columns: 1fr;
@@ -2647,15 +2448,6 @@ const styles = `
     .case-heading {
       display: grid;
     }
-
-    .pagination {
-      align-items: stretch;
-      flex-direction: column;
-    }
-
-    .pagination-direction {
-      width: 100%;
-    }
   }
 `;
 
@@ -2664,29 +2456,15 @@ const renderPage = (
   featuredEpisode = episodes[0],
   categories = buildEpisodeCategories(episodes),
   selectedCategory = null,
-  requestedPage = 1,
   analytics = {}
 ) => {
   const activeCategory = categories.find((category) => category.slug === selectedCategory);
   const visibleEpisodes = activeCategory?.episodes ?? episodes;
-  const totalPages = Math.max(1, Math.ceil(visibleEpisodes.length / EPISODES_PER_PAGE));
-  const currentPage = Math.min(Math.max(1, requestedPage), totalPages);
-  const pageStart = (currentPage - 1) * EPISODES_PER_PAGE;
-  const paginatedEpisodes = visibleEpisodes.slice(
-    pageStart,
-    pageStart + EPISODES_PER_PAGE
-  );
-  const pageEnd = Math.min(pageStart + paginatedEpisodes.length, visibleEpisodes.length);
-  const pageTitle = activeCategory
-    ? `${activeCategory.label} Episodes`
-    : podcast.name;
 
   return `<!doctype html>
 <html lang="en">
   ${renderHead({
-    title: `${pageTitle}${currentPage > 1 ? ` - Page ${currentPage}` : ""}${
-      activeCategory ? ` | ${podcast.name}` : ""
-    }`,
+    title: activeCategory ? `${activeCategory.label} Episodes | ${podcast.name}` : podcast.name,
     description: activeCategory?.description ?? podcast.description,
     facebookPixelId: analytics.facebookPixelId
   })}
@@ -2725,9 +2503,6 @@ const renderPage = (
           <div class="player-wrap">
             ${renderSpreakerPlayer(featuredEpisode)}
           </div>
-          <div class="links-grid" aria-label="Podcast platform links">
-            ${renderLinks(podcast.links)}
-          </div>
         </div>
       </section>
 
@@ -2747,13 +2522,9 @@ const renderPage = (
               : ""
           }
         </div>
-        <p class="archive-count">Showing ${pageStart + 1}-${pageEnd} of ${
-          visibleEpisodes.length
-        } episodes</p>
         <div class="case-grid">
-          ${renderCases(paginatedEpisodes)}
+          ${renderCases(visibleEpisodes)}
         </div>
-        ${renderEpisodePagination(currentPage, totalPages, activeCategory?.slug ?? null)}
       </section>
 
       ${renderNativeAd()}
@@ -2795,7 +2566,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
           ${renderEpisodeImage(episode, "episode-meta-image")}
           <p class="section-kicker">${escapeHtml(episode.publishedAt ?? "Episode")}</p>
           <a class="button" href="${escapeHtml(episode.href)}">Listen on Spreaker</a>
-          ${renderSpotifyEpisodeLink(episode)}
           ${
             episode.transcriptContent
               ? '<a class="button transcript-button" href="#transcript">Read episode transcript</a>'
@@ -2810,6 +2580,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
 
     <main>
       <article class="section episode-detail-layout">
+        ${renderVideoOverview(episode)}
         ${renderAttachments(episode)}
         <div class="episode-body">
           ${(episode.body?.length ? episode.body : [episode.summary])
@@ -2824,8 +2595,8 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
+    ${renderHlsPlayback([episode])}
     ${renderPlaybackTracking([episode], analytics.countryCode)}
-    ${renderExclusiveContentTracking(episode, analytics.countryCode)}
   </body>
 </html>`;
 
@@ -2890,12 +2661,31 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
     )
     .join("");
 
-  const attachmentLists = episodes
-    .filter((episode) => contentByEpisode.get(episode.id)?.attachments.length)
+  const contentLists = episodes
+    .filter((episode) => {
+      const content = contentByEpisode.get(episode.id);
+      return content?.videoUrl || content?.attachments?.length;
+    })
     .map((episode) => {
-      const attachments = contentByEpisode
-        .get(episode.id)
-        .attachments
+      const content = contentByEpisode.get(episode.id) ?? emptyEpisodeContent();
+      const video = parseVideoUrl(content.videoUrl);
+      const videoOverview = video
+        ? `
+            <div class="admin-attachment">
+              <div>
+                <strong>Video overview</strong>
+                <div><a href="${escapeHtml(
+                  video.url
+                )}" target="_blank" rel="noopener">${escapeHtml(video.url)}</a></div>
+              </div>
+              <form method="post" action="/admin/content/video">
+                <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
+                <input type="hidden" name="videoUrl" value="">
+                <button class="danger-button" type="submit">Remove</button>
+              </form>
+            </div>`
+        : "";
+      const attachments = content.attachments
         .map(
           (attachment) => `
             <div class="admin-attachment">
@@ -2917,30 +2707,9 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
       return `
         <section class="admin-episode">
           <h3>${escapeHtml(episode.title)}</h3>
+          ${videoOverview}
           ${attachments}
         </section>`;
-    })
-    .join("");
-  const spotifyForms = episodes
-    .map((episode) => {
-      const spotifyUrl = contentByEpisode.get(episode.id)?.spotifyUrl ?? "";
-
-      return `
-        <form class="admin-form spotify-admin-form" method="post" action="/admin/content/spotify">
-          <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
-          <label>
-            ${escapeHtml(episode.title)}
-            <span>Video Overview URL</span>
-            <input
-              name="spotifyUrl"
-              type="url"
-              inputmode="url"
-              placeholder="https://open.spotify.com/episode/..."
-              value="${escapeHtml(spotifyUrl)}"
-            >
-          </label>
-          <button class="button secondary-dark" type="submit">Save Video Overview</button>
-        </form>`;
     })
     .join("");
 
@@ -2956,8 +2725,28 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
         <a class="back-link" href="/">Back to site</a>
         <p class="section-kicker">Administration</p>
         <h1>Episode content</h1>
-        <p>Upload images, PDFs, and other supporting files, or add episode-specific Video Overview links. This content appears on the episode detail page.</p>
+        <p>Add a video overview link or upload images, PDFs, and other supporting files for an episode.</p>
         ${notice ? `<p class="admin-notice">${escapeHtml(notice)}</p>` : ""}
+        <form class="admin-form" method="post" action="/admin/content/video">
+          <label>
+            Episode
+            <select name="episodeId" required>${episodeOptions}</select>
+          </label>
+          <label>
+            Video URL
+            <input
+              type="url"
+              name="videoUrl"
+              placeholder="https://customer-...cloudflarestream.com/.../manifest/video.m3u8"
+              required
+            >
+          </label>
+          <button class="button" type="submit">Save video overview</button>
+        </form>
+      </section>
+      <section class="admin-panel">
+        <p class="section-kicker">Supporting material</p>
+        <h2>Upload a file</h2>
         <form class="admin-form" method="post" action="/admin/content/upload" enctype="multipart/form-data">
           <label>
             Episode
@@ -2979,15 +2768,9 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
         </form>
       </section>
       <section class="admin-panel">
-        <p class="section-kicker">Video Overview</p>
-        <h2>Episode Video Overview links</h2>
-        <p>Paste a Spotify episode link for each Video Overview. Leave the field blank and save to remove the link.</p>
-        <div class="spotify-admin-list">${spotifyForms}</div>
-      </section>
-      <section class="admin-panel">
         <p class="section-kicker">Current content</p>
-        <h2>Attached files</h2>
-        ${attachmentLists || "<p>No episode content has been uploaded yet.</p>"}
+        <h2>Episode videos and files</h2>
+        ${contentLists || "<p>No episode content has been added yet.</p>"}
       </section>
     </main>
   </body>
@@ -3072,9 +2855,9 @@ const handleAdminPage = async (request, env, url) => {
   const notices = {
     uploaded: "Content uploaded successfully.",
     deleted: "Content deleted.",
-    missing: "The selected episode or file could not be found.",
-    spotify: "Video Overview link saved.",
-    invalid_spotify: "Enter a valid Spotify URL for the Video Overview."
+    videoSaved: "Video overview saved.",
+    videoRemoved: "Video overview removed.",
+    missing: "The selected episode or file could not be found."
   };
 
   return new Response(
@@ -3155,7 +2938,7 @@ const handleUpload = async (request, env) => {
   return adminRedirect(request, "?status=uploaded");
 };
 
-const handleSpotifyLink = async (request, env) => {
+const handleVideoOverview = async (request, env) => {
   if (!isAdmin(request, env)) {
     return adminUnauthorized();
   }
@@ -3170,10 +2953,11 @@ const handleSpotifyLink = async (request, env) => {
 
   const form = await request.formData();
   const episodeId = String(form.get("episodeId") ?? "").trim();
-  const spotifyUrl = normalizeSpotifyUrl(form.get("spotifyUrl"));
+  const videoInput = String(form.get("videoUrl") ?? form.get("youtubeUrl") ?? "").trim();
+  const video = videoInput ? parseVideoUrl(videoInput) : null;
 
-  if (spotifyUrl === null) {
-    return adminRedirect(request, "?status=invalid_spotify");
+  if (!episodeId || (videoInput && !video)) {
+    return new Response("A valid HTTPS video URL is required", { status: 400 });
   }
 
   const episodes = await loadEpisodes();
@@ -3182,9 +2966,16 @@ const handleSpotifyLink = async (request, env) => {
     return adminRedirect(request, "?status=missing");
   }
 
-  await saveSpotifyUrl(env, episodeId, spotifyUrl);
+  const content = await loadEpisodeContent(env, episodeId);
+  await saveEpisodeContent(env, episodeId, {
+    ...content,
+    videoUrl: video?.url ?? ""
+  });
 
-  return adminRedirect(request, "?status=spotify");
+  return adminRedirect(
+    request,
+    video ? "?status=videoSaved" : "?status=videoRemoved"
+  );
 };
 
 const handleDelete = async (request, env) => {
@@ -3220,95 +3011,16 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const cacheControl = `public, max-age=${podcast.spreaker.cacheSeconds}`;
-    const isApiRequest = url.pathname.startsWith("/api/");
     const analytics = {
       countryCode: getCountryCode(request),
       facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
     };
-
-    if (request.method === "OPTIONS" && isApiRequest) {
-      return new Response(null, { status: 204, headers: API_HEADERS });
-    }
 
     if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {
       return env.ASSETS.fetch(request);
     }
 
     try {
-      if (isApiRequest && !["GET", "HEAD"].includes(request.method)) {
-        return jsonResponse(
-          { error: { code: "method_not_allowed", message: "Use GET for this endpoint." } },
-          405
-        );
-      }
-
-      if (url.pathname === "/api/podcast" || url.pathname === "/api/podcast/") {
-        const episodes = await loadApiEpisodeCatalog(env);
-        return jsonResponse(
-          renderPodcastApi(episodes, url.origin),
-          200,
-          cacheControl,
-          request.method === "HEAD"
-        );
-      }
-
-      if (url.pathname === "/api/episodes" || url.pathname === "/api/episodes/") {
-        const episodes = await loadApiEpisodeCatalog(env);
-        return jsonResponse(
-          {
-            apiVersion: "1.0",
-            episodes: episodes.map((episode) => serializeEpisode(episode, url.origin)),
-            meta: {
-              episodeCount: episodes.length,
-              generatedAt: new Date().toISOString()
-            }
-          },
-          200,
-          cacheControl,
-          request.method === "HEAD"
-        );
-      }
-
-      const apiEpisodeSlug = apiEpisodeSlugFromPath(url.pathname);
-
-      if (apiEpisodeSlug) {
-        const episodes = await loadEpisodes();
-        const listEpisode = episodes.find((episode) => episode.slug === apiEpisodeSlug);
-
-        if (!listEpisode) {
-          return jsonResponse(
-            { error: { code: "episode_not_found", message: "Episode not found." } },
-            404
-          );
-        }
-
-        const episode = await loadEpisodeDetails(listEpisode.id);
-        const [content, transcriptContent] = await Promise.all([
-          loadEpisodeContent(env, episode.id),
-          loadEpisodeTranscript(episode)
-        ]);
-        episode.attachments = content.attachments;
-        episode.spotifyUrl = content.spotifyUrl;
-        episode.transcriptContent = transcriptContent;
-
-        return jsonResponse(
-          {
-            apiVersion: "1.0",
-            episode: serializeEpisode(episode, url.origin, true)
-          },
-          200,
-          cacheControl,
-          request.method === "HEAD"
-        );
-      }
-
-      if (isApiRequest) {
-        return jsonResponse(
-          { error: { code: "not_found", message: "API endpoint not found." } },
-          404
-        );
-      }
-
       if (url.pathname.startsWith(`${CONTENT_ROUTE_PREFIX}/`)) {
         return serveAttachment(request, env, url.pathname);
       }
@@ -3321,8 +3033,11 @@ export default {
         return handleUpload(request, env);
       }
 
-      if (url.pathname === "/admin/content/spotify" && request.method === "POST") {
-        return handleSpotifyLink(request, env);
+      if (
+        (url.pathname === "/admin/content/video" || url.pathname === "/admin/content/youtube") &&
+        request.method === "POST"
+      ) {
+        return handleVideoOverview(request, env);
       }
 
       if (url.pathname === "/admin/content/delete" && request.method === "POST") {
@@ -3359,19 +3074,27 @@ export default {
       const episodeSlug = episodeSlugFromPath(url.pathname);
 
       if (episodeSlug) {
-        const pageData = await loadEpisodePageData(request, env, ctx, episodeSlug);
+        const episodes = await loadEpisodes();
+        const listEpisode = episodes.find((episode) => episode.slug === episodeSlug);
 
-        if (!pageData) {
+        if (!listEpisode) {
           return new Response("Not found", { status: 404 });
         }
 
-        const { episode, episodes } = pageData;
+        const episode = await loadEpisodeDetails(listEpisode.id);
+        const [episodeContent, transcriptContent] = await Promise.all([
+          loadEpisodeContent(env, episode.id),
+          loadEpisodeTranscript(episode)
+        ]);
+        episode.attachments = episodeContent.attachments;
+        episode.videoUrl = episodeContent.videoUrl;
+        episode.transcriptContent = transcriptContent;
         ctx.waitUntil(notifyEpisodeView(env, request, episode));
 
         return new Response(renderEpisodePage(episode, episodes, analytics), {
           headers: {
             "content-type": "text/html;charset=UTF-8",
-            "cache-control": "no-cache"
+            "cache-control": cacheControl
           }
         });
       }
@@ -3389,18 +3112,9 @@ export default {
       const featuredEpisode = episodes[0];
       const categories = buildEpisodeCategories(episodes);
       const selectedCategory = String(url.searchParams.get("category") ?? "").trim();
-      const pageValue = Number.parseInt(url.searchParams.get("page") ?? "1", 10);
-      const requestedPage = Number.isFinite(pageValue) && pageValue > 0 ? pageValue : 1;
 
       return new Response(
-        renderPage(
-          episodes,
-          featuredEpisode,
-          categories,
-          selectedCategory,
-          requestedPage,
-          analytics
-        ),
+        renderPage(episodes, featuredEpisode, categories, selectedCategory, analytics),
         {
           headers: {
             "content-type": "text/html;charset=UTF-8",
@@ -3409,18 +3123,6 @@ export default {
         }
       );
     } catch (error) {
-      if (isApiRequest) {
-        return jsonResponse(
-          {
-            error: {
-              code: "upstream_error",
-              message: "Unable to load podcast data."
-            }
-          },
-          502
-        );
-      }
-
       return new Response(`Unable to load Spreaker episodes: ${error.message}`, {
         status: 502,
         headers: {

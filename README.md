@@ -26,39 +26,9 @@ npx wrangler secret put DISCORD_WEBHOOK_URL
 
 Episode detail pages send the Discord notification in the background with `ctx.waitUntil`, so page rendering does not wait for Discord.
 
-## App API
-
-The Worker exposes JSON endpoints with CORS enabled:
-
-```text
-GET /api/podcast
-GET /api/episodes
-GET /api/episodes/:slug
-```
-
-`/api/podcast` returns show metadata, platform links, and the episode collection. Episode responses include Spreaker artwork, audio stream/download URLs, transcripts, and supporting files uploaded through `/admin/content`.
-
-Additional externally hosted media can be configured in `src/podcast.config.js`, keyed by the Spreaker episode slug:
-
-```js
-episodeMedia: {
-  "episode-slug": [
-    {
-      type: "document",
-      role: "case-file",
-      title: "Episode case file",
-      url: "https://example.com/case-file.pdf",
-      mimeType: "application/pdf"
-    }
-  ]
-}
-```
-
 ## Playback Analytics
 
-The Spreaker player reports play and pause transitions to Google Analytics and Meta Pixel with country-specific event names such as `play_US` and `pause_GB`. Event parameters include the episode ID, title, country code, playback position, and duration.
-
-Exclusive-content views and downloads report country-specific events such as `exclusive_content_interaction_US`. Event parameters include the interaction type, episode, attachment ID, title, type, filename, size, and destination URL.
+The Spreaker audio player reports play and pause transitions to Google Analytics and Meta Pixel with country-specific event names such as `play_US` and `pause_GB`. Episode video overview players report play, pause, ended, and milestone events at `progress_20`, `progress_50`, and `progress_75`. Event parameters include the episode ID, title, country code, media type, playback position, and duration.
 
 Google Analytics uses the configured measurement ID in `src/podcast.config.js`. To enable the matching Facebook custom events, set the Meta Pixel ID as a Worker secret or variable:
 
@@ -68,7 +38,7 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 
 ## Episode Content
 
-The password-protected `/admin/content` page uploads images, PDFs, and other supporting files to Cloudflare R2. Each file has a display title and description and appears on its episode detail page. The same page can save an episode-specific Spotify link, which appears as a `Video Overview` button on that episode detail page.
+The password-protected `/admin/content` page accepts an episode-level video URL and uploads images, PDFs, and other supporting files to Cloudflare R2. Video overviews are rendered with an HTML5 video player on the episode detail page. Each uploaded file has a display title and description and appears on the same page.
 
 Create the configured R2 bucket once:
 

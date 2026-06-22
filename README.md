@@ -2,6 +2,14 @@
 
 A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the Spreaker episode API.
 
+The dynamic `/sitemap.xml` includes the homepage and every current Spreaker episode page. New episodes are added automatically.
+
+The sitewide search form uses `/search?q=...` to search the titles and descriptions of all current Spreaker episodes.
+
+Homepage categories are generated automatically from current Spreaker episode titles and descriptions. Category links filter the episode archive with `/?category=...`.
+
+When Spreaker provides an episode transcript, the Worker fetches it and embeds the full text in the server-rendered episode page so visitors and search engines can read it.
+
 ## Edit Site Config
 
 Update `src/podcast.config.js` to change the show copy, Spreaker show ID, platform links, email address, Google Analytics ID, and API cache duration.
@@ -28,9 +36,9 @@ GET /api/episodes
 GET /api/episodes/:slug
 ```
 
-`/api/podcast` returns show metadata, platform links, and the episode collection. The episode detail endpoint also includes the full description and a `media` array containing Spreaker artwork, audio stream/download URLs, available transcripts, and configured supplemental media.
+`/api/podcast` returns show metadata, platform links, and the episode collection. Episode responses include Spreaker artwork, audio stream/download URLs, transcripts, and supporting files uploaded through `/admin/content`.
 
-Add supplemental episode files in `src/podcast.config.js`, keyed by the Spreaker slug:
+Additional externally hosted media can be configured in `src/podcast.config.js`, keyed by the Spreaker episode slug:
 
 ```js
 episodeMedia: {
@@ -45,6 +53,41 @@ episodeMedia: {
   ]
 }
 ```
+
+## Playback Analytics
+
+The Spreaker player reports play and pause transitions to Google Analytics and Meta Pixel with country-specific event names such as `play_US` and `pause_GB`. Event parameters include the episode ID, title, country code, playback position, and duration.
+
+Google Analytics uses the configured measurement ID in `src/podcast.config.js`. To enable the matching Facebook custom events, set the Meta Pixel ID as a Worker secret or variable:
+
+```bash
+npx wrangler secret put FACEBOOK_PIXEL_ID
+```
+
+## Episode Content
+
+The password-protected `/admin/content` page uploads images, PDFs, and other supporting files to Cloudflare R2. Each file has a display title and description and appears on its episode detail page.
+
+Create the configured R2 bucket once:
+
+```bash
+npx wrangler r2 bucket create the-last-known-podcast-content
+```
+
+Set the admin password as a Worker secret:
+
+```bash
+npx wrangler secret put ADMIN_PASSWORD
+```
+
+The username defaults to `admin`. To use a different username, set `ADMIN_USERNAME` as a Worker variable or secret. For local development, add both values to `.dev.vars`:
+
+```dotenv
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=choose-a-long-password
+```
+
+Uploads are limited to 25 MB. Attachment files and their metadata manifests are both stored in the `EPISODE_CONTENT` R2 binding.
 
 ## Development
 

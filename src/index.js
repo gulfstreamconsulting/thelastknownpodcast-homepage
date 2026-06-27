@@ -21,6 +21,8 @@ const safeJson = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
 const SPREAKER_API_BASE = "https://api.spreaker.com/v2";
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
+const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data";
+const EPISODES_PER_PAGE = 9;
 
 const stripHtml = (value = "") =>
   String(value)
@@ -263,19 +265,52 @@ const loadEpisodeTranscript = async (episode) => {
     : null;
 };
 
-const loadEpisodeCatalog = async () => {
-  const episodes = await loadEpisodes();
+const loadEpisodeCatalog = () => loadEpisodes();
 
-  return Promise.all(
-    episodes.map(async (episode) => {
-      try {
-        return await loadEpisodeDetails(episode.id);
-      } catch (error) {
-        console.error(`Unable to load details for episode ${episode.id}`, error);
-        return episode;
-      }
-    })
-  );
+const episodeDataCacheRequest = (request, episodeSlug) => {
+  const cacheUrl = new URL(request.url);
+  cacheUrl.pathname = `${EPISODE_DATA_CACHE_PREFIX}/${encodeURIComponent(episodeSlug)}`;
+  cacheUrl.search = "";
+  cacheUrl.hash = "";
+  return new Request(cacheUrl, { method: "GET" });
+};
+
+const loadEpisodePageData = async (request, ctx, episodeSlug) => {
+  const cache = caches.default;
+  const cacheRequest = episodeDataCacheRequest(request, episodeSlug);
+  const cachedResponse = await cache.match(cacheRequest);
+
+  if (cachedResponse) {
+    return cachedResponse.json();
+  }
+
+  const episodes = await loadEpisodes();
+  const listEpisode = episodes.find((episode) => episode.slug === episodeSlug);
+
+  if (!listEpisode) {
+    return null;
+  }
+
+  let episode = listEpisode;
+
+  try {
+    episode = await loadEpisodeDetails(listEpisode.id);
+  } catch (error) {
+    console.error(`Unable to load details for episode ${listEpisode.id}`, error);
+  }
+
+  episode.transcriptContent = await loadEpisodeTranscript(episode);
+
+  const data = { episode, episodes };
+  const response = new Response(JSON.stringify(data), {
+    headers: {
+      "content-type": "application/json;charset=UTF-8",
+      "cache-control": `public, max-age=${podcast.spreaker.cacheSeconds}`
+    }
+  });
+  ctx.waitUntil(cache.put(cacheRequest, response));
+
+  return data;
 };
 
 const attachmentManifestKey = (episodeId) => `episodes/${episodeId}/manifest.json`;
@@ -332,6 +367,20 @@ const saveEpisodeContent = (env, episodeId, content) =>
 
 const loadAttachments = async (env, episodeId) =>
   (await loadEpisodeContent(env, episodeId)).attachments;
+
+const loadApiEpisodeCatalog = async (env) => {
+  const episodes = await loadEpisodes();
+
+  await Promise.all(
+    episodes.map(async (episode) => {
+      const content = await loadEpisodeContent(env, episode.id);
+      episode.attachments = content.attachments;
+      episode.videoUrl = content.videoUrl;
+    })
+  );
+
+  return episodes;
+};
 
 const saveAttachments = async (env, episodeId, attachments) => {
   const content = await loadEpisodeContent(env, episodeId);
@@ -637,6 +686,168 @@ const episodeSlugFromPath = (pathname) => {
   return match?.[1] ?? null;
 };
 
+const absoluteUrl = (value, origin) => {
+  if (!value) {
+    return null;
+  }
+
+  return new URL(value, origin).href;
+};
+
+const serializeAttachment = (attachment, episode, origin) => ({
+  id: attachment.id,
+  type: attachment.type,
+  title: attachment.title,
+  description: attachment.description || null,
+  filename: attachment.filename,
+  mimeType: attachment.contentType || null,
+  sizeBytes: attachment.size ?? null,
+  url: absoluteUrl(attachmentPath(episode.id, attachment.id), origin)
+});
+
+const serializeEpisode = (episode, origin) => ({
+  id: episode.id,
+  slug: episode.slug,
+  title: episode.title,
+  summary: episode.summary,
+  description: (episode.body ?? []).join("\n\n"),
+  publishedAt: episode.publishedDate,
+  publishedAtDisplay: episode.publishedAt,
+  detailPageUrl: absoluteUrl(episodePath(episode), origin),
+  spreakerUrl: episode.spreakerUrl,
+  artworkUrl: absoluteUrl(episode.image, origin),
+  player: {
+    provider: "spreaker",
+    resource: episode.spreakerResource
+  },
+  transcript: episode.transcript
+    ? {
+        url: episode.transcript.url,
+        mimeType: episode.transcript.type
+      }
+    : null,
+  videoUrl: episode.videoUrl || null,
+  attachments: (episode.attachments ?? []).map((attachment) =>
+    serializeAttachment(attachment, episode, origin)
+  )
+});
+
+const API_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, HEAD, OPTIONS",
+  "access-control-allow-headers": "Content-Type",
+  "content-type": "application/json;charset=UTF-8",
+  "x-content-type-options": "nosniff"
+};
+
+const jsonResponse = (
+  data,
+  status = 200,
+  cacheControl = "no-store",
+  headRequest = false
+) =>
+  new Response(headRequest ? null : JSON.stringify(data), {
+    status,
+    headers: {
+      ...API_HEADERS,
+      "cache-control": cacheControl
+    }
+  });
+
+const renderPodcastApi = (episodes, origin) => ({
+  apiVersion: "1.0",
+  podcast: {
+    name: podcast.name,
+    tagline: podcast.tagline,
+    description: podcast.description,
+    host: podcast.host,
+    email: podcast.email,
+    heroImageUrl: absoluteUrl(podcast.heroImage, origin),
+    websiteUrl: origin,
+    links: podcast.links
+      .filter((link) => link.href && link.href !== "#")
+      .map((link) => ({
+        label: link.label,
+        url: absoluteUrl(link.href, origin)
+      }))
+  },
+  episodes: episodes.map((episode) => serializeEpisode(episode, origin)),
+  meta: {
+    episodeCount: episodes.length,
+    generatedAt: new Date().toISOString()
+  }
+});
+
+const STATIC_PAGES = [
+  {
+    slug: "about-us",
+    title: "About Us",
+    description: `${podcast.name} is a true crime podcast focused on final confirmed moments, unresolved timelines, and the details that keep a case alive.`,
+    kicker: "About",
+    heading: `About ${podcast.name}`,
+    body: [
+      `${podcast.name} is operated by Gulfstream Software Consulting LLC.`,
+      `${podcast.name} traces true crime stories through the last confirmed moments: the final call, the last sighting, the route home, the missed check-in, and the unresolved questions that remain after the public attention moves on.`,
+      "Each episode is built to be measured and evidence-led. We focus on documented timelines, available reporting, law enforcement updates, family statements, and the context listeners need to understand what is known, what is disputed, and what is still missing.",
+      `The podcast is hosted by ${podcast.host}. Our goal is to keep cases accessible, searchable, and grounded in care for the people at the center of each story.`
+    ]
+  },
+  {
+    slug: "contact-us",
+    title: "Contact Us",
+    description: `Contact ${podcast.name} with episode feedback, case suggestions, corrections, or media inquiries.`,
+    kicker: "Contact",
+    heading: "Contact Us",
+    body: [
+      `${podcast.name} is operated by Gulfstream Software Consulting LLC.`,
+      "Send episode feedback, case suggestions, corrections, source material, or media inquiries to the address below.",
+      `Email: ${podcast.email}`,
+      "Please include as much context as you can, including names, dates, locations, links to public sources, and whether you are sharing a correction, a suggestion, or a personal connection to a case."
+    ],
+    cta: {
+      label: "Email the podcast",
+      href: `mailto:${podcast.email}`
+    }
+  },
+  {
+    slug: "privacy-policy",
+    title: "Privacy Policy",
+    description: `Privacy policy for ${podcast.name}.`,
+    kicker: "Privacy",
+    heading: "Privacy Policy",
+    body: [
+      `${podcast.name} keeps personal data collection limited. You can browse the website without creating an account or submitting personal information.`,
+      "When you contact us by email, we receive the information you choose to send, such as your name, email address, message, attachments, and any case details you include. We use that information to read, respond to, evaluate, and follow up on your message.",
+      "The site may use basic analytics, hosting logs, embedded podcast players, advertising scripts, and platform services that process technical information such as pages viewed, device and browser details, IP-derived location, referral pages, and playback interactions. These services help operate the site, understand audience interest, measure media playback, prevent abuse, and support the podcast.",
+      "Third-party vendors, including Google, may use cookies to serve ads based on a user's prior visits to this website or other websites. Google's use of advertising cookies enables Google and its partners to serve ads based on visits to this site and other sites on the Internet.",
+      "Users may opt out of personalized advertising by visiting Google Ads Settings at https://www.google.com/settings/ads. Users may also visit https://www.aboutads.info to opt out of some third-party vendors' use of cookies for personalized advertising.",
+      "If third-party ad vendors or ad networks serve ads on this site, those vendors may use cookies or similar technologies under their own privacy policies. Visitors can review those vendors' websites for more information about their data practices and available opt-out choices.",
+      "We do not sell personal information that you send directly to us. We may share information when needed to operate the site, comply with law, protect rights and safety, or work with service providers that support hosting, analytics, email, advertising, and podcast distribution.",
+      "To ask a privacy question or request that we delete a message you sent us, contact us at the email address listed on this site."
+    ],
+    updated: "Last updated: June 25, 2026"
+  },
+  {
+    slug: "editorial-policy",
+    title: "Editorial Policy",
+    description: `${podcast.name} editorial standards, sourcing approach, and corrections process.`,
+    kicker: "Standards",
+    heading: "Editorial Policy",
+    body: [
+      `${podcast.name} covers true crime cases with a measured, evidence-led approach. We aim to distinguish verified facts from allegations, theories, and open questions.`,
+      "Episodes and written page summaries are built from public reporting, available records, official statements, family or advocate statements, and other sources that can be reviewed or attributed. We avoid presenting speculation as fact.",
+      "We try to use restrained language, avoid graphic detail unless it is necessary to understand the case, and keep attention on the people affected rather than sensationalizing violence or loss.",
+      "When a case involves an ongoing investigation, charges, or court proceedings, we aim to describe allegations carefully and respect the presumption of innocence unless there has been a legal finding.",
+      `Corrections, clarifications, source suggestions, and rights-holder concerns can be sent to ${podcast.email}. Please include the episode or page title, the detail at issue, supporting source links, and the correction or clarification you are requesting.`,
+      "When we confirm a material error, we will update the relevant page or future coverage as appropriate. Smaller wording clarifications may be made without a separate notice."
+    ]
+  }
+];
+
+const staticPageByPath = (pathname) =>
+  STATIC_PAGES.find((page) => pathname === `/${page.slug}` || pathname === `/${page.slug}/`) ??
+  null;
+
 const searchEpisodes = (episodes, query) => {
   const normalizedQuery = normalizeSearchText(query);
   const terms = normalizedQuery.split(/\s+/).filter(Boolean);
@@ -860,6 +1071,10 @@ const renderSitemap = (origin, episodes) => {
       location: new URL("/", origin).href,
       lastModified: homepageLastModified
     },
+    ...STATIC_PAGES.map((page) => ({
+      location: new URL(`/${page.slug}`, origin).href,
+      lastModified: null
+    })),
     ...episodes.map((episode) => ({
       location: new URL(episodePath(episode), origin).href,
       lastModified: episode.publishedDate
@@ -896,6 +1111,50 @@ const renderCases = (cases) =>
         </${tag}>`;
     })
     .join("");
+
+const homepageCasesHref = (selectedCategory, page) => {
+  const params = [];
+
+  if (selectedCategory) {
+    params.push(`category=${encodeURIComponent(selectedCategory)}`);
+  }
+
+  if (page > 1) {
+    params.push(`page=${encodeURIComponent(page)}`);
+  }
+
+  return `/${params.length ? `?${params.join("&")}` : ""}#cases`;
+};
+
+const renderPagination = (currentPage, totalPages, selectedCategory) => {
+  if (totalPages <= 1) {
+    return "";
+  }
+
+  const pages = Array.from({ length: totalPages }, (_, index) => index + 1);
+
+  return `
+    <nav class="pagination" aria-label="Episode pages">
+      <a class="pagination-link${currentPage === 1 ? " disabled" : ""}" href="${escapeHtml(
+        homepageCasesHref(selectedCategory, Math.max(1, currentPage - 1))
+      )}"${currentPage === 1 ? ' aria-disabled="true"' : ""}>Previous</a>
+      <div class="pagination-pages">
+        ${pages
+          .map(
+            (page) => `
+              <a class="pagination-number${
+                page === currentPage ? " active" : ""
+              }" href="${escapeHtml(homepageCasesHref(selectedCategory, page))}"${
+                page === currentPage ? ' aria-current="page"' : ""
+              }>${escapeHtml(page)}</a>`
+          )
+          .join("")}
+      </div>
+      <a class="pagination-link${currentPage === totalPages ? " disabled" : ""}" href="${escapeHtml(
+        homepageCasesHref(selectedCategory, Math.min(totalPages, currentPage + 1))
+      )}"${currentPage === totalPages ? ' aria-disabled="true"' : ""}>Next</a>
+    </nav>`;
+};
 
 const renderCategoryBrowser = (categories, selectedCategory, episodeCount) => `
   <section class="section category-section" id="categories">
@@ -974,16 +1233,13 @@ const renderFooter = () => `
     <nav class="footer-links" aria-label="Footer navigation">
       <a href="/">Home</a>
       <a href="/#cases">All episodes</a>
+      <a href="/about-us">About Us</a>
+      <a href="/contact-us">Contact Us</a>
+      <a href="/privacy-policy">Privacy Policy</a>
+      <a href="/editorial-policy">Editorial Policy</a>
       <a href="/sitemap.xml">Sitemap</a>
-      <a href="mailto:${escapeHtml(podcast.email)}">Contact</a>
     </nav>
   </footer>`;
-
-const renderNativeAd = () => `
-  <aside class="section native-ad" aria-label="Advertisement">
-    <script async="async" data-cfasync="false" src="https://pl28638835.effectivecpmnetwork.com/8fee276f31bbe673bacbd151f123599f/invoke.js"></script>
-    <div id="container-8fee276f31bbe673bacbd151f123599f"></div>
-  </aside>`;
 
 const renderSearchForm = (query = "", className = "site-search") => `
   <form class="${escapeHtml(className)}" action="/search" method="get" role="search">
@@ -1007,9 +1263,13 @@ const renderSiteHeader = ({ home = false, query = "" } = {}) => `
       <span>${escapeHtml(podcast.name)}</span>
     </a>
     <nav class="nav" aria-label="Primary navigation">
-      <a href="${home ? "#listen" : "/#listen"}">Listen</a>
-      <a href="${home ? "#cases" : "/#cases"}">Case Files</a>
-      <a href="mailto:${escapeHtml(podcast.email)}">Contact</a>
+      <a href="/">Home</a>
+      <a href="${home ? "#cases" : "/#cases"}">All episodes</a>
+      <a href="/about-us">About Us</a>
+      <a href="/contact-us">Contact Us</a>
+      <a href="/privacy-policy">Privacy Policy</a>
+      <a href="/editorial-policy">Editorial Policy</a>
+      <a href="/sitemap.xml">Sitemap</a>
     </nav>
     ${renderSearchForm(query)}
   </header>`;
@@ -1416,19 +1676,27 @@ const renderTranscript = (episode) => {
     return "";
   }
 
+  const visibleParagraphs = episode.transcriptContent.paragraphs.slice(0, 3);
+  const remainingParagraphs = episode.transcriptContent.paragraphs.slice(3);
+
   return `
     <section class="episode-transcript" id="transcript" aria-labelledby="transcript-title">
       <p class="section-kicker">Full text</p>
       <h2 id="transcript-title">${escapeHtml(episode.title)} transcript</h2>
-      <p class="transcript-intro">Read the full episode transcript supplied by Spreaker.</p>
-      <details class="transcript-details">
-        <summary>Read transcript</summary>
-        <div class="transcript-copy">
-          ${episode.transcriptContent.paragraphs
-            .map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`)
-            .join("")}
-        </div>
-      </details>
+      <p class="transcript-intro">Transcript excerpt supplied by Spreaker.</p>
+      <div class="transcript-preview">
+        ${visibleParagraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("")}
+      </div>
+      ${
+        remainingParagraphs.length
+          ? `<details class="transcript-details">
+              <summary>Read full transcript</summary>
+              <div class="transcript-copy">
+                ${remainingParagraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("")}
+              </div>
+            </details>`
+          : ""
+      }
       <a class="transcript-source" href="${escapeHtml(
         episode.transcriptContent.sourceUrl
       )}" target="_blank" rel="noopener">View original transcript on Spreaker</a>
@@ -1478,7 +1746,6 @@ const renderHead = ({
   facebookPixelId = ""
 }) => `
   <head>
-    <script>(function(s){s.dataset.zone='11111233',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>${escapeHtml(title)}</title>
@@ -1488,6 +1755,11 @@ const renderHead = ({
     <meta property="og:image" content="${escapeHtml(image)}">
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(facebookPixelId)}
+    <script type="text/javascript">
+      var infolinks_pid = 3446247;
+      var infolinks_wsid = 0;
+    </script>
+    <script type="text/javascript" src="https://resources.infolinks.com/js/infolinks_main.js"></script>
     <style>${styles}</style>
   </head>`;
 
@@ -1559,10 +1831,10 @@ const styles = `
   }
 
   .topbar {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 270px);
     align-items: center;
-    justify-content: space-between;
-    gap: 16px;
+    gap: 14px 24px;
     padding: 22px 0;
     border-bottom: 1px solid var(--line);
   }
@@ -1593,10 +1865,16 @@ const styles = `
 
   .nav {
     display: flex;
+    grid-column: 1 / -1;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 18px;
+    gap: 10px 18px;
     color: var(--muted);
     font-size: 0.92rem;
+  }
+
+  .nav a {
+    white-space: nowrap;
   }
 
   .nav a:hover {
@@ -1605,8 +1883,9 @@ const styles = `
 
   .site-search {
     display: flex;
-    width: min(270px, 28vw);
+    width: min(270px, 100%);
     min-width: 190px;
+    justify-self: end;
   }
 
   .site-search input,
@@ -1838,6 +2117,17 @@ const styles = `
 
   .transcript-intro {
     color: #61584f;
+  }
+
+  .transcript-preview {
+    margin-top: 22px;
+    color: #332d28;
+    font-size: 1.02rem;
+    line-height: 1.8;
+  }
+
+  .transcript-preview p {
+    margin: 0 0 18px;
   }
 
   .transcript-details {
@@ -2249,6 +2539,58 @@ const styles = `
     gap: 24px;
   }
 
+  .pagination-summary {
+    margin: 14px 0 0;
+    color: #61584f;
+  }
+
+  .pagination {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 32px;
+  }
+
+  .pagination-pages {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+  }
+
+  .pagination-link,
+  .pagination-number {
+    display: inline-flex;
+    min-width: 42px;
+    min-height: 42px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #fffaf2;
+    color: #332d28;
+    font-weight: 900;
+  }
+
+  .pagination-link {
+    padding: 0 16px;
+  }
+
+  .pagination-link:hover,
+  .pagination-number:hover,
+  .pagination-number.active {
+    border-color: rgba(157, 63, 54, 0.58);
+    background: #f3e4d7;
+    color: var(--rust);
+  }
+
+  .pagination-link.disabled {
+    opacity: 0.46;
+    pointer-events: none;
+  }
+
   .clear-category {
     color: var(--rust);
     font-weight: 900;
@@ -2336,12 +2678,37 @@ const styles = `
     color: #61584f;
   }
 
-  .native-ad {
-    min-height: 90px;
-    padding-top: 24px;
-    padding-bottom: 24px;
-    border-top: 1px solid #d8cab7;
-    border-bottom: 1px solid #d8cab7;
+  .static-page {
+    max-width: 860px;
+    padding-top: 64px;
+    padding-bottom: 64px;
+  }
+
+  .static-page h1 {
+    max-width: 760px;
+    color: #201b17;
+    font-size: clamp(2.6rem, 6vw, 5rem);
+  }
+
+  .static-page-content {
+    margin-top: 28px;
+    color: #332d28;
+    font-size: 1.08rem;
+    line-height: 1.8;
+  }
+
+  .static-page-content p {
+    margin: 0 0 20px;
+  }
+
+  .static-page-updated {
+    color: #61584f;
+    font-weight: 800;
+  }
+
+  .static-page-content .button {
+    width: auto;
+    margin-top: 10px;
   }
 
   .footer {
@@ -2373,12 +2740,21 @@ const styles = `
       background-size: cover;
     }
 
+    .topbar {
+      grid-template-columns: minmax(0, 1fr) minmax(210px, 320px);
+    }
+
     .nav {
-      display: none;
+      width: 100%;
+      justify-content: flex-start;
+      gap: 10px 14px;
+      order: 3;
+      font-size: 0.86rem;
     }
 
     .site-search {
       width: min(320px, 48vw);
+      order: 2;
     }
 
     .hero {
@@ -2412,7 +2788,18 @@ const styles = `
 
   @media (max-width: 520px) {
     .topbar {
-      flex-wrap: wrap;
+      grid-template-columns: 1fr;
+    }
+
+    .brand,
+    .nav,
+    .site-search {
+      grid-column: 1;
+      width: 100%;
+    }
+
+    .nav {
+      order: 2;
     }
 
     .site-search {
@@ -2451,20 +2838,77 @@ const styles = `
   }
 `;
 
+const renderStaticPage = (page, analytics = {}) => `<!doctype html>
+<html lang="en">
+  ${renderHead({
+    title: `${page.title} | ${podcast.name}`,
+    description: page.description,
+    facebookPixelId: analytics.facebookPixelId
+  })}
+  <body>
+    <div class="page-shell">
+      ${renderSiteHeader()}
+
+      <section class="hero episode-hero" aria-labelledby="static-page-title">
+        <div class="hero-copy">
+          <nav class="breadcrumbs" aria-label="Breadcrumb">
+            <a href="/">Home</a>
+            <span aria-hidden="true">/</span>
+            <span aria-current="page">${escapeHtml(page.title)}</span>
+          </nav>
+          <p class="eyebrow">${escapeHtml(page.kicker)}</p>
+          <h1 id="static-page-title">${escapeHtml(page.heading)}</h1>
+          <p class="lede">${escapeHtml(page.description)}</p>
+        </div>
+      </section>
+    </div>
+
+    <main>
+      <article class="section static-page">
+        <p class="section-kicker">${escapeHtml(page.kicker)}</p>
+        <h1>${escapeHtml(page.heading)}</h1>
+        <div class="static-page-content">
+          ${page.updated ? `<p class="static-page-updated">${escapeHtml(page.updated)}</p>` : ""}
+          ${page.body.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("")}
+          ${
+            page.cta
+              ? `<p><a class="button" href="${escapeHtml(page.cta.href)}">${escapeHtml(
+                  page.cta.label
+                )}</a></p>`
+              : ""
+          }
+        </div>
+      </article>
+      ${renderFooter()}
+    </main>
+  </body>
+</html>`;
+
 const renderPage = (
   episodes,
   featuredEpisode = episodes[0],
   categories = buildEpisodeCategories(episodes),
   selectedCategory = null,
+  requestedPage = 1,
   analytics = {}
 ) => {
   const activeCategory = categories.find((category) => category.slug === selectedCategory);
   const visibleEpisodes = activeCategory?.episodes ?? episodes;
+  const totalPages = Math.max(1, Math.ceil(visibleEpisodes.length / EPISODES_PER_PAGE));
+  const currentPage = Math.min(Math.max(1, requestedPage), totalPages);
+  const pageStart = (currentPage - 1) * EPISODES_PER_PAGE;
+  const paginatedEpisodes = visibleEpisodes.slice(pageStart, pageStart + EPISODES_PER_PAGE);
+  const firstVisibleEpisode = visibleEpisodes.length ? pageStart + 1 : 0;
+  const lastVisibleEpisode = Math.min(pageStart + paginatedEpisodes.length, visibleEpisodes.length);
+  const pageTitle = activeCategory
+    ? `${activeCategory.label} Episodes | ${podcast.name}`
+    : podcast.name;
+  const title = currentPage > 1 ? `${pageTitle} | Page ${currentPage}` : pageTitle;
 
   return `<!doctype html>
 <html lang="en">
   ${renderHead({
-    title: activeCategory ? `${activeCategory.label} Episodes | ${podcast.name}` : podcast.name,
+    title,
     description: activeCategory?.description ?? podcast.description,
     facebookPixelId: analytics.facebookPixelId
   })}
@@ -2511,11 +2955,16 @@ const renderPage = (
       <section class="section" id="cases">
         <p class="section-kicker">Case files</p>
         <div class="case-heading">
-          <h2>${
-            activeCategory
-              ? escapeHtml(activeCategory.label)
-              : "Built around timelines, records, and what can be verified."
-          }</h2>
+          <div>
+            <h2>${
+              activeCategory
+                ? escapeHtml(activeCategory.label)
+                : "Built around timelines, records, and what can be verified."
+            }</h2>
+            <p class="pagination-summary">Showing ${escapeHtml(firstVisibleEpisode)}-${escapeHtml(
+              lastVisibleEpisode
+            )} of ${escapeHtml(visibleEpisodes.length)} episodes</p>
+          </div>
           ${
             activeCategory
               ? '<a class="clear-category" href="/#cases">View all episodes</a>'
@@ -2523,11 +2972,11 @@ const renderPage = (
           }
         </div>
         <div class="case-grid">
-          ${renderCases(visibleEpisodes)}
+          ${renderCases(paginatedEpisodes)}
         </div>
+        ${renderPagination(currentPage, totalPages, activeCategory?.slug ?? null)}
       </section>
 
-      ${renderNativeAd()}
       ${renderFooter()}
     </main>
 
@@ -2590,7 +3039,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
         ${renderTranscript(episode)}
       </article>
       ${renderRelatedEpisodes(episode, episodes)}
-      ${renderNativeAd()}
       ${renderFooter()}
     </main>
 
@@ -3011,16 +3459,38 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const cacheControl = `public, max-age=${podcast.spreaker.cacheSeconds}`;
+    const isApiRequest = url.pathname === "/api/podcast" || url.pathname === "/api/podcast/";
     const analytics = {
       countryCode: getCountryCode(request),
       facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
     };
+
+    if (request.method === "OPTIONS" && isApiRequest) {
+      return new Response(null, { status: 204, headers: API_HEADERS });
+    }
 
     if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {
       return env.ASSETS.fetch(request);
     }
 
     try {
+      if (isApiRequest && !["GET", "HEAD"].includes(request.method)) {
+        return jsonResponse(
+          { error: { code: "method_not_allowed", message: "Use GET for this endpoint." } },
+          405
+        );
+      }
+
+      if (isApiRequest) {
+        const episodes = await loadApiEpisodeCatalog(env);
+        return jsonResponse(
+          renderPodcastApi(episodes, url.origin),
+          200,
+          cacheControl,
+          request.method === "HEAD"
+        );
+      }
+
       if (url.pathname.startsWith(`${CONTENT_ROUTE_PREFIX}/`)) {
         return serveAttachment(request, env, url.pathname);
       }
@@ -3071,24 +3541,30 @@ export default {
         });
       }
 
+      const staticPage = staticPageByPath(url.pathname);
+
+      if (staticPage && ["GET", "HEAD"].includes(request.method)) {
+        return new Response(request.method === "HEAD" ? null : renderStaticPage(staticPage, analytics), {
+          headers: {
+            "content-type": "text/html;charset=UTF-8",
+            "cache-control": cacheControl
+          }
+        });
+      }
+
       const episodeSlug = episodeSlugFromPath(url.pathname);
 
       if (episodeSlug) {
-        const episodes = await loadEpisodes();
-        const listEpisode = episodes.find((episode) => episode.slug === episodeSlug);
+        const pageData = await loadEpisodePageData(request, ctx, episodeSlug);
 
-        if (!listEpisode) {
+        if (!pageData) {
           return new Response("Not found", { status: 404 });
         }
 
-        const episode = await loadEpisodeDetails(listEpisode.id);
-        const [episodeContent, transcriptContent] = await Promise.all([
-          loadEpisodeContent(env, episode.id),
-          loadEpisodeTranscript(episode)
-        ]);
+        const { episode, episodes } = pageData;
+        const episodeContent = await loadEpisodeContent(env, episode.id);
         episode.attachments = episodeContent.attachments;
         episode.videoUrl = episodeContent.videoUrl;
-        episode.transcriptContent = transcriptContent;
         ctx.waitUntil(notifyEpisodeView(env, request, episode));
 
         return new Response(renderEpisodePage(episode, episodes, analytics), {
@@ -3112,9 +3588,11 @@ export default {
       const featuredEpisode = episodes[0];
       const categories = buildEpisodeCategories(episodes);
       const selectedCategory = String(url.searchParams.get("category") ?? "").trim();
+      const requestedPage = Number.parseInt(url.searchParams.get("page") ?? "1", 10);
+      const currentPage = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
 
       return new Response(
-        renderPage(episodes, featuredEpisode, categories, selectedCategory, analytics),
+        renderPage(episodes, featuredEpisode, categories, selectedCategory, currentPage, analytics),
         {
           headers: {
             "content-type": "text/html;charset=UTF-8",
@@ -3123,6 +3601,18 @@ export default {
         }
       );
     } catch (error) {
+      if (isApiRequest) {
+        return jsonResponse(
+          {
+            error: {
+              code: "upstream_error",
+              message: "Unable to load podcast data."
+            }
+          },
+          502
+        );
+      }
+
       return new Response(`Unable to load Spreaker episodes: ${error.message}`, {
         status: 502,
         headers: {

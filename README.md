@@ -26,6 +26,16 @@ npx wrangler secret put DISCORD_WEBHOOK_URL
 
 Episode detail pages send the Discord notification in the background with `ctx.waitUntil`, so page rendering does not wait for Discord.
 
+## App API
+
+The Worker exposes the podcast and episode catalog as JSON with CORS enabled:
+
+```text
+GET /api/podcast
+```
+
+During local development, use `http://localhost:8787/api/podcast`.
+
 ## Playback Analytics
 
 The Spreaker audio player reports play and pause transitions to Google Analytics and Meta Pixel with country-specific event names such as `play_US` and `pause_GB`. Episode video overview players report play, pause, ended, and milestone events at `progress_20`, `progress_50`, and `progress_75`. Event parameters include the episode ID, title, country code, media type, playback position, and duration.

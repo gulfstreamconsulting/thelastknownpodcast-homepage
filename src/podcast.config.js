@@ -4,7 +4,7 @@ export const podcast = {
   description:
     "Measured, evidence-led episodes on disappearances, unresolved timelines, and the details that keep a case alive.",
   host: "The Last Known Podcast",
-  email: "hello@thelastknownpodcast.com",
+  email: "info@gulfstreamsoftwareconsultingllc.com",
   heroImage: "/hero.png",
   googleAnalyticsId: "G-E33WVYGYBT",
   spreaker: {

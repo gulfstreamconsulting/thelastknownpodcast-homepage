@@ -84,6 +84,15 @@ const formatSitemapDate = (value) => {
   return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
 };
 
+const formatStaticPageSitemapDate = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(String(value).replace(/^Last updated:\s*/i, ""));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+};
+
 const fetchSpreakerJson = async (path) => {
   const apiUrl = path.startsWith("http") ? path : `${SPREAKER_API_BASE}${path}`;
   const response = await fetch(apiUrl, {
@@ -387,6 +396,30 @@ const saveAttachments = async (env, episodeId, attachments) => {
   return saveEpisodeContent(env, episodeId, { ...content, attachments });
 };
 
+const parseYouTubeStartSeconds = (value) => {
+  const input = String(value ?? "").trim();
+
+  if (!input) {
+    return 0;
+  }
+
+  if (/^\d+$/.test(input)) {
+    return Number(input);
+  }
+
+  const match = input.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+
+  if (!match) {
+    return 0;
+  }
+
+  return (
+    Number(match[1] ?? 0) * 3600 +
+    Number(match[2] ?? 0) * 60 +
+    Number(match[3] ?? 0)
+  );
+};
+
 const parseVideoUrl = (value) => {
   const input = String(value ?? "").trim();
 
@@ -402,67 +435,49 @@ const parseVideoUrl = (value) => {
     return null;
   }
 
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
+  if (url.protocol !== "https:") {
     return null;
   }
 
-  if (url.protocol === "http:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+  const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
+  const pathParts = url.pathname.split("/").filter(Boolean);
+  let videoId = "";
+
+  if (hostname === "youtu.be") {
+    videoId = pathParts[0] ?? "";
+  } else if (hostname === "youtube.com" || hostname === "m.youtube.com") {
+    if (pathParts[0] === "watch") {
+      videoId = url.searchParams.get("v") ?? "";
+    } else if (["embed", "shorts", "live"].includes(pathParts[0])) {
+      videoId = pathParts[1] ?? "";
+    }
+  } else if (hostname === "youtube-nocookie.com" && pathParts[0] === "embed") {
+    videoId = pathParts[1] ?? "";
+  }
+
+  if (!/^[A-Za-z0-9_-]{6,64}$/.test(videoId)) {
     return null;
   }
 
-  if (!url.hostname) {
-    return null;
+  const startSeconds =
+    parseYouTubeStartSeconds(url.searchParams.get("start")) ||
+    parseYouTubeStartSeconds(url.searchParams.get("t"));
+  const canonicalUrl = new URL("https://www.youtube.com/watch");
+  const embedUrl = new URL(`https://www.youtube-nocookie.com/embed/${videoId}`);
+  canonicalUrl.searchParams.set("v", videoId);
+  embedUrl.searchParams.set("enablejsapi", "1");
+  embedUrl.searchParams.set("playsinline", "1");
+
+  if (startSeconds > 0) {
+    canonicalUrl.searchParams.set("t", `${startSeconds}s`);
+    embedUrl.searchParams.set("start", String(startSeconds));
   }
 
   return {
-    url: url.href
+    url: canonicalUrl.href,
+    videoId,
+    embedUrl: embedUrl.href
   };
-};
-
-const videoContentType = (url) => {
-  const pathname = new URL(url).pathname.toLowerCase();
-
-  if (pathname.endsWith(".m3u8")) {
-    return "application/x-mpegURL";
-  }
-
-  if (pathname.endsWith(".mp4")) {
-    return "video/mp4";
-  }
-
-  if (pathname.endsWith(".webm")) {
-    return "video/webm";
-  }
-
-  if (pathname.endsWith(".ogv") || pathname.endsWith(".ogg")) {
-    return "video/ogg";
-  }
-
-  return "";
-};
-
-const isHlsVideoUrl = (url) => new URL(url).pathname.toLowerCase().endsWith(".m3u8");
-
-const cloudflareStreamThumbnailUrl = (url) => {
-  const videoUrl = new URL(url);
-  const hostname = videoUrl.hostname.toLowerCase();
-
-  if (!hostname.endsWith(".cloudflarestream.com") && hostname !== "videodelivery.net") {
-    return "";
-  }
-
-  const videoId = videoUrl.pathname.split("/").filter(Boolean)[0];
-
-  if (!videoId) {
-    return "";
-  }
-
-  const thumbnailUrl = new URL(`/${videoId}/thumbnails/thumbnail.jpg`, videoUrl.origin);
-  thumbnailUrl.searchParams.set("time", "0s");
-  thumbnailUrl.searchParams.set("height", "720");
-  thumbnailUrl.searchParams.set("fit", "scale");
-
-  return thumbnailUrl.href;
 };
 
 const sanitizeFilename = (value) => {
@@ -1065,7 +1080,51 @@ const buildEpisodeCategories = (episodes) => {
 };
 
 const renderSitemap = (origin, episodes) => {
-  const homepageLastModified = episodes.find((episode) => episode.publishedDate)?.publishedDate;
+  const latestPublishedDate = (items) =>
+    items
+      .map((item) => item.publishedDate)
+      .filter(Boolean)
+      .sort()
+      .at(-1) ?? null;
+  const listingUrls = [];
+  const listingGroups = [
+    {
+      categorySlug: null,
+      episodes
+    },
+    ...buildEpisodeCategories(episodes).map((category) => ({
+      categorySlug: category.slug,
+      episodes: category.episodes
+    }))
+  ];
+
+  for (const group of listingGroups) {
+    const totalPages = Math.ceil(group.episodes.length / EPISODES_PER_PAGE);
+    const lastModified = latestPublishedDate(group.episodes);
+
+    for (let page = 1; page <= totalPages; page += 1) {
+      if (!group.categorySlug && page === 1) {
+        continue;
+      }
+
+      const location = new URL("/", origin);
+
+      if (group.categorySlug) {
+        location.searchParams.set("category", group.categorySlug);
+      }
+
+      if (page > 1) {
+        location.searchParams.set("page", String(page));
+      }
+
+      listingUrls.push({
+        location: location.href,
+        lastModified
+      });
+    }
+  }
+
+  const homepageLastModified = latestPublishedDate(episodes);
   const urls = [
     {
       location: new URL("/", origin).href,
@@ -1073,8 +1132,9 @@ const renderSitemap = (origin, episodes) => {
     },
     ...STATIC_PAGES.map((page) => ({
       location: new URL(`/${page.slug}`, origin).href,
-      lastModified: null
+      lastModified: formatStaticPageSitemapDate(page.updated)
     })),
+    ...listingUrls,
     ...episodes.map((episode) => ({
       location: new URL(episodePath(episode), origin).href,
       lastModified: episode.publishedDate
@@ -1227,9 +1287,12 @@ const renderRelatedEpisodes = (episode, episodes) => {
     </section>`;
 };
 
-const renderFooter = () => `
+const renderFooter = ({ disclaimer = "" } = {}) => `
   <footer class="section footer">
-    <span>${escapeHtml(podcast.name)}. Hosted by ${escapeHtml(podcast.host)}.</span>
+    <div class="footer-copy">
+      <span>${escapeHtml(podcast.name)}. Hosted by ${escapeHtml(podcast.host)}.</span>
+      ${disclaimer ? `<p>${escapeHtml(disclaimer)}</p>` : ""}
+    </div>
     <nav class="footer-links" aria-label="Footer navigation">
       <a href="/">Home</a>
       <a href="/#cases">All episodes</a>
@@ -1437,135 +1500,104 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           });
         }
 
-        initializeAudioTracking(0);
+        function initializeYouTubeTracking() {
+          if (!videoPlayers.length) return;
 
-        videoPlayers.forEach(function (episode) {
-          var element = document.getElementById(episode.elementId);
-          if (!element) return;
+          videoPlayers.forEach(function (episode) {
+            var element = document.getElementById(episode.elementId);
+            if (!element || element.dataset.analyticsInitialized === 'true') return;
 
-          var completedMilestones = {};
+            element.dataset.analyticsInitialized = 'true';
+            var completedMilestones = {};
+            var progressTimer = 0;
+            var player = new window.YT.Player(episode.elementId, {
+              events: {
+                onStateChange: function (event) {
+                  var state = event.data;
+                  var position = Number(player.getCurrentTime && player.getCurrentTime()) * 1000 || 0;
+                  var duration = Number(player.getDuration && player.getDuration()) * 1000 || 0;
 
-          function durationMs() {
-            return Number.isFinite(element.duration) ? element.duration * 1000 : 0;
-          }
+                  if (state === window.YT.PlayerState.PLAYING) {
+                    sendPlaybackEvent('play', episode, position, duration, 'video');
+                    window.clearInterval(progressTimer);
+                    progressTimer = window.setInterval(function () {
+                      var currentPosition = Number(player.getCurrentTime && player.getCurrentTime()) * 1000 || 0;
+                      var currentDuration = Number(player.getDuration && player.getDuration()) * 1000 || 0;
 
-          function positionMs() {
-            return Number.isFinite(element.currentTime) ? element.currentTime * 1000 : 0;
-          }
+                      if (currentDuration <= 0) return;
 
-          element.addEventListener('play', function () {
-            sendPlaybackEvent('play', episode, positionMs(), durationMs(), 'video');
-          });
+                      var progress = (currentPosition / currentDuration) * 100;
 
-          element.addEventListener('pause', function () {
-            if (element.ended) return;
-            sendPlaybackEvent('pause', episode, positionMs(), durationMs(), 'video');
-          });
+                      milestones.forEach(function (milestone) {
+                        if (completedMilestones[milestone] || progress < milestone) return;
 
-          element.addEventListener('ended', function () {
-            sendPlaybackEvent(
-              'ended',
-              episode,
-              positionMs(),
-              durationMs(),
-              'video',
-              { progress_percent: 100 }
-            );
-          });
+                        completedMilestones[milestone] = true;
+                        sendPlaybackEvent(
+                          'progress_' + milestone,
+                          episode,
+                          currentPosition,
+                          currentDuration,
+                          'video',
+                          { progress_percent: milestone }
+                        );
+                      });
+                    }, 1000);
+                    return;
+                  }
 
-          element.addEventListener('timeupdate', function () {
-            if (!Number.isFinite(element.duration) || element.duration <= 0) return;
+                  if (state === window.YT.PlayerState.PAUSED) {
+                    window.clearInterval(progressTimer);
+                    sendPlaybackEvent('pause', episode, position, duration, 'video');
+                    return;
+                  }
 
-            var progress = (element.currentTime / element.duration) * 100;
-
-            milestones.forEach(function (milestone) {
-              if (completedMilestones[milestone] || progress < milestone) return;
-
-              completedMilestones[milestone] = true;
-              sendPlaybackEvent(
-                'progress_' + milestone,
-                episode,
-                positionMs(),
-                durationMs(),
-                'video',
-                { progress_percent: milestone }
-              );
+                  if (state === window.YT.PlayerState.ENDED) {
+                    window.clearInterval(progressTimer);
+                    sendPlaybackEvent(
+                      'ended',
+                      episode,
+                      position,
+                      duration,
+                      'video',
+                      { progress_percent: 100 }
+                    );
+                  }
+                }
+              }
             });
           });
-        });
+        }
+
+        function loadYouTubeApi() {
+          if (!videoPlayers.length) return;
+
+          if (window.YT && typeof window.YT.Player === 'function') {
+            initializeYouTubeTracking();
+            return;
+          }
+
+          var existingCallback = window.onYouTubeIframeAPIReady;
+          window.onYouTubeIframeAPIReady = function () {
+            if (typeof existingCallback === 'function') {
+              existingCallback();
+            }
+
+            initializeYouTubeTracking();
+          };
+
+          if (document.querySelector('script[data-youtube-iframe-api]')) return;
+
+          var script = document.createElement('script');
+          script.src = 'https://www.youtube.com/iframe_api';
+          script.async = true;
+          script.dataset.youtubeIframeApi = 'true';
+          document.head.appendChild(script);
+        }
+
+        initializeAudioTracking(0);
+        loadYouTubeApi();
       })();
     </script>`;
-};
-
-const renderHlsPlayback = (episodes) => {
-  const hasHlsVideo = episodes.some((episode) => {
-    const video = parseVideoUrl(episode.videoUrl);
-    return video && isHlsVideoUrl(video.url);
-  });
-
-  if (!hasHlsVideo) {
-    return "";
-  }
-
-  return `
-    <script>
-      window.initializeHlsPlayers = function () {
-        document.querySelectorAll('video[data-hls-src]').forEach(function (element) {
-          if (element.dataset.hlsInitialized === 'true') return;
-
-          var source = element.getAttribute('data-hls-src');
-          if (!source) return;
-
-          if (window.Hls && window.Hls.isSupported()) {
-            var hls = new window.Hls();
-            element.dataset.hlsInitialized = 'true';
-            hls.loadSource(source);
-            hls.attachMedia(element);
-            element._hls = hls;
-
-            hls.on(window.Hls.Events.ERROR, function (_event, data) {
-              if (!data.fatal) return;
-
-              if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
-                hls.startLoad();
-                return;
-              }
-
-              if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
-                hls.recoverMediaError();
-                return;
-              }
-
-              hls.destroy();
-              element.dataset.hlsInitialized = 'false';
-              var fallback = element.parentElement.querySelector('[data-hls-fallback]');
-              if (fallback) fallback.hidden = false;
-            });
-            return;
-          }
-
-          if (element.canPlayType('application/vnd.apple.mpegurl')) {
-            element.dataset.hlsInitialized = 'true';
-            element.src = source;
-            return;
-          }
-
-          var fallback = element.parentElement.querySelector('[data-hls-fallback]');
-          if (fallback) fallback.hidden = false;
-        });
-      };
-
-      window.showHlsFallback = function () {
-        document.querySelectorAll('[data-hls-fallback]').forEach(function (fallback) {
-          fallback.hidden = false;
-        });
-      };
-    </script>
-    <script
-      src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"
-      onload="window.initializeHlsPlayers()"
-      onerror="window.showHlsFallback()"
-    ></script>`;
 };
 
 const renderAttachments = (episode) => {
@@ -1630,43 +1662,21 @@ const renderVideoOverview = (episode) => {
     return "";
   }
 
-  const contentType = videoContentType(video.url);
-  const posterUrl = cloudflareStreamThumbnailUrl(video.url);
-  const isHls = isHlsVideoUrl(video.url);
-
   return `
     <section class="episode-video" aria-labelledby="video-overview-title">
       <p class="section-kicker">Watch</p>
       <h2 id="video-overview-title">Video overview</h2>
       <div class="video-player">
-        <video
+        <iframe
           id="overview-video-${escapeHtml(episode.id)}"
           class="overview-video-player"
-          data-episode-id="${escapeHtml(episode.id)}"
-          data-episode-title="${escapeHtml(episode.title)}"
+          src="${escapeHtml(video.embedUrl)}"
           title="${escapeHtml(`${episode.title} video overview`)}"
-          controls
-          playsinline
-          preload="metadata"
-          ${isHls ? `data-hls-src="${escapeHtml(video.url)}"` : ""}
-          ${posterUrl ? `poster="${escapeHtml(posterUrl)}"` : ""}
-        >
-          ${
-            isHls
-              ? ""
-              : `<source src="${escapeHtml(video.url)}"${
-                  contentType ? ` type="${escapeHtml(contentType)}"` : ""
-                }>`
-          }
-          <a href="${escapeHtml(video.url)}">Watch the video overview</a>
-        </video>
-        ${
-          isHls
-            ? `<p data-hls-fallback hidden><a href="${escapeHtml(
-                video.url
-              )}">Open the video stream directly</a></p>`
-            : ""
-        }
+          loading="lazy"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+          allowfullscreen
+          referrerpolicy="strict-origin-when-cross-origin"
+        ></iframe>
       </div>
     </section>`;
 };
@@ -2095,7 +2105,7 @@ const styles = `
     box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
   }
 
-  .video-player video {
+  .video-player iframe {
     display: block;
     width: 100%;
     height: 100%;
@@ -2721,6 +2731,15 @@ const styles = `
     font-size: 0.95rem;
   }
 
+  .footer-copy {
+    max-width: 560px;
+  }
+
+  .footer-copy p {
+    margin: 8px 0 0;
+    line-height: 1.6;
+  }
+
   .footer-links {
     display: flex;
     flex-wrap: wrap;
@@ -3039,11 +3058,12 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
         ${renderTranscript(episode)}
       </article>
       ${renderRelatedEpisodes(episode, episodes)}
-      ${renderFooter()}
+      ${renderFooter({
+        disclaimer: "We do not glorify violent crime or offenders."
+      })}
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
-    ${renderHlsPlayback([episode])}
     ${renderPlaybackTracking([episode], analytics.countryCode)}
   </body>
 </html>`;
@@ -3117,14 +3137,15 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
     .map((episode) => {
       const content = contentByEpisode.get(episode.id) ?? emptyEpisodeContent();
       const video = parseVideoUrl(content.videoUrl);
-      const videoOverview = video
+      const videoOverview = content.videoUrl
         ? `
             <div class="admin-attachment">
               <div>
-                <strong>Video overview</strong>
+                <strong>${video ? "YouTube video overview" : "Unsupported video overview URL"}</strong>
                 <div><a href="${escapeHtml(
-                  video.url
-                )}" target="_blank" rel="noopener">${escapeHtml(video.url)}</a></div>
+                  video?.url ?? content.videoUrl
+                )}" target="_blank" rel="noopener">${escapeHtml(video?.url ?? content.videoUrl)}</a></div>
+                ${video ? "" : "<div>Replace this with a YouTube link or remove it.</div>"}
               </div>
               <form method="post" action="/admin/content/video">
                 <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
@@ -3173,7 +3194,7 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
         <a class="back-link" href="/">Back to site</a>
         <p class="section-kicker">Administration</p>
         <h1>Episode content</h1>
-        <p>Add a video overview link or upload images, PDFs, and other supporting files for an episode.</p>
+        <p>Add a YouTube video overview link or upload images, PDFs, and other supporting files for an episode.</p>
         ${notice ? `<p class="admin-notice">${escapeHtml(notice)}</p>` : ""}
         <form class="admin-form" method="post" action="/admin/content/video">
           <label>
@@ -3181,11 +3202,11 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
             <select name="episodeId" required>${episodeOptions}</select>
           </label>
           <label>
-            Video URL
+            YouTube URL
             <input
               type="url"
               name="videoUrl"
-              placeholder="https://customer-...cloudflarestream.com/.../manifest/video.m3u8"
+              placeholder="https://www.youtube.com/watch?v=..."
               required
             >
           </label>
@@ -3405,7 +3426,7 @@ const handleVideoOverview = async (request, env) => {
   const video = videoInput ? parseVideoUrl(videoInput) : null;
 
   if (!episodeId || (videoInput && !video)) {
-    return new Response("A valid HTTPS video URL is required", { status: 400 });
+    return new Response("A valid YouTube URL is required", { status: 400 });
   }
 
   const episodes = await loadEpisodes();
@@ -3469,7 +3490,7 @@ export default {
       return new Response(null, { status: 204, headers: API_HEADERS });
     }
 
-    if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {
+    if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png" || url.pathname === "/ads.txt") {
       return env.ASSETS.fetch(request);
     }
 

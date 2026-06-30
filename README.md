@@ -2,7 +2,7 @@
 
 A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the Spreaker episode API.
 
-The dynamic `/sitemap.xml` includes the homepage and every current Spreaker episode page. New episodes are added automatically.
+The dynamic `/sitemap.xml` includes the homepage, static pages, archive pagination, generated category archive pages, and every current Spreaker episode page. New episodes are added automatically.
 
 The sitewide search form uses `/search?q=...` to search the titles and descriptions of all current Spreaker episodes.
 
@@ -38,7 +38,7 @@ During local development, use `http://localhost:8787/api/podcast`.
 
 ## Playback Analytics
 
-The Spreaker audio player reports play and pause transitions to Google Analytics and Meta Pixel with country-specific event names such as `play_US` and `pause_GB`. Episode video overview players report play, pause, ended, and milestone events at `progress_20`, `progress_50`, and `progress_75`. Event parameters include the episode ID, title, country code, media type, playback position, and duration.
+The Spreaker audio player and YouTube video overview player report play, pause, ended, and milestone transitions to Google Analytics and Meta Pixel with country-specific event names such as `audio_play_US`, `video_pause_GB`, and `video_progress_50_US`. Event parameters include the episode ID, title, country code, media type, playback position, and duration.
 
 Google Analytics uses the configured measurement ID in `src/podcast.config.js`. To enable the matching Facebook custom events, set the Meta Pixel ID as a Worker secret or variable:
 
@@ -48,7 +48,7 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 
 ## Episode Content
 
-The password-protected `/admin/content` page accepts an episode-level video URL and uploads images, PDFs, and other supporting files to Cloudflare R2. Video overviews are rendered with an HTML5 video player on the episode detail page. Each uploaded file has a display title and description and appears on the same page.
+The password-protected `/admin/content` page accepts an episode-level YouTube video URL and uploads images, PDFs, and other supporting files to Cloudflare R2. Video overviews are rendered with a YouTube player on the episode detail page. Each uploaded file has a display title and description and appears on the same page.
 
 Create the configured R2 bucket once:
 

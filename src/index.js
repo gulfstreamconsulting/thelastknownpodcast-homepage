@@ -1550,7 +1550,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
             numericDuration > 0
               ? Math.min(100, Math.max(0, Math.round((numericPosition / numericDuration) * 100)))
               : 0;
-          var eventName = mediaType + '_' + type + '_' + countryCode;
+          var eventName = 'thelastknownpodcast_' + mediaType + '_' + type + '_' + countryCode;
           var parameters = {
             event_type: type,
             country_code: countryCode,
@@ -1758,6 +1758,183 @@ const renderPlaybackTracking = (episodes, countryCode) => {
       })();
     </script>`;
 };
+
+const renderEpisodeJumpNavTracking = (episode, countryCode) => `
+  <script>
+    (function () {
+      var countryCode = ${safeJson(countryCode)};
+      var episode = ${safeJson({
+        episodeId: episode.id,
+        episodeTitle: episode.title
+      })};
+      var jumpNav = document.querySelector('.episode-jump-nav');
+      if (!jumpNav || jumpNav.dataset.analyticsInitialized === 'true') return;
+
+      jumpNav.dataset.analyticsInitialized = 'true';
+      jumpNav.addEventListener('click', function (event) {
+        var link = event.target.closest('a[data-jump-section]');
+        if (!link || !jumpNav.contains(link)) return;
+
+        var eventName = 'thelastknownpodcast_episode_jump_nav_click_' + countryCode;
+        var parameters = {
+          country_code: countryCode,
+          episode_id: episode.episodeId,
+          episode_title: episode.episodeTitle,
+          jump_section: link.dataset.jumpSection || link.textContent.trim(),
+          jump_target: link.dataset.jumpTarget || link.getAttribute('href') || ''
+        };
+
+        if (typeof window.gtag === 'function') {
+          window.gtag('event', eventName, parameters);
+        }
+
+        if (typeof window.fbq === 'function') {
+          window.fbq('trackCustom', eventName, parameters);
+        }
+      });
+    })();
+  </script>`;
+
+const renderTimeOnSiteTracking = (countryCode) => `
+  <script>
+    (function () {
+      if (window.__theLastKnownTimeOnSiteInitialized) return;
+      window.__theLastKnownTimeOnSiteInitialized = true;
+
+      var countryCode = ${safeJson(countryCode)};
+      var startedAt = Date.now();
+      var milestones = [15, 30, 60, 120, 300, 600];
+      var completedMilestones = {};
+      var finalSent = false;
+
+      function secondsOnPage() {
+        return Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+      }
+
+      function sendTimeOnSiteEvent(type, durationSeconds) {
+        var bucket = type === 'milestone' ? '_' + durationSeconds + 's' : '_final';
+        var eventName = 'thelastknownpodcast_time_on_site' + bucket + '_' + countryCode;
+        var parameters = {
+          country_code: countryCode,
+          duration_seconds: durationSeconds,
+          engagement_type: type,
+          page_path: window.location.pathname,
+          page_title: document.title
+        };
+
+        if (typeof window.gtag === 'function') {
+          window.gtag('event', eventName, parameters);
+        }
+
+        if (typeof window.fbq === 'function') {
+          window.fbq('trackCustom', eventName, parameters);
+        }
+      }
+
+      var interval = window.setInterval(function () {
+        var elapsedSeconds = secondsOnPage();
+
+        milestones.forEach(function (milestone) {
+          if (completedMilestones[milestone] || elapsedSeconds < milestone) return;
+
+          completedMilestones[milestone] = true;
+          sendTimeOnSiteEvent('milestone', milestone);
+        });
+      }, 1000);
+
+      function sendFinalEvent() {
+        if (finalSent) return;
+
+        finalSent = true;
+        window.clearInterval(interval);
+        sendTimeOnSiteEvent('final', secondsOnPage());
+      }
+
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'hidden') {
+          sendFinalEvent();
+        }
+      });
+
+      window.addEventListener('pagehide', sendFinalEvent);
+    })();
+  </script>`;
+
+const renderScrollDepthTracking = (countryCode) => `
+  <script>
+    (function () {
+      if (window.__theLastKnownScrollDepthInitialized) return;
+      window.__theLastKnownScrollDepthInitialized = true;
+
+      var countryCode = ${safeJson(countryCode)};
+      var milestones = [25, 50, 75, 90];
+      var completedMilestones = {};
+      var ticking = false;
+
+      function documentHeight() {
+        return Math.max(
+          document.body.scrollHeight,
+          document.body.offsetHeight,
+          document.documentElement.clientHeight,
+          document.documentElement.scrollHeight,
+          document.documentElement.offsetHeight
+        );
+      }
+
+      function currentScrollPercent() {
+        var height = documentHeight();
+        var viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+        var maxScroll = Math.max(0, height - viewportHeight);
+
+        if (maxScroll <= 0) {
+          return 0;
+        }
+
+        return Math.min(100, Math.max(0, Math.round((window.scrollY / maxScroll) * 100)));
+      }
+
+      function sendScrollDepthEvent(milestone) {
+        var eventName = 'thelastknownpodcast_scroll_depth_' + milestone + '_' + countryCode;
+        var parameters = {
+          country_code: countryCode,
+          scroll_percent: milestone,
+          page_path: window.location.pathname,
+          page_title: document.title
+        };
+
+        if (typeof window.gtag === 'function') {
+          window.gtag('event', eventName, parameters);
+        }
+
+        if (typeof window.fbq === 'function') {
+          window.fbq('trackCustom', eventName, parameters);
+        }
+      }
+
+      function evaluateScrollDepth() {
+        ticking = false;
+        var percent = currentScrollPercent();
+
+        milestones.forEach(function (milestone) {
+          if (completedMilestones[milestone] || percent < milestone) return;
+
+          completedMilestones[milestone] = true;
+          sendScrollDepthEvent(milestone);
+        });
+      }
+
+      function scheduleEvaluation() {
+        if (ticking) return;
+
+        ticking = true;
+        window.requestAnimationFrame(evaluateScrollDepth);
+      }
+
+      window.addEventListener('scroll', scheduleEvaluation, { passive: true });
+      window.addEventListener('resize', scheduleEvaluation);
+      scheduleEvaluation();
+    })();
+  </script>`;
 
 const renderAttachments = (episode) => {
   if (!episode.attachments?.length) {
@@ -1991,7 +2168,12 @@ const renderEpisodeJumpNav = (episode, relatedEpisodes = []) => {
       <span>On this page</span>
       <div>
         ${links
-          .map((link) => `<a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`)
+          .map(
+            (link) =>
+              `<a href="${escapeHtml(link.href)}" data-jump-section="${escapeHtml(
+                link.label
+              )}" data-jump-target="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`
+          )
           .join("")}
       </div>
     </nav>`;
@@ -2848,7 +3030,7 @@ const styles = `
   .native-ad iframe {
     display: block;
     width: 100%;
-    min-height: 280px;
+    height: 380px;
     border: 0;
     background: transparent;
   }
@@ -2856,6 +3038,11 @@ const styles = `
   .article-body .native-ad,
   .transcript-preview .native-ad {
     margin: 30px 0;
+  }
+
+  .article-body .native-ad iframe,
+  .transcript-preview .native-ad iframe {
+    height: 440px;
   }
 
   .banner-ad {
@@ -3548,6 +3735,12 @@ const styles = `
       grid-template-columns: 1fr;
     }
 
+    .native-ad iframe,
+    .article-body .native-ad iframe,
+    .transcript-preview .native-ad iframe {
+      height: 500px;
+    }
+
     .episode-jump-nav {
       align-items: start;
       flex-direction: column;
@@ -3675,6 +3868,8 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
       </article>
       ${renderFooter()}
     </main>
+    ${renderTimeOnSiteTracking(analytics.countryCode)}
+    ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
 </html>`;
 
@@ -3779,6 +3974,8 @@ const renderPage = (
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
     ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
+    ${renderTimeOnSiteTracking(analytics.countryCode)}
+    ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
 </html>`;
 };
@@ -3853,11 +4050,14 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
     ${renderPlaybackTracking([episode], analytics.countryCode)}
+    ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
+    ${renderTimeOnSiteTracking(analytics.countryCode)}
+    ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
 </html>`;
 };
 
-const renderSearchPage = (query, results) => {
+const renderSearchPage = (query, results, analytics = {}) => {
   const hasQuery = query.length > 0;
   const resultLabel = `${results.length} episode${results.length === 1 ? "" : "s"} found`;
 
@@ -3907,6 +4107,8 @@ const renderSearchPage = (query, results) => {
       </section>
       ${renderFooter()}
     </main>
+    ${renderTimeOnSiteTracking(analytics.countryCode)}
+    ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
 </html>`;
 };
@@ -4665,7 +4867,7 @@ export default {
         const episodes = await loadEpisodeCatalog();
         const results = searchEpisodes(episodes, query);
 
-        return new Response(renderSearchPage(query, results), {
+        return new Response(renderSearchPage(query, results, analytics), {
           headers: {
             "content-type": "text/html;charset=UTF-8",
             "cache-control": cacheControl,

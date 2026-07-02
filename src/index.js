@@ -23,6 +23,14 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
 const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data";
 const EPISODES_PER_PAGE = 9;
+const ADS_TXT_REDIRECT_URL = "https://srv.adstxtmanager.com/19390/thelastknownpodcast.com";
+const DIRECT_SUPPORT_URL = "https://omg10.com/4/11230976";
+const ADSTERRA_NATIVE_SCRIPT_URL =
+  "https://pl28638835.effectivecpmnetwork.com/8fee276f31bbe673bacbd151f123599f/invoke.js";
+const ADSTERRA_NATIVE_CONTAINER_ID = "container-8fee276f31bbe673bacbd151f123599f";
+const ADSTERRA_BANNER_KEY = "8ce72288f86a6c1f5e7fef247bea3264";
+const ADSTERRA_BANNER_SCRIPT_URL =
+  "https://www.highperformanceformat.com/8ce72288f86a6c1f5e7fef247bea3264/invoke.js";
 
 const stripHtml = (value = "") =>
   String(value)
@@ -140,7 +148,8 @@ const selectTranscript = (episode) => {
 
 const normalizeEpisode = (episode) => {
   const description = stripHtml(episode.description_html ?? episode.description ?? "");
-  const summary = truncateText(description || `${episode.title} from ${podcast.name}.`);
+  const detail = description || `${episode.title} from ${podcast.name}.`;
+  const summary = truncateText(detail);
 
   return {
     id: String(episode.episode_id),
@@ -148,7 +157,7 @@ const normalizeEpisode = (episode) => {
     status: "Episode",
     title: episode.title,
     summary,
-    detail: summary,
+    detail,
     publishedAt: formatPublishedDate(episode.published_at),
     publishedDate: formatSitemapDate(episode.published_at),
     href: episode.site_url,
@@ -326,8 +335,118 @@ const attachmentManifestKey = (episodeId) => `episodes/${episodeId}/manifest.jso
 
 const emptyEpisodeContent = () => ({
   attachments: [],
-  videoUrl: ""
+  videoUrl: "",
+  mapLocations: [],
+  article: {
+    title: "",
+    excerpt: "",
+    body: "",
+    updatedAt: ""
+  }
 });
+
+const normalizeArticle = (article) => ({
+  title: String(article?.title ?? "").trim().slice(0, 160),
+  excerpt: String(article?.excerpt ?? "").trim().slice(0, 500),
+  body: String(article?.body ?? "").trim().slice(0, 80000),
+  updatedAt: String(article?.updatedAt ?? "").trim().slice(0, 40)
+});
+
+const normalizeMapLocation = (location) => {
+  const label = fallbackText(location?.label, "Case location").slice(0, 140);
+  const address = String(location?.address ?? "").trim().slice(0, 240);
+  const note = String(location?.note ?? "").trim().slice(0, 500);
+  const latitude = Number.parseFloat(location?.latitude);
+  const longitude = Number.parseFloat(location?.longitude);
+  const hasCoordinates =
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    latitude >= -90 &&
+    latitude <= 90 &&
+    longitude >= -180 &&
+    longitude <= 180;
+
+  if (!label && !address && !hasCoordinates) {
+    return null;
+  }
+
+  const fallbackId =
+    `${label}-${address}-${hasCoordinates ? `${latitude}-${longitude}` : ""}`
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 100) || crypto.randomUUID();
+
+  return {
+    id: String(location?.id ?? fallbackId),
+    label,
+    address,
+    note,
+    latitude: hasCoordinates ? latitude : null,
+    longitude: hasCoordinates ? longitude : null
+  };
+};
+
+const normalizeMapLocations = (locations) =>
+  (Array.isArray(locations) ? locations : [])
+    .map(normalizeMapLocation)
+    .filter(Boolean)
+    .slice(0, 12);
+
+const geocodeMapLocation = async (location, env) => {
+  if (location.latitude !== null || location.longitude !== null || !location.address) {
+    return { location, geocoded: false };
+  }
+
+  const geocoderUrl = new URL(env.GEOCODER_BASE_URL || "https://nominatim.openstreetmap.org/search");
+  geocoderUrl.searchParams.set("format", "jsonv2");
+  geocoderUrl.searchParams.set("limit", "1");
+  geocoderUrl.searchParams.set("q", location.address);
+
+  if (env.GEOCODER_EMAIL) {
+    geocoderUrl.searchParams.set("email", env.GEOCODER_EMAIL);
+  }
+
+  try {
+    const response = await fetch(geocoderUrl.href, {
+      headers: {
+        accept: "application/json",
+        referer: "https://thelastknownpodcast.com/",
+        "user-agent": `${podcast.name} website (${podcast.email})`
+      },
+      cf: {
+        cacheTtl: 60 * 60 * 24 * 30,
+        cacheEverything: true
+      }
+    });
+
+    if (!response.ok) {
+      console.error(`Geocoder returned ${response.status} for ${location.address}`);
+      return { location, geocoded: false };
+    }
+
+    const results = await response.json();
+    const result = Array.isArray(results) ? results[0] : null;
+    const latitude = Number.parseFloat(result?.lat);
+    const longitude = Number.parseFloat(result?.lon);
+
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return { location, geocoded: false };
+    }
+
+    return {
+      location: normalizeMapLocation({
+        ...location,
+        latitude,
+        longitude
+      }),
+      geocoded: true
+    };
+  } catch (error) {
+    console.error(`Unable to geocode map location: ${location.address}`, error);
+    return { location, geocoded: false };
+  }
+};
 
 const loadEpisodeContent = async (env, episodeId) => {
   if (!env.EPISODE_CONTENT) {
@@ -344,6 +463,8 @@ const loadEpisodeContent = async (env, episodeId) => {
     const manifest = await object.json();
     return {
       attachments: Array.isArray(manifest.attachments) ? manifest.attachments : [],
+      article: normalizeArticle(manifest.article),
+      mapLocations: normalizeMapLocations(manifest.mapLocations),
       videoUrl:
         typeof manifest.videoUrl === "string"
           ? manifest.videoUrl
@@ -364,6 +485,8 @@ const saveEpisodeContent = (env, episodeId, content) =>
       {
         version: 2,
         attachments: content.attachments ?? [],
+        article: normalizeArticle(content.article),
+        mapLocations: normalizeMapLocations(content.mapLocations),
         videoUrl: content.videoUrl ?? ""
       },
       null,
@@ -384,7 +507,9 @@ const loadApiEpisodeCatalog = async (env) => {
     episodes.map(async (episode) => {
       const content = await loadEpisodeContent(env, episode.id);
       episode.attachments = content.attachments;
+      episode.article = content.article;
       episode.videoUrl = content.videoUrl;
+      episode.mapLocations = content.mapLocations;
     })
   );
 
@@ -741,7 +866,9 @@ const serializeEpisode = (episode, origin) => ({
         mimeType: episode.transcript.type
       }
     : null,
+  article: normalizeArticle(episode.article),
   videoUrl: episode.videoUrl || null,
+  mapLocations: normalizeMapLocations(episode.mapLocations),
   attachments: (episode.attachments ?? []).map((attachment) =>
     serializeAttachment(attachment, episode, origin)
   )
@@ -1257,15 +1384,13 @@ const selectRelatedEpisodes = (episode, episodes, limit = 3) => {
   return [...adjacent, ...remaining].slice(0, limit);
 };
 
-const renderRelatedEpisodes = (episode, episodes) => {
-  const relatedEpisodes = selectRelatedEpisodes(episode, episodes);
-
+const renderRelatedEpisodes = (episode, relatedEpisodes) => {
   if (!relatedEpisodes.length) {
     return "";
   }
 
   return `
-    <section class="related-episodes" aria-labelledby="related-episodes-title">
+    <section class="related-episodes" id="related-episodes" aria-labelledby="related-episodes-title">
       <p class="section-kicker">Keep exploring</p>
       <h2 id="related-episodes-title">More episodes from ${escapeHtml(podcast.name)}</h2>
       <div class="related-episode-grid">
@@ -1298,6 +1423,7 @@ const renderFooter = ({ disclaimer = "" } = {}) => `
       <a href="/#cases">All episodes</a>
       <a href="/about-us">About Us</a>
       <a href="/contact-us">Contact Us</a>
+      <a href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
       <a href="/privacy-policy">Privacy Policy</a>
       <a href="/editorial-policy">Editorial Policy</a>
       <a href="/sitemap.xml">Sitemap</a>
@@ -1330,6 +1456,7 @@ const renderSiteHeader = ({ home = false, query = "" } = {}) => `
       <a href="${home ? "#cases" : "/#cases"}">All episodes</a>
       <a href="/about-us">About Us</a>
       <a href="/contact-us">Contact Us</a>
+      <a href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
       <a href="/privacy-policy">Privacy Policy</a>
       <a href="/editorial-policy">Editorial Policy</a>
       <a href="/sitemap.xml">Sitemap</a>
@@ -1357,6 +1484,38 @@ const renderSpreakerPlayer = (episode) => `
     data-hide-download="true"
     data-title="${escapeHtml(episode.title)}"
   >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
+
+const renderAdsterraNativeAd = (placement = "episode") => {
+  const adMarkup = `<script async="async" data-cfasync="false" src="${ADSTERRA_NATIVE_SCRIPT_URL}"></script>
+<div id="${ADSTERRA_NATIVE_CONTAINER_ID}"></div>`;
+
+  return `
+    <aside class="native-ad native-ad-${escapeHtml(placement)}" aria-label="Advertisement">
+      <iframe
+        title="Advertisement"
+        loading="lazy"
+        srcdoc="${escapeHtml(adMarkup)}"
+        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+        referrerpolicy="no-referrer-when-downgrade"
+      ></iframe>
+    </aside>`;
+};
+
+const appendNativeAd = (html, placement) => (html ? `${html}${renderAdsterraNativeAd(placement)}` : "");
+
+const renderAdsterraBannerAd = (placement = "page") => `
+  <aside class="banner-ad banner-ad-${escapeHtml(placement)}" aria-label="Advertisement">
+    <script>
+      atOptions = {
+        'key' : '${ADSTERRA_BANNER_KEY}',
+        'format' : 'iframe',
+        'height' : 60,
+        'width' : 468,
+        'params' : {}
+      };
+    </script>
+    <script src="${ADSTERRA_BANNER_SCRIPT_URL}"></script>
+  </aside>`;
 
 const renderPlaybackTracking = (episodes, countryCode) => {
   const audioPlayers = episodes.map((episode) => ({
@@ -1628,6 +1787,32 @@ const renderAttachments = (episode) => {
           </figure>`;
       }
 
+      if (attachment.type === "pdf") {
+        const pdfPreviewUrl = `${url}#page=1&toolbar=0&navpanes=0`;
+
+        return `
+          <article class="attachment-card attachment-pdf">
+            <div class="pdf-preview" aria-label="${escapeHtml(`${attachment.title} first page preview`)}">
+              <iframe
+                src="${escapeHtml(pdfPreviewUrl)}"
+                title="${escapeHtml(`${attachment.title} first page preview`)}"
+                loading="lazy"
+              ></iframe>
+            </div>
+            <div class="attachment-file">
+              <p class="attachment-type">PDF document</p>
+              <h3>${escapeHtml(attachment.title)}</h3>
+              ${description}
+              <p class="attachment-meta">${escapeHtml(attachment.filename)} · ${escapeHtml(
+                formatFileSize(attachment.size)
+              )}</p>
+              <a class="button secondary-dark" href="${escapeHtml(
+                url
+              )}" target="_blank" rel="noopener">View PDF</a>
+            </div>
+          </article>`;
+      }
+
       const label = attachment.type === "pdf" ? "View PDF" : "Download file";
 
       return `
@@ -1648,7 +1833,7 @@ const renderAttachments = (episode) => {
     .join("");
 
   return `
-    <section class="episode-attachments" aria-labelledby="episode-materials-title">
+    <section class="episode-attachments" id="materials" aria-labelledby="episode-materials-title">
       <p class="section-kicker">Supporting material</p>
       <h2 id="episode-materials-title">Episode materials</h2>
       <div class="attachment-grid">${items}</div>
@@ -1663,7 +1848,7 @@ const renderVideoOverview = (episode) => {
   }
 
   return `
-    <section class="episode-video" aria-labelledby="video-overview-title">
+    <section class="episode-video" id="video" aria-labelledby="video-overview-title">
       <p class="section-kicker">Watch</p>
       <h2 id="video-overview-title">Video overview</h2>
       <div class="video-player">
@@ -1681,6 +1866,280 @@ const renderVideoOverview = (episode) => {
     </section>`;
 };
 
+const renderInlineMarkdown = (value) => {
+  const escaped = escapeHtml(value);
+  return escaped
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+};
+
+const renderMarkdownBlocks = (value, options = {}) => {
+  const lines = String(value ?? "").replace(/\r/g, "").split("\n");
+  const blocks = [];
+  let paragraph = [];
+  let listItems = [];
+  let paragraphCount = 0;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) {
+      return;
+    }
+
+    paragraphCount += 1;
+    blocks.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+    if (options.insertAdAfterParagraph && paragraphCount === options.insertAdAfterParagraph) {
+      blocks.push(renderAdsterraNativeAd(options.adPlacement ?? "article-inline"));
+    }
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!listItems.length) {
+      return;
+    }
+
+    blocks.push(`<ul>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
+    listItems = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = line.match(/^(#{2,3})\s+(.+)$/);
+
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      blocks.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    if (line.startsWith("> ")) {
+      flushParagraph();
+      flushList();
+      blocks.push(`<blockquote>${renderInlineMarkdown(line.slice(2).trim())}</blockquote>`);
+      continue;
+    }
+
+    const listItem = line.match(/^[-*]\s+(.+)$/);
+
+    if (listItem) {
+      flushParagraph();
+      listItems.push(listItem[1]);
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+
+  return blocks.join("");
+};
+
+const renderEpisodeArticle = (episode) => {
+  const article = normalizeArticle(episode.article);
+
+  if (!article.body) {
+    return "";
+  }
+
+  return `
+    <section class="episode-article" id="companion-article" aria-labelledby="episode-article-title">
+      <p class="section-kicker">Companion article</p>
+      <h2 id="episode-article-title">${escapeHtml(article.title || `${episode.title} companion article`)}</h2>
+      <p class="article-context">This companion article expands on themes, context, or related questions from the episode.</p>
+      ${article.updatedAt ? `<p class="article-updated">Last updated ${escapeHtml(article.updatedAt)}</p>` : ""}
+      ${article.excerpt ? `<p class="article-excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
+      <div class="article-body">
+        ${renderMarkdownBlocks(article.body, {
+          insertAdAfterParagraph: 3,
+          adPlacement: "article-inline"
+        })}
+      </div>
+      <a class="back-to-top" href="#episode-title">Back to top</a>
+    </section>`;
+};
+
+const renderEpisodeJumpNav = (episode, relatedEpisodes = []) => {
+  const article = normalizeArticle(episode.article);
+  const links = [
+    parseVideoUrl(episode.videoUrl) ? { href: "#video", label: "Video" } : null,
+    normalizeMapLocations(episode.mapLocations).length ? { href: "#locations", label: "Locations" } : null,
+    episode.attachments?.length ? { href: "#materials", label: "Materials" } : null,
+    article.body ? { href: "#companion-article", label: "Companion article" } : null,
+    episode.transcriptContent?.paragraphs?.length ? { href: "#transcript", label: "Transcript" } : null,
+    relatedEpisodes.length ? { href: "#related-episodes", label: "Related episodes" } : null
+  ].filter(Boolean);
+
+  if (!links.length) {
+    return "";
+  }
+
+  return `
+    <nav class="episode-jump-nav" aria-label="Episode sections">
+      <span>On this page</span>
+      <div>
+        ${links
+          .map((link) => `<a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`)
+          .join("")}
+      </div>
+    </nav>`;
+};
+
+const mapSearchUrl = (location) => {
+  if (location.latitude !== null && location.longitude !== null) {
+    return `https://www.openstreetmap.org/?mlat=${encodeURIComponent(
+      location.latitude
+    )}&mlon=${encodeURIComponent(location.longitude)}#map=14/${encodeURIComponent(
+      location.latitude
+    )}/${encodeURIComponent(location.longitude)}`;
+  }
+
+  return `https://www.openstreetmap.org/search?query=${encodeURIComponent(
+    location.address || location.label
+  )}`;
+};
+
+const mapEmbedUrl = (location) => {
+  if (location.latitude === null || location.longitude === null) {
+    return "";
+  }
+
+  const latitude = location.latitude;
+  const longitude = location.longitude;
+  const latitudeDelta = 0.018;
+  const longitudeDelta = 0.026;
+  const bbox = [
+    longitude - longitudeDelta,
+    latitude - latitudeDelta,
+    longitude + longitudeDelta,
+    latitude + latitudeDelta
+  ].join(",");
+
+  return `https://www.openstreetmap.org/export/embed.html?bbox=${encodeURIComponent(
+    bbox
+  )}&layer=mapnik&marker=${encodeURIComponent(`${latitude},${longitude}`)}`;
+};
+
+const renderEpisodeMap = (episode) => {
+  const locations = normalizeMapLocations(episode.mapLocations);
+
+  if (!locations.length) {
+    return "";
+  }
+
+  const primaryLocation = locations.find(
+    (location) => location.latitude !== null && location.longitude !== null
+  );
+  const embedUrl = primaryLocation ? mapEmbedUrl(primaryLocation) : "";
+
+  return `
+    <section class="episode-map" id="locations" aria-labelledby="episode-map-title">
+      <p class="section-kicker">Locations</p>
+      <h2 id="episode-map-title">Case locations</h2>
+      ${
+        embedUrl
+          ? `<div class="map-frame">
+              <iframe
+                src="${escapeHtml(embedUrl)}"
+                title="${escapeHtml(`${episode.title} case location map`)}"
+                loading="lazy"
+              ></iframe>
+            </div>`
+          : ""
+      }
+      <div class="map-location-list">
+        ${locations
+          .map(
+            (location) => `
+              <article class="map-location">
+                <h3>${escapeHtml(location.label)}</h3>
+                ${
+                  location.address
+                    ? `<p>${escapeHtml(location.address)}</p>`
+                    : ""
+                }
+                ${
+                  location.note
+                    ? `<p>${escapeHtml(location.note)}</p>`
+                    : ""
+                }
+                <a href="${escapeHtml(mapSearchUrl(location))}" target="_blank" rel="noopener">Open map</a>
+              </article>`
+          )
+          .join("")}
+      </div>
+    </section>`;
+};
+
+const LOCATION_STOP_WORDS = new Set([
+  "And",
+  "But",
+  "Case",
+  "Episode",
+  "Facebook",
+  "Friday",
+  "Monday",
+  "Podcast",
+  "Saturday",
+  "Sunday",
+  "Thursday",
+  "Tuesday",
+  "Wednesday",
+  "YouTube"
+]);
+
+const inferLocationSuggestions = (episode) => {
+  const text = [
+    episode.title,
+    episode.summary,
+    ...(episode.body ?? []),
+    ...(episode.transcriptContent?.paragraphs ?? [])
+  ]
+    .join("\n")
+    .replace(/\s+/g, " ");
+  const candidates = new Map();
+  const patterns = [
+    /\b(?:in|near|from|at|around|outside|inside|through|toward|towards|between)\s+([A-Z][A-Za-z.'-]+(?:\s+(?:and|of|the|[A-Z][A-Za-z.'-]+)){0,5}(?:,\s*[A-Z]{2})?)/g,
+    /\b([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3},\s*[A-Z]{2})\b/g
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const candidate = match[1]
+        .replace(/[.;:!?)]*$/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      const firstWord = candidate.split(/\s+/)[0];
+
+      if (
+        candidate.length < 4 ||
+        candidate.length > 120 ||
+        LOCATION_STOP_WORDS.has(firstWord) ||
+        /^\d+$/.test(candidate)
+      ) {
+        continue;
+      }
+
+      const key = candidate.toLowerCase();
+      candidates.set(key, candidate);
+    }
+  }
+
+  return [...candidates.values()].slice(0, 12);
+};
+
 const renderTranscript = (episode) => {
   if (!episode.transcriptContent?.paragraphs?.length) {
     return "";
@@ -1688,6 +2147,12 @@ const renderTranscript = (episode) => {
 
   const visibleParagraphs = episode.transcriptContent.paragraphs.slice(0, 3);
   const remainingParagraphs = episode.transcriptContent.paragraphs.slice(3);
+  const transcriptPreview = visibleParagraphs
+    .map((paragraph, index) => {
+      const ad = index === 1 ? renderAdsterraNativeAd("transcript-inline") : "";
+      return `<p>${escapeHtml(paragraph)}</p>${ad}`;
+    })
+    .join("");
 
   return `
     <section class="episode-transcript" id="transcript" aria-labelledby="transcript-title">
@@ -1695,7 +2160,7 @@ const renderTranscript = (episode) => {
       <h2 id="transcript-title">${escapeHtml(episode.title)} transcript</h2>
       <p class="transcript-intro">Transcript excerpt supplied by Spreaker.</p>
       <div class="transcript-preview">
-        ${visibleParagraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("")}
+        ${transcriptPreview}
       </div>
       ${
         remainingParagraphs.length
@@ -1710,6 +2175,7 @@ const renderTranscript = (episode) => {
       <a class="transcript-source" href="${escapeHtml(
         episode.transcriptContent.sourceUrl
       )}" target="_blank" rel="noopener">View original transcript on Spreaker</a>
+      <a class="back-to-top" href="#episode-title">Back to top</a>
     </section>`;
 };
 
@@ -1753,7 +2219,8 @@ const renderHead = ({
   title,
   description,
   image = podcast.heroImage,
-  facebookPixelId = ""
+  facebookPixelId = "",
+  extraHead = ""
 }) => `
   <head>
     <meta charset="utf-8">
@@ -1763,21 +2230,16 @@ const renderHead = ({
     <meta property="og:title" content="${escapeHtml(title)}">
     <meta property="og:description" content="${escapeHtml(description)}">
     <meta property="og:image" content="${escapeHtml(image)}">
+    ${extraHead}
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(facebookPixelId)}
-    <script data-cfasync="false" src="https://cmp.gatekeeperconsent.com/min.js"></script>
-    <script data-cfasync="false" src="https://the.gatekeeperconsent.com/cmp.min.js"></script>
-    <script async src="//www.ezojs.com/ezoic/sa.min.js"></script>
-    <script>
-      window.ezstandalone = window.ezstandalone || {};
-      ezstandalone.cmd = ezstandalone.cmd || [];
-    </script>
-    <script src="//ezoicanalytics.com/analytics.js"></script>
     <script type="text/javascript">
       var infolinks_pid = 3446247;
       var infolinks_wsid = 0;
     </script>
     <script type="text/javascript" src="https://resources.infolinks.com/js/infolinks_main.js"></script>
+    <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
+    <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
     <style>${styles}</style>
   </head>`;
 
@@ -1951,9 +2413,19 @@ const styles = `
     display: grid;
     grid-template-columns: minmax(0, 0.82fr) minmax(320px, 0.58fr);
     gap: 42px;
-    min-height: calc(100vh - 84px);
+    min-height: auto;
     padding: 64px 0;
-    align-items: center;
+    align-items: start;
+  }
+
+  .episode-hero h1 {
+    font-size: clamp(2.65rem, 6vw, 5.6rem);
+    line-height: 0.98;
+  }
+
+  .episode-hero .lede {
+    max-width: 680px;
+    line-height: 1.55;
   }
 
   .search-hero {
@@ -2001,6 +2473,14 @@ const styles = `
     margin: 24px 0 0;
     color: #ddd5ca;
     font-size: clamp(1.05rem, 2vw, 1.35rem);
+  }
+
+  .episode-published {
+    margin: 18px 0 0;
+    color: var(--gold);
+    font-size: 0.86rem;
+    font-weight: 800;
+    text-transform: uppercase;
   }
 
   .back-link {
@@ -2069,6 +2549,52 @@ const styles = `
     max-width: 820px;
   }
 
+  .episode-jump-nav {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    display: flex;
+    width: min(1120px, calc(100% - 40px));
+    align-items: center;
+    gap: 14px;
+    margin: 0 auto;
+    padding: 14px 0;
+    border-bottom: 1px solid #d8cab7;
+    background: #f7f2ea;
+    color: #332d28;
+  }
+
+  .episode-jump-nav span {
+    flex: 0 0 auto;
+    color: var(--rust);
+    font-size: 0.78rem;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  .episode-jump-nav div {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .episode-jump-nav a {
+    display: inline-flex;
+    min-height: 36px;
+    align-items: center;
+    padding: 0 12px;
+    border: 1px solid #d8cab7;
+    border-radius: 999px;
+    background: #fffaf2;
+    font-size: 0.88rem;
+    font-weight: 900;
+  }
+
+  .episode-jump-nav a:hover {
+    border-color: rgba(157, 63, 54, 0.58);
+    color: var(--rust);
+  }
+
   .episode-body {
     color: #332d28;
     font-size: 1.08rem;
@@ -2076,6 +2602,73 @@ const styles = `
 
   .episode-body p {
     margin: 0 0 18px;
+  }
+
+  .episode-article {
+    margin-top: 42px;
+    margin-bottom: 42px;
+    padding-bottom: 42px;
+    padding-top: 36px;
+    border-top: 1px solid #d8cab7;
+    border-bottom: 1px solid #d8cab7;
+  }
+
+  .article-context {
+    margin: 12px 0 0;
+    color: #61584f;
+    font-size: 0.98rem;
+    line-height: 1.6;
+  }
+
+  .article-updated {
+    margin: 10px 0 0;
+    color: #61584f;
+    font-size: 0.88rem;
+    font-weight: 800;
+  }
+
+  .article-excerpt {
+    margin: 18px 0 0;
+    color: #4d453d;
+    font-size: 1.08rem;
+    font-weight: 800;
+    line-height: 1.7;
+  }
+
+  .article-body {
+    margin-top: 28px;
+    color: #332d28;
+    font-size: 1.08rem;
+    line-height: 1.82;
+  }
+
+  .article-body h2,
+  .article-body h3 {
+    margin: 34px 0 14px;
+  }
+
+  .article-body p,
+  .article-body ul,
+  .article-body blockquote {
+    margin: 0 0 20px;
+  }
+
+  .article-body ul {
+    padding-left: 24px;
+  }
+
+  .article-body blockquote {
+    padding: 16px 18px;
+    border-left: 4px solid var(--rust);
+    background: #fffaf2;
+    color: #4d453d;
+  }
+
+  .article-body a {
+    color: var(--rust);
+    font-weight: 900;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
   }
 
   .breadcrumbs {
@@ -2099,6 +2692,57 @@ const styles = `
     margin-bottom: 42px;
     padding-bottom: 42px;
     border-bottom: 1px solid #d8cab7;
+  }
+
+  .episode-map {
+    margin-bottom: 42px;
+    padding-bottom: 42px;
+    border-bottom: 1px solid #d8cab7;
+  }
+
+  .map-frame {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    margin-top: 22px;
+    overflow: hidden;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #e7dccd;
+    box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
+  }
+
+  .map-frame iframe {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+  }
+
+  .map-location-list {
+    display: grid;
+    gap: 14px;
+    margin-top: 18px;
+  }
+
+  .map-location {
+    padding: 16px;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #fffaf2;
+  }
+
+  .map-location h3 {
+    margin: 0 0 8px;
+  }
+
+  .map-location p {
+    margin: 0 0 8px;
+    color: #61584f;
+  }
+
+  .map-location a {
+    color: var(--rust);
+    font-weight: 900;
   }
 
   .video-player {
@@ -2184,6 +2828,51 @@ const styles = `
     font-weight: 900;
   }
 
+  .back-to-top {
+    display: inline-flex;
+    margin-top: 18px;
+    color: var(--rust);
+    font-weight: 900;
+  }
+
+  .native-ad {
+    display: block;
+    width: 100%;
+    margin: 28px 0;
+    overflow: hidden;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #fffaf2;
+  }
+
+  .native-ad iframe {
+    display: block;
+    width: 100%;
+    min-height: 280px;
+    border: 0;
+    background: transparent;
+  }
+
+  .article-body .native-ad,
+  .transcript-preview .native-ad {
+    margin: 30px 0;
+  }
+
+  .banner-ad {
+    display: flex;
+    width: min(100% - 40px, 468px);
+    min-height: 60px;
+    align-items: center;
+    justify-content: center;
+    margin: 22px auto;
+    overflow: hidden;
+  }
+
+  .banner-ad iframe {
+    max-width: 100%;
+    border: 0;
+  }
+
   .attachment-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2215,6 +2904,23 @@ const styles = `
     max-height: 440px;
     object-fit: contain;
     background: #e7dccd;
+  }
+
+  .pdf-preview {
+    display: block;
+    width: 100%;
+    aspect-ratio: 4 / 5;
+    overflow: hidden;
+    border-bottom: 1px solid #d8cab7;
+    background: #e7dccd;
+  }
+
+  .pdf-preview iframe {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: white;
   }
 
   .attachment-image figcaption,
@@ -2359,6 +3065,44 @@ const styles = `
   .admin-form textarea {
     min-height: 110px;
     resize: vertical;
+  }
+
+  .admin-form .admin-large-textarea {
+    min-height: 420px;
+    line-height: 1.6;
+  }
+
+  .admin-field-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+
+  .admin-suggestion-panel {
+    margin-top: 22px;
+    padding: 16px;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #f7f2ea;
+  }
+
+  .admin-suggestion-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 14px;
+  }
+
+  .suggestion-button {
+    min-height: 38px;
+    padding: 0 12px;
+    border: 1px solid #bba991;
+    border-radius: 4px;
+    background: #fffaf2;
+    color: var(--rust);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 900;
   }
 
   .admin-notice {
@@ -2804,7 +3548,28 @@ const styles = `
       grid-template-columns: 1fr;
     }
 
+    .episode-jump-nav {
+      align-items: start;
+      flex-direction: column;
+    }
+
+    .episode-jump-nav div {
+      width: 100%;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+
+    .episode-jump-nav a {
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
     .category-heading {
+      grid-template-columns: 1fr;
+    }
+
+    .admin-field-grid {
       grid-template-columns: 1fr;
     }
 
@@ -2890,6 +3655,8 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
       </section>
     </div>
 
+    ${renderAdsterraBannerAd("static")}
+
     <main>
       <article class="section static-page">
         <p class="section-kicker">${escapeHtml(page.kicker)}</p>
@@ -2951,10 +3718,13 @@ const renderPage = (
           <div class="hero-actions">
             <a class="button" href="#listen">Listen now</a>
             <a class="button secondary" href="${escapeHtml(episodePath(featuredEpisode))}">Episode details</a>
+            <a class="button secondary" href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
           </div>
         </div>
       </section>
     </div>
+
+    ${renderAdsterraBannerAd("home")}
 
     <main>
       <section class="section episode-layout" id="listen">
@@ -3013,7 +3783,15 @@ const renderPage = (
 </html>`;
 };
 
-const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html>
+const renderEpisodePage = (episode, episodes, analytics = {}) => {
+  const relatedEpisodes = selectRelatedEpisodes(episode, episodes);
+  const videoOverview = renderVideoOverview(episode);
+  const episodeMap = renderEpisodeMap(episode);
+  const attachments = renderAttachments(episode);
+  const companionArticle = renderEpisodeArticle(episode);
+  const transcript = renderTranscript(episode);
+
+  return `<!doctype html>
 <html lang="en">
   ${renderHead({
     title: `${episode.title} | ${podcast.name}`,
@@ -3036,12 +3814,14 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
           </nav>
           <p class="eyebrow">${escapeHtml(episode.status)}</p>
           <h1 id="episode-title">${escapeHtml(episode.title)}</h1>
-          <p class="lede">${escapeHtml(episode.summary)}</p>
+          <p class="episode-published">Published ${escapeHtml(episode.publishedAt ?? "Episode")}</p>
+          <p class="lede">${escapeHtml(episode.detail ?? episode.summary)}</p>
         </div>
         <aside class="episode-play-panel" aria-label="Episode player">
           ${renderEpisodeImage(episode, "episode-meta-image")}
           <p class="section-kicker">${escapeHtml(episode.publishedAt ?? "Episode")}</p>
           <a class="button" href="${escapeHtml(episode.href)}">Listen on Spreaker</a>
+          <a class="button secondary-dark" href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
           ${
             episode.transcriptContent
               ? '<a class="button transcript-button" href="#transcript">Read episode transcript</a>'
@@ -3054,18 +3834,18 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
       </section>
     </div>
 
+    ${renderAdsterraBannerAd("episode")}
+
     <main>
+      ${renderEpisodeJumpNav(episode, relatedEpisodes)}
       <article class="section episode-detail-layout">
-        ${renderVideoOverview(episode)}
-        ${renderAttachments(episode)}
-        <div class="episode-body">
-          ${(episode.body?.length ? episode.body : [episode.summary])
-            .map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`)
-            .join("")}
-        </div>
-        ${renderTranscript(episode)}
+        ${appendNativeAd(videoOverview, "after-video")}
+        ${appendNativeAd(episodeMap, "after-locations")}
+        ${appendNativeAd(attachments, "after-materials")}
+        ${appendNativeAd(companionArticle, "after-article")}
+        ${appendNativeAd(transcript, "after-transcript")}
       </article>
-      ${renderRelatedEpisodes(episode, episodes)}
+      ${renderRelatedEpisodes(episode, relatedEpisodes)}
       ${renderFooter({
         disclaimer: "We do not glorify violent crime or offenders."
       })}
@@ -3075,6 +3855,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => `<!doctype html
     ${renderPlaybackTracking([episode], analytics.countryCode)}
   </body>
 </html>`;
+};
 
 const renderSearchPage = (query, results) => {
   const hasQuery = query.length > 0;
@@ -3104,6 +3885,7 @@ const renderSearchPage = (query, results) => {
         </div>
       </section>
     </div>
+    ${renderAdsterraBannerAd("search")}
     <main>
       <section class="section">
         <div class="search-results-heading">
@@ -3129,22 +3911,48 @@ const renderSearchPage = (query, results) => {
 </html>`;
 };
 
-const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
+const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSuggestionData = null) => {
   const episodeOptions = episodes
     .map(
       (episode) =>
-        `<option value="${escapeHtml(episode.id)}">${escapeHtml(episode.title)}</option>`
+        `<option value="${escapeHtml(episode.id)}"${
+          locationSuggestionData?.episode?.id === episode.id ? " selected" : ""
+        }>${escapeHtml(episode.title)}</option>`
     )
     .join("");
 
   const contentLists = episodes
     .filter((episode) => {
       const content = contentByEpisode.get(episode.id);
-      return content?.videoUrl || content?.attachments?.length;
+      return (
+        content?.videoUrl ||
+        content?.attachments?.length ||
+        content?.mapLocations?.length ||
+        normalizeArticle(content?.article).body
+      );
     })
     .map((episode) => {
       const content = contentByEpisode.get(episode.id) ?? emptyEpisodeContent();
       const video = parseVideoUrl(content.videoUrl);
+      const article = normalizeArticle(content.article);
+      const articleOverview = article.body
+        ? `
+            <div class="admin-attachment">
+              <div>
+                <strong>${escapeHtml(article.title || "Episode article")}</strong>
+                <div>${escapeHtml(article.excerpt || `${article.body.slice(0, 140)}...`)}</div>
+                ${article.updatedAt ? `<div>Updated ${escapeHtml(article.updatedAt)}</div>` : ""}
+              </div>
+              <form method="post" action="/admin/content/article">
+                <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
+                <input type="hidden" name="title" value="">
+                <input type="hidden" name="excerpt" value="">
+                <input type="hidden" name="body" value="">
+                <input type="hidden" name="updatedAt" value="">
+                <button class="danger-button" type="submit">Remove</button>
+              </form>
+            </div>`
+        : "";
       const videoOverview = content.videoUrl
         ? `
             <div class="admin-attachment">
@@ -3162,6 +3970,27 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
               </form>
             </div>`
         : "";
+      const mapLocations = normalizeMapLocations(content.mapLocations)
+        .map(
+          (location) => `
+            <div class="admin-attachment">
+              <div>
+                <strong>${escapeHtml(location.label)}</strong>
+                <div>${escapeHtml(location.address || "Coordinates only")}</div>
+                ${
+                  location.latitude !== null && location.longitude !== null
+                    ? `<div>${escapeHtml(location.latitude)}, ${escapeHtml(location.longitude)}</div>`
+                    : ""
+                }
+              </div>
+              <form method="post" action="/admin/content/map/delete">
+                <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
+                <input type="hidden" name="locationId" value="${escapeHtml(location.id)}">
+                <button class="danger-button" type="submit">Remove</button>
+              </form>
+            </div>`
+        )
+        .join("");
       const attachments = content.attachments
         .map(
           (attachment) => `
@@ -3184,11 +4013,39 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
       return `
         <section class="admin-episode">
           <h3>${escapeHtml(episode.title)}</h3>
+          ${articleOverview}
           ${videoOverview}
+          ${mapLocations}
           ${attachments}
         </section>`;
     })
     .join("");
+  const locationSuggestions = locationSuggestionData
+    ? `
+        <div class="admin-suggestion-panel">
+          <h3>Transcript suggestions for ${escapeHtml(locationSuggestionData.episode.title)}</h3>
+          ${
+            locationSuggestionData.suggestions.length
+              ? `<div class="admin-suggestion-list">
+                  ${locationSuggestionData.suggestions
+                    .map(
+                      (suggestion) => `
+                        <form method="post" action="/admin/content/map">
+                          <input type="hidden" name="episodeId" value="${escapeHtml(
+                            locationSuggestionData.episode.id
+                          )}">
+                          <input type="hidden" name="label" value="${escapeHtml(suggestion)}">
+                          <input type="hidden" name="address" value="${escapeHtml(suggestion)}">
+                          <input type="hidden" name="note" value="Suggested from transcript text. Verify before publishing as a case location.">
+                          <button class="suggestion-button" type="submit">${escapeHtml(suggestion)}</button>
+                        </form>`
+                    )
+                    .join("")}
+                </div>`
+              : "<p>No likely location phrases were found in this episode transcript.</p>"
+          }
+        </div>`
+    : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -3204,6 +4061,35 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
         <h1>Episode content</h1>
         <p>Add a YouTube video overview link or upload images, PDFs, and other supporting files for an episode.</p>
         ${notice ? `<p class="admin-notice">${escapeHtml(notice)}</p>` : ""}
+        <h2>Add a companion article</h2>
+        <p>Use this for broader background, themes, or related context. It does not need to mirror the transcript.</p>
+        <form class="admin-form" method="post" action="/admin/content/article">
+          <label>
+            Episode
+            <select name="episodeId" required>${episodeOptions}</select>
+          </label>
+          <label>
+            Companion article title
+            <input name="title" maxlength="160" placeholder="Background and context">
+          </label>
+          <label>
+            Companion article excerpt
+            <textarea name="excerpt" maxlength="500" placeholder="Short introduction shown above the article body"></textarea>
+          </label>
+          <label>
+            Companion article body (Markdown)
+            <textarea class="admin-large-textarea" name="body" maxlength="80000" placeholder="Paste the blog post here. Supports ## headings, links, lists, blockquotes, bold, and italic."></textarea>
+          </label>
+          <label>
+            Updated date
+            <input name="updatedAt" maxlength="40" placeholder="July 1, 2026">
+          </label>
+          <button class="button" type="submit">Save article</button>
+        </form>
+      </section>
+      <section class="admin-panel">
+        <p class="section-kicker">Video</p>
+        <h2>Add a video overview</h2>
         <form class="admin-form" method="post" action="/admin/content/video">
           <label>
             Episode
@@ -3219,6 +4105,48 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
             >
           </label>
           <button class="button" type="submit">Save video overview</button>
+        </form>
+      </section>
+      <section class="admin-panel">
+        <p class="section-kicker">Map locations</p>
+        <h2>Add a case location</h2>
+        <p>Leave latitude and longitude blank to geocode the address when saving.</p>
+        <form class="admin-form" method="get" action="/admin/content">
+          <label>
+            Find suggestions from transcript
+            <select name="suggestEpisodeId" required>${episodeOptions}</select>
+          </label>
+          <button class="button secondary-dark" type="submit">Scan transcript</button>
+        </form>
+        ${locationSuggestions}
+        <form class="admin-form" method="post" action="/admin/content/map">
+          <label>
+            Episode
+            <select name="episodeId" required>${episodeOptions}</select>
+          </label>
+          <label>
+            Location label
+            <input name="label" maxlength="140" placeholder="Last confirmed sighting" required>
+          </label>
+          <label>
+            Address or place
+            <input name="address" maxlength="240" placeholder="City, state, landmark, or street address">
+          </label>
+          <div class="admin-field-grid">
+            <label>
+              Latitude
+              <input name="latitude" inputmode="decimal" placeholder="39.9612">
+            </label>
+            <label>
+              Longitude
+              <input name="longitude" inputmode="decimal" placeholder="-82.9988">
+            </label>
+          </div>
+          <label>
+            Note
+            <textarea name="note" maxlength="500" placeholder="Why this location matters to the episode"></textarea>
+          </label>
+          <button class="button" type="submit">Save map location</button>
         </form>
       </section>
       <section class="admin-panel">
@@ -3329,16 +4257,48 @@ const handleAdminPage = async (request, env, url) => {
   const contentEntries = await Promise.all(
     episodes.map(async (episode) => [episode.id, await loadEpisodeContent(env, episode.id)])
   );
+  const suggestEpisodeId = String(url.searchParams.get("suggestEpisodeId") ?? "").trim();
+  let locationSuggestionData = null;
+
+  if (suggestEpisodeId) {
+    const listEpisode = episodes.find((episode) => episode.id === suggestEpisodeId);
+
+    if (listEpisode) {
+      let suggestionEpisode = listEpisode;
+
+      try {
+        suggestionEpisode = await loadEpisodeDetails(listEpisode.id);
+      } catch (error) {
+        console.error(`Unable to load details for episode ${listEpisode.id}`, error);
+      }
+
+      suggestionEpisode.transcriptContent = await loadEpisodeTranscript(suggestionEpisode);
+      locationSuggestionData = {
+        episode: suggestionEpisode,
+        suggestions: inferLocationSuggestions(suggestionEpisode)
+      };
+    }
+  }
   const notices = {
+    articleSaved: "Article saved.",
+    articleRemoved: "Article removed.",
     uploaded: "Content uploaded successfully.",
     deleted: "Content deleted.",
+    mapSaved: "Map location saved.",
+    mapSavedNoGeocode: "Map location saved, but no coordinates were found. Add latitude and longitude manually to show an embedded map.",
+    mapRemoved: "Map location removed.",
     videoSaved: "Video overview saved.",
     videoRemoved: "Video overview removed.",
     missing: "The selected episode or file could not be found."
   };
 
   return new Response(
-    renderAdminPage(episodes, new Map(contentEntries), notices[url.searchParams.get("status")]),
+    renderAdminPage(
+      episodes,
+      new Map(contentEntries),
+      notices[url.searchParams.get("status")],
+      locationSuggestionData
+    ),
     {
       headers: {
         "content-type": "text/html;charset=UTF-8",
@@ -3415,6 +4375,47 @@ const handleUpload = async (request, env) => {
   return adminRedirect(request, "?status=uploaded");
 };
 
+const handleArticle = async (request, env) => {
+  if (!isAdmin(request, env)) {
+    return adminUnauthorized();
+  }
+
+  if (!sameOriginRequest(request)) {
+    return new Response("Invalid request origin", { status: 403 });
+  }
+
+  if (!env.EPISODE_CONTENT) {
+    return new Response("Content storage is not configured", { status: 503 });
+  }
+
+  const form = await request.formData();
+  const episodeId = String(form.get("episodeId") ?? "").trim();
+  const article = normalizeArticle({
+    title: form.get("title"),
+    excerpt: form.get("excerpt"),
+    body: form.get("body"),
+    updatedAt: form.get("updatedAt")
+  });
+
+  if (!episodeId) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  const episodes = await loadEpisodes();
+
+  if (!episodes.some((episode) => episode.id === episodeId)) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  const content = await loadEpisodeContent(env, episodeId);
+  await saveEpisodeContent(env, episodeId, {
+    ...content,
+    article
+  });
+
+  return adminRedirect(request, article.body ? "?status=articleSaved" : "?status=articleRemoved");
+};
+
 const handleVideoOverview = async (request, env) => {
   if (!isAdmin(request, env)) {
     return adminUnauthorized();
@@ -3453,6 +4454,93 @@ const handleVideoOverview = async (request, env) => {
     request,
     video ? "?status=videoSaved" : "?status=videoRemoved"
   );
+};
+
+const handleMapLocation = async (request, env) => {
+  if (!isAdmin(request, env)) {
+    return adminUnauthorized();
+  }
+
+  if (!sameOriginRequest(request)) {
+    return new Response("Invalid request origin", { status: 403 });
+  }
+
+  if (!env.EPISODE_CONTENT) {
+    return new Response("Content storage is not configured", { status: 503 });
+  }
+
+  const form = await request.formData();
+  const episodeId = String(form.get("episodeId") ?? "").trim();
+  const location = normalizeMapLocation({
+    label: form.get("label"),
+    address: form.get("address"),
+    latitude: form.get("latitude"),
+    longitude: form.get("longitude"),
+    note: form.get("note")
+  });
+
+  if (!episodeId || !location || (!location.address && location.latitude === null)) {
+    return new Response("Episode and either an address or coordinates are required", { status: 400 });
+  }
+
+  const episodes = await loadEpisodes();
+
+  if (!episodes.some((episode) => episode.id === episodeId)) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  const content = await loadEpisodeContent(env, episodeId);
+  const mapLocations = normalizeMapLocations(content.mapLocations);
+  const geocodedLocation = await geocodeMapLocation(location, env);
+
+  await saveEpisodeContent(env, episodeId, {
+    ...content,
+    mapLocations: [...mapLocations, geocodedLocation.location]
+  });
+
+  return adminRedirect(
+    request,
+    geocodedLocation.geocoded || geocodedLocation.location.latitude !== null
+      ? "?status=mapSaved"
+      : "?status=mapSavedNoGeocode"
+  );
+};
+
+const handleDeleteMapLocation = async (request, env) => {
+  if (!isAdmin(request, env)) {
+    return adminUnauthorized();
+  }
+
+  if (!sameOriginRequest(request)) {
+    return new Response("Invalid request origin", { status: 403 });
+  }
+
+  if (!env.EPISODE_CONTENT) {
+    return new Response("Content storage is not configured", { status: 503 });
+  }
+
+  const form = await request.formData();
+  const episodeId = String(form.get("episodeId") ?? "").trim();
+  const locationId = String(form.get("locationId") ?? "").trim();
+
+  if (!episodeId || !locationId) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  const content = await loadEpisodeContent(env, episodeId);
+  const mapLocations = normalizeMapLocations(content.mapLocations);
+  const nextMapLocations = mapLocations.filter((location) => location.id !== locationId);
+
+  if (nextMapLocations.length === mapLocations.length) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  await saveEpisodeContent(env, episodeId, {
+    ...content,
+    mapLocations: nextMapLocations
+  });
+
+  return adminRedirect(request, "?status=mapRemoved");
 };
 
 const handleDelete = async (request, env) => {
@@ -3498,7 +4586,11 @@ export default {
       return new Response(null, { status: 204, headers: API_HEADERS });
     }
 
-    if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png" || url.pathname === "/ads.txt") {
+    if (url.pathname === "/ads.txt") {
+      return Response.redirect(ADS_TXT_REDIRECT_URL, 301);
+    }
+
+    if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {
       return env.ASSETS.fetch(request);
     }
 
@@ -3532,11 +4624,23 @@ export default {
         return handleUpload(request, env);
       }
 
+      if (url.pathname === "/admin/content/article" && request.method === "POST") {
+        return handleArticle(request, env);
+      }
+
       if (
         (url.pathname === "/admin/content/video" || url.pathname === "/admin/content/youtube") &&
         request.method === "POST"
       ) {
         return handleVideoOverview(request, env);
+      }
+
+      if (url.pathname === "/admin/content/map" && request.method === "POST") {
+        return handleMapLocation(request, env);
+      }
+
+      if (url.pathname === "/admin/content/map/delete" && request.method === "POST") {
+        return handleDeleteMapLocation(request, env);
       }
 
       if (url.pathname === "/admin/content/delete" && request.method === "POST") {
@@ -3593,7 +4697,9 @@ export default {
         const { episode, episodes } = pageData;
         const episodeContent = await loadEpisodeContent(env, episode.id);
         episode.attachments = episodeContent.attachments;
+        episode.article = episodeContent.article;
         episode.videoUrl = episodeContent.videoUrl;
+        episode.mapLocations = episodeContent.mapLocations;
         ctx.waitUntil(notifyEpisodeView(env, request, episode));
 
         return new Response(renderEpisodePage(episode, episodes, analytics), {

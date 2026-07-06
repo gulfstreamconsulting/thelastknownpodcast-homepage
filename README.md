@@ -48,7 +48,7 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 
 ## Episode Content
 
-The password-protected `/admin/content` page accepts an episode-level YouTube video URL and uploads images, PDFs, and other supporting files to Cloudflare R2. Video overviews are rendered with a YouTube player on the episode detail page. Each uploaded file has a display title and description and appears on the same page.
+The password-protected `/admin/content` page lets you choose one episode and save its YouTube overview plus several supporting files in a single submit. Uploaded images, PDFs, and other supporting files are stored in Cloudflare R2. Video overviews are rendered with a YouTube player on the episode detail page. Each uploaded file has a display title and description and appears on the same page.
 
 Create the configured R2 bucket once:
 

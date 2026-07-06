@@ -396,6 +396,24 @@ const saveAttachments = async (env, episodeId, attachments) => {
   return saveEpisodeContent(env, episodeId, { ...content, attachments });
 };
 
+const buildAttachment = (episodeId, file, title, description) => {
+  const id = crypto.randomUUID();
+  const filename = sanitizeFilename(file.name);
+  const contentType = file.type || "application/octet-stream";
+
+  return {
+    id,
+    objectKey: `episodes/${episodeId}/attachments/${id}/${filename}`,
+    filename,
+    title,
+    description,
+    contentType,
+    type: attachmentType(contentType),
+    size: file.size,
+    uploadedAt: new Date().toISOString()
+  };
+};
+
 const parseYouTubeStartSeconds = (value) => {
   const input = String(value ?? "").trim();
 
@@ -2361,6 +2379,43 @@ const styles = `
     resize: vertical;
   }
 
+  .admin-form fieldset {
+    display: grid;
+    gap: 14px;
+    margin: 8px 0 0;
+    padding: 18px;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+  }
+
+  .admin-form legend {
+    padding: 0 8px;
+    font-weight: 900;
+  }
+
+  .admin-file-slot {
+    display: grid;
+    gap: 12px;
+    padding: 16px 0;
+    border-top: 1px solid #e5d9c9;
+  }
+
+  .admin-file-slot:first-of-type {
+    border-top: 0;
+    padding-top: 4px;
+  }
+
+  .admin-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 800;
+  }
+
+  .admin-checkbox input {
+    width: auto;
+  }
+
   .admin-notice {
     padding: 12px 14px;
     border-left: 4px solid var(--teal);
@@ -3136,6 +3191,26 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
         `<option value="${escapeHtml(episode.id)}">${escapeHtml(episode.title)}</option>`
     )
     .join("");
+  const renderUploadSlot = (index) => {
+    const slotNumber = index + 1;
+
+    return `
+      <div class="admin-file-slot">
+        <label>
+          File ${slotNumber}
+          <input type="file" name="file">
+        </label>
+        <label>
+          Display title
+          <input name="attachmentTitle" maxlength="140">
+        </label>
+        <label>
+          Description
+          <textarea name="attachmentDescription" maxlength="2000"></textarea>
+        </label>
+      </div>`;
+  };
+  const uploadSlots = Array.from({ length: 3 }, (_, index) => renderUploadSlot(index)).join("");
 
   const contentLists = episodes
     .filter((episode) => {
@@ -3202,46 +3277,33 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
         <a class="back-link" href="/">Back to site</a>
         <p class="section-kicker">Administration</p>
         <h1>Episode content</h1>
-        <p>Add a YouTube video overview link or upload images, PDFs, and other supporting files for an episode.</p>
+        <p>Add the YouTube overview and supporting files for one episode in a single pass.</p>
         ${notice ? `<p class="admin-notice">${escapeHtml(notice)}</p>` : ""}
-        <form class="admin-form" method="post" action="/admin/content/video">
+        <form class="admin-form" method="post" action="/admin/content/media" enctype="multipart/form-data">
           <label>
             Episode
             <select name="episodeId" required>${episodeOptions}</select>
           </label>
           <label>
-            YouTube URL
+            YouTube overview URL
             <input
               type="url"
               name="videoUrl"
               placeholder="https://www.youtube.com/watch?v=..."
-              required
             >
           </label>
-          <button class="button" type="submit">Save video overview</button>
-        </form>
-      </section>
-      <section class="admin-panel">
-        <p class="section-kicker">Supporting material</p>
-        <h2>Upload a file</h2>
-        <form class="admin-form" method="post" action="/admin/content/upload" enctype="multipart/form-data">
-          <label>
-            Episode
-            <select name="episodeId" required>${episodeOptions}</select>
+          <label class="admin-checkbox">
+            <input type="checkbox" name="removeVideo" value="1">
+            Remove existing video overview
           </label>
-          <label>
-            Display title
-            <input name="title" maxlength="140" required>
-          </label>
-          <label>
-            Description
-            <textarea name="description" maxlength="2000"></textarea>
-          </label>
-          <label>
-            File (maximum ${escapeHtml(formatFileSize(MAX_UPLOAD_BYTES))})
-            <input type="file" name="file" required>
-          </label>
-          <button class="button" type="submit">Upload content</button>
+          <fieldset>
+            <legend>Supporting files, maximum ${escapeHtml(formatFileSize(MAX_UPLOAD_BYTES))} each</legend>
+            <div data-upload-slots>
+              ${uploadSlots}
+            </div>
+            <button class="button secondary" type="button" data-add-upload>Add another file</button>
+          </fieldset>
+          <button class="button" type="submit">Save episode media</button>
         </form>
       </section>
       <section class="admin-panel">
@@ -3250,6 +3312,30 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "") => {
         ${contentLists || "<p>No episode content has been added yet.</p>"}
       </section>
     </main>
+    <template id="upload-slot-template">
+      ${renderUploadSlot(0)}
+    </template>
+    <script>
+      (function () {
+        var addButton = document.querySelector('[data-add-upload]');
+        var slots = document.querySelector('[data-upload-slots]');
+        var template = document.getElementById('upload-slot-template');
+
+        if (!addButton || !slots || !template) return;
+
+        addButton.addEventListener('click', function () {
+          var nextNumber = slots.querySelectorAll('.admin-file-slot').length + 1;
+          var fragment = template.content.cloneNode(true);
+          var firstLabel = fragment.querySelector('label');
+
+          if (firstLabel && firstLabel.firstChild) {
+            firstLabel.firstChild.textContent = 'File ' + nextNumber;
+          }
+
+          slots.appendChild(fragment);
+        });
+      })();
+    </script>
   </body>
 </html>`;
 };
@@ -3330,6 +3416,7 @@ const handleAdminPage = async (request, env, url) => {
     episodes.map(async (episode) => [episode.id, await loadEpisodeContent(env, episode.id)])
   );
   const notices = {
+    saved: "Episode media saved.",
     uploaded: "Content uploaded successfully.",
     deleted: "Content deleted.",
     videoSaved: "Video overview saved.",
@@ -3383,36 +3470,113 @@ const handleUpload = async (request, env) => {
     return adminRedirect(request, "?status=missing");
   }
 
-  const id = crypto.randomUUID();
-  const filename = sanitizeFilename(file.name);
-  const objectKey = `episodes/${episodeId}/attachments/${id}/${filename}`;
-  const contentType = file.type || "application/octet-stream";
-  const attachment = {
-    id,
-    objectKey,
-    filename,
-    title,
-    description,
-    contentType,
-    type: attachmentType(contentType),
-    size: file.size,
-    uploadedAt: new Date().toISOString()
-  };
+  const attachment = buildAttachment(episodeId, file, title, description);
 
-  await env.EPISODE_CONTENT.put(objectKey, file.stream(), {
-    httpMetadata: { contentType },
-    customMetadata: { episodeId, attachmentId: id }
+  await env.EPISODE_CONTENT.put(attachment.objectKey, file.stream(), {
+    httpMetadata: { contentType: attachment.contentType },
+    customMetadata: { episodeId, attachmentId: attachment.id }
   });
 
   try {
     const attachments = await loadAttachments(env, episodeId);
     await saveAttachments(env, episodeId, [...attachments, attachment]);
   } catch (error) {
-    await env.EPISODE_CONTENT.delete(objectKey);
+    await env.EPISODE_CONTENT.delete(attachment.objectKey);
     throw error;
   }
 
   return adminRedirect(request, "?status=uploaded");
+};
+
+const handleMediaBundle = async (request, env) => {
+  if (!isAdmin(request, env)) {
+    return adminUnauthorized();
+  }
+
+  if (!sameOriginRequest(request)) {
+    return new Response("Invalid request origin", { status: 403 });
+  }
+
+  if (!env.EPISODE_CONTENT) {
+    return new Response("Content storage is not configured", { status: 503 });
+  }
+
+  const form = await request.formData();
+  const episodeId = String(form.get("episodeId") ?? "").trim();
+  const videoInput = String(form.get("videoUrl") ?? "").trim();
+  const removeVideo = form.get("removeVideo") === "1";
+  const video = videoInput ? parseVideoUrl(videoInput) : null;
+
+  if (!episodeId) {
+    return new Response("Episode is required", { status: 400 });
+  }
+
+  if (videoInput && !video) {
+    return new Response("A valid YouTube URL is required", { status: 400 });
+  }
+
+  const episodes = await loadEpisodes();
+
+  if (!episodes.some((episode) => episode.id === episodeId)) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  const files = form.getAll("file");
+  const titles = form.getAll("attachmentTitle");
+  const descriptions = form.getAll("attachmentDescription");
+  const attachmentsToUpload = [];
+
+  for (const [index, file] of files.entries()) {
+    if (!(file instanceof File) || file.size === 0) {
+      continue;
+    }
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return new Response(`Files must be ${formatFileSize(MAX_UPLOAD_BYTES)} or smaller`, {
+        status: 413
+      });
+    }
+
+    const title = String(titles[index] ?? "").trim().slice(0, 140);
+    const description = String(descriptions[index] ?? "").trim().slice(0, 2000);
+
+    if (!title) {
+      return new Response("Each uploaded file needs a display title", { status: 400 });
+    }
+
+    attachmentsToUpload.push({
+      file,
+      attachment: buildAttachment(episodeId, file, title, description)
+    });
+  }
+
+  const uploadedAttachments = [];
+
+  try {
+    for (const { file, attachment } of attachmentsToUpload) {
+      await env.EPISODE_CONTENT.put(attachment.objectKey, file.stream(), {
+        httpMetadata: { contentType: attachment.contentType },
+        customMetadata: { episodeId, attachmentId: attachment.id }
+      });
+      uploadedAttachments.push(attachment);
+    }
+
+    const content = await loadEpisodeContent(env, episodeId);
+    const nextVideoUrl = removeVideo ? "" : video ? video.url : content.videoUrl;
+
+    await saveEpisodeContent(env, episodeId, {
+      ...content,
+      videoUrl: nextVideoUrl,
+      attachments: [...content.attachments, ...uploadedAttachments]
+    });
+  } catch (error) {
+    await Promise.all(
+      uploadedAttachments.map((attachment) => env.EPISODE_CONTENT.delete(attachment.objectKey))
+    );
+    throw error;
+  }
+
+  return adminRedirect(request, "?status=saved");
 };
 
 const handleVideoOverview = async (request, env) => {
@@ -3530,6 +3694,10 @@ export default {
 
       if (url.pathname === "/admin/content/upload" && request.method === "POST") {
         return handleUpload(request, env);
+      }
+
+      if (url.pathname === "/admin/content/media" && request.method === "POST") {
+        return handleMediaBundle(request, env);
       }
 
       if (

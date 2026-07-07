@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
-import { mkdir, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
 const DEFAULT_DOWNLOAD_DIR = "downloads/youtube-video-migration";
+const DEFAULT_CHECKPOINT_FILE = ".youtube-video-migration-checkpoint.json";
 const VIDEO_EXTENSIONS = new Set([".m4v", ".mov", ".mp4", ".mpeg", ".mpg", ".ogv", ".webm"]);
 
 const config = {
@@ -16,8 +17,10 @@ const config = {
   episodeId: process.env.EPISODE_ID || "",
   dryRun: process.env.DRY_RUN === "1",
   keepDownloads: process.env.KEEP_DOWNLOADS === "1",
+  resetCheckpoint: process.env.RESET_CHECKPOINT === "1",
   ytDlpBin: process.env.YT_DLP_BIN || "yt-dlp",
-  curlBin: process.env.CURL_BIN || "curl"
+  curlBin: process.env.CURL_BIN || "curl",
+  maxAttempts: Number.parseInt(process.env.MAX_ATTEMPTS || "3", 10)
 };
 
 if (!config.adminPassword && !config.dryRun) {
@@ -39,18 +42,33 @@ async function main() {
   console.log(`Mode: ${config.dryRun ? "dry run" : "download and upload"}`);
   if (config.episodeId) console.log(`Episode filter: ${config.episodeId}`);
   if (Number.isFinite(config.limit) && config.limit > 0) console.log(`Limit: ${config.limit}`);
+  if (!config.dryRun) console.log(`Retry attempts per episode: ${maxAttempts()}`);
 
   logStep("Preparing download directory");
   await mkdir(config.downloadDir, { recursive: true });
+
+  const checkpointPath = path.join(config.downloadDir, DEFAULT_CHECKPOINT_FILE);
+  const checkpoint = config.resetCheckpoint ? emptyCheckpoint() : await loadCheckpoint(checkpointPath);
+
+  if (config.resetCheckpoint) {
+    console.log("Ignoring existing checkpoint because RESET_CHECKPOINT=1.");
+  } else if (checkpoint.lastCompletedEpisodeId && !config.episodeId) {
+    console.log(`Last known good episode: ${checkpoint.lastCompletedEpisodeTitle || checkpoint.lastCompletedEpisodeId}`);
+  }
 
   logStep("Loading podcast API");
   const episodes = await loadEpisodes();
   console.log(`Loaded ${episodes.length} episode${episodes.length === 1 ? "" : "s"} from API.`);
 
-  const migrationCandidates = episodes
+  const allMigrationCandidates = episodes
     .filter((episode) => episode.youtubeUrl && !episode.videoAsset)
-    .filter((episode) => !config.episodeId || episode.id === config.episodeId)
-    .slice(0, Number.isFinite(config.limit) && config.limit > 0 ? config.limit : undefined);
+    .filter((episode) => !config.episodeId || episode.id === config.episodeId);
+
+  const resumableCandidates = resumeAfterLastKnownGood(allMigrationCandidates, checkpoint);
+  const migrationCandidates = resumableCandidates.slice(
+    0,
+    Number.isFinite(config.limit) && config.limit > 0 ? config.limit : undefined
+  );
 
   if (!migrationCandidates.length) {
     console.log("No YouTube-backed episodes need migration.");
@@ -73,16 +91,50 @@ async function main() {
       continue;
     }
 
-    const downloadedPath = await downloadYouTubeVideo(episode);
-    await uploadHostedVideo(episode, downloadedPath);
+    try {
+      const downloadedPath = await withRetries(
+        () => downloadYouTubeVideo(episode),
+        `Download failed for episode ${episode.id}`
+      );
 
-    if (!config.keepDownloads) {
-      logStep("Removing local download");
-      await rm(downloadedPath, { force: true });
-      console.log("Removed local download.");
-    } else {
-      console.log(`Keeping local download: ${downloadedPath}`);
+      try {
+        await withRetries(
+          () => uploadHostedVideo(episode, downloadedPath),
+          `Upload failed for episode ${episode.id}`
+        );
+      } finally {
+        if (!config.keepDownloads) {
+          logStep("Removing local download");
+          await rm(downloadedPath, { force: true });
+          console.log("Removed local download.");
+        } else {
+          console.log(`Keeping local download: ${downloadedPath}`);
+        }
+      }
+    } catch (error) {
+      await saveCheckpoint(checkpointPath, {
+        ...checkpoint,
+        lastFailedEpisodeId: episode.id,
+        lastFailedEpisodeTitle: episode.title,
+        lastFailedAt: new Date().toISOString(),
+        lastError: error.message
+      });
+
+      console.error(`\nStopped at episode ${episode.id}: ${episode.title}`);
+      console.error(error.message);
+      console.error("Fix the issue, then rerun the same command to resume after the last completed video.");
+      process.exitCode = 1;
+      return;
     }
+
+    checkpoint.lastCompletedEpisodeId = episode.id;
+    checkpoint.lastCompletedEpisodeTitle = episode.title;
+    checkpoint.lastCompletedAt = new Date().toISOString();
+    checkpoint.lastFailedEpisodeId = "";
+    checkpoint.lastFailedEpisodeTitle = "";
+    checkpoint.lastFailedAt = "";
+    checkpoint.lastError = "";
+    await saveCheckpoint(checkpointPath, checkpoint);
 
     console.log(`Episode complete in ${formatDuration(Date.now() - episodeStartedAt)}.`);
   }
@@ -104,7 +156,7 @@ async function loadEpisodes() {
   }
 
   if (!response.ok) {
-    fail(`Unable to load podcast API from ${config.siteUrl}: HTTP ${response.status}`);
+    throw new Error(`Unable to load podcast API from ${config.siteUrl}: HTTP ${response.status}`);
   }
 
   const data = await response.json();
@@ -152,7 +204,7 @@ async function downloadYouTubeVideo(episode) {
     .filter((filePath) => VIDEO_EXTENSIONS.has(path.extname(filePath).toLowerCase()));
 
   if (!candidates.length) {
-    fail(`yt-dlp completed but no video file was found for episode ${episode.id}.`);
+    throw new Error(`yt-dlp completed but no video file was found for episode ${episode.id}.`);
   }
 
   candidates.sort((left, right) => right.length - left.length);
@@ -190,10 +242,101 @@ async function uploadHostedVideo(episode, videoPath) {
   const statusCode = result.stdout.trim();
 
   if (!["200", "303"].includes(statusCode)) {
-    fail(`Upload failed for episode ${episode.id}: HTTP ${statusCode || "unknown"}`);
+    throw new Error(`Upload failed for episode ${episode.id}: HTTP ${statusCode || "unknown"}`);
   }
 
   console.log("Uploaded and saved hosted video.");
+}
+
+async function withRetries(operation, message) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts(); attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= maxAttempts()) {
+        break;
+      }
+
+      const delay = retryDelay(attempt);
+      console.warn(`${message} on attempt ${attempt}/${maxAttempts()}: ${error.message}`);
+      console.warn(`Retrying in ${formatDuration(delay)}...`);
+      await sleep(delay);
+    }
+  }
+
+  throw new Error(`${message} after ${maxAttempts()} attempt${maxAttempts() === 1 ? "" : "s"}: ${lastError.message}`);
+}
+
+function resumeAfterLastKnownGood(episodes, checkpoint) {
+  if (config.episodeId || !checkpoint.lastCompletedEpisodeId) {
+    return episodes;
+  }
+
+  const lastCompletedIndex = episodes.findIndex((episode) => episode.id === checkpoint.lastCompletedEpisodeId);
+
+  if (lastCompletedIndex === -1) {
+    return episodes;
+  }
+
+  const skippedCount = lastCompletedIndex + 1;
+  console.log(
+    `Resuming after checkpoint: skipping ${skippedCount} already completed episode${skippedCount === 1 ? "" : "s"}.`
+  );
+  return episodes.slice(skippedCount);
+}
+
+async function loadCheckpoint(checkpointPath) {
+  try {
+    const data = await readFile(checkpointPath, "utf8");
+    const checkpoint = JSON.parse(data);
+    return {
+      ...emptyCheckpoint(),
+      ...checkpoint
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return emptyCheckpoint();
+    }
+
+    console.warn(`Unable to read checkpoint at ${checkpointPath}: ${error.message}`);
+    console.warn("Starting from the first pending episode.");
+    return emptyCheckpoint();
+  }
+}
+
+async function saveCheckpoint(checkpointPath, checkpoint) {
+  await writeFile(`${checkpointPath}.tmp`, `${JSON.stringify(checkpoint, null, 2)}\n`);
+  await rename(`${checkpointPath}.tmp`, checkpointPath);
+}
+
+function emptyCheckpoint() {
+  return {
+    lastCompletedEpisodeId: "",
+    lastCompletedEpisodeTitle: "",
+    lastCompletedAt: "",
+    lastFailedEpisodeId: "",
+    lastFailedEpisodeTitle: "",
+    lastFailedAt: "",
+    lastError: ""
+  };
+}
+
+function maxAttempts() {
+  return Number.isFinite(config.maxAttempts) && config.maxAttempts > 0 ? config.maxAttempts : 1;
+}
+
+function retryDelay(attempt) {
+  return Math.min(30000, 1000 * 2 ** (attempt - 1));
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
 }
 
 function logStep(message) {

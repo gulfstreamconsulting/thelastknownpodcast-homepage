@@ -32,12 +32,16 @@ const ADSTERRA_NATIVE_CONTAINER_ID = "container-8fee276f31bbe673bacbd151f123599f
 const ADSTERRA_BANNER_KEY = "8ce72288f86a6c1f5e7fef247bea3264";
 const ADSTERRA_BANNER_SCRIPT_URL =
   "https://www.highperformanceformat.com/8ce72288f86a6c1f5e7fef247bea3264/invoke.js";
+const HILLTOPADS_VIDEO_SLIDER_SCRIPT_URL =
+  "//prizefamily.com/bmX/VxsZd.Gala0qYJWhcK/peDmW9euAZkUglakXP_TVcEyBMODVMWw-O/DkEItMNVzeITwlMXzaA/4TNKQs";
 const VAST_AD_TAG_URL =
   "https://funny-tooth.com/dymdFqz.dzGzNsvnZ/GkUW/iehmn9eu/ZoU-lykZPiTjcbyXMBDAE/x/NlDNEotLN/zhIZw/MUTyEc0/NsSoZysdaPW-1Npxd/Dc0Gxs";
 const VAST_AD_ROUTE = "/vast-ad.xml";
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const VAST_FETCH_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const BOT_USER_AGENT_PATTERN =
+  /\b(bot|crawl|crawler|spider|slurp|preview|facebookexternalhit|discordbot|twitterbot|linkedinbot|slackbot|telegrambot|whatsapp|embedly|pinterest|google-inspectiontool|gptbot|chatgpt-user|ccbot|claudebot|perplexitybot|bytespider|yandex|duckduckbot|baiduspider|semrushbot|ahrefsbot|mj12bot|dotbot|petalbot|headlesschrome|lighthouse|pagespeed|pingdom|gtmetrix|uptimerobot|curl|wget|python-requests|go-http-client|java|axios|undici)\b/i;
 
 const stripHtml = (value = "") =>
   String(value)
@@ -830,7 +834,7 @@ const limitField = (value, maxLength = 1000) => {
 const detectDevice = (userAgent = "") => {
   const ua = userAgent.toLowerCase();
 
-  if (/bot|crawl|spider|slurp|facebookexternalhit|discordbot/.test(ua)) {
+  if (BOT_USER_AGENT_PATTERN.test(userAgent)) {
     return "Bot / crawler";
   }
 
@@ -843,6 +847,31 @@ const detectDevice = (userAgent = "") => {
   }
 
   return "Desktop";
+};
+
+const isLikelyBotRequest = (request) => {
+  if (request.method !== "GET") {
+    return true;
+  }
+
+  const headers = request.headers;
+  const userAgent = headers.get("user-agent") ?? "";
+  const accept = headers.get("accept") ?? "";
+  const botManagement = request.cf?.botManagement;
+
+  if (!userAgent || BOT_USER_AGENT_PATTERN.test(userAgent)) {
+    return true;
+  }
+
+  if (botManagement?.verifiedBot === true) {
+    return true;
+  }
+
+  if (Number.isFinite(botManagement?.score) && botManagement.score <= 29) {
+    return true;
+  }
+
+  return !accept.includes("text/html") && !accept.includes("*/*");
 };
 
 const getClientInfo = (request) => {
@@ -876,6 +905,10 @@ const getCountryCode = (request) => {
 
 const notifyEpisodeView = (env, request, episode) => {
   if (!env.DISCORD_WEBHOOK_URL) {
+    return Promise.resolve();
+  }
+
+  if (isLikelyBotRequest(request)) {
     return Promise.resolve();
   }
 
@@ -1859,7 +1892,8 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           hostedVideoPlayers.forEach(function (episode) {
             var video = document.getElementById(episode.elementId);
             var adContainer = document.getElementById(episode.adContainerId);
-            var skipButton = adContainer ? adContainer.querySelector('[data-video-ad-skip]') : null;
+            var videoPlayer = adContainer ? adContainer.closest('.video-player') : null;
+            var skipButton = videoPlayer ? videoPlayer.querySelector('[data-video-ad-skip]') : null;
 
             if (
               !video ||
@@ -1885,9 +1919,66 @@ const renderPlaybackTracking = (episodes, countryCode) => {
             var currentAdBreak = "";
             var adsLoader = null;
             var adsManager = null;
+            var adDisplayContainer = null;
+            var adDisplayContainerInitialized = false;
             var skipTimer = 0;
             var adRequestTimer = 0;
             var suppressNextPlayAd = false;
+
+            function initializeAdDisplayContainer() {
+              if (!window.google || !window.google.ima) {
+                return false;
+              }
+
+              if (
+                window.google.ima.settings &&
+                typeof window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus === 'function'
+              ) {
+                window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus(true);
+              }
+
+              if (!adDisplayContainer) {
+                adDisplayContainer = new window.google.ima.AdDisplayContainer(adContainer, video);
+              }
+
+              if (!adDisplayContainerInitialized) {
+                adDisplayContainer.initialize();
+                adDisplayContainerInitialized = true;
+              }
+
+              return true;
+            }
+
+            function prepareAdsForUserGesture() {
+              if (adDisplayContainerInitialized) return;
+
+              loadImaSdk(function () {
+                initializeAdDisplayContainer();
+              });
+            }
+
+            function adSlotSize() {
+              return {
+                width: adContainer.offsetWidth || video.clientWidth || 640,
+                height: adContainer.offsetHeight || video.clientHeight || 360
+              };
+            }
+
+            function resizeAdManager() {
+              if (!adsManager || typeof adsManager.resize !== 'function') return;
+
+              var size = adSlotSize();
+              adsManager.resize(size.width, size.height, window.google.ima.ViewMode.NORMAL);
+            }
+
+            function forceAdLayerPaint() {
+              adContainer.classList.add('painting');
+              window.requestAnimationFrame(function () {
+                resizeAdManager();
+                adContainer.classList.remove('painting');
+                window.requestAnimationFrame(resizeAdManager);
+              });
+            }
 
             function finishAd(resumeContent, adCompleted) {
               if (!adPlaying && !currentAdBreak) return;
@@ -1903,6 +1994,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               window.clearTimeout(adRequestTimer);
               video.dataset.vastAdPlaying = 'false';
               adContainer.classList.remove('active');
+              adContainer.classList.remove('painting');
               if (skipButton) {
                 skipButton.classList.remove('visible');
               }
@@ -1938,26 +2030,31 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               ) {
                 window.google.ima.settings.setLocale(adLanguage);
               }
+              if (
+                window.google.ima.settings &&
+                typeof window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus === 'function'
+              ) {
+                window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus(true);
+              }
 
               adPlaying = true;
               currentAdBreak = adBreak;
               video.dataset.vastAdPlaying = 'true';
               video.pause();
               adContainer.classList.add('active');
+
+              if (!initializeAdDisplayContainer()) {
+                finishAd(resumeContent, false);
+                return;
+              }
+
               adRequestTimer = window.setTimeout(function () {
                 finishAd(resumeContent, false);
               }, 8000);
               if (skipButton) {
                 skipButton.classList.remove('visible');
-                skipTimer = window.setTimeout(function () {
-                  if (adPlaying) {
-                    skipButton.classList.add('visible');
-                  }
-                }, 15000);
               }
 
-              var adDisplayContainer = new window.google.ima.AdDisplayContainer(adContainer, video);
-              adDisplayContainer.initialize();
               adsLoader = new window.google.ima.AdsLoader(adDisplayContainer);
 
               adsLoader.addEventListener(
@@ -1965,6 +2062,18 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                 function (adsManagerLoadedEvent) {
                   window.clearTimeout(adRequestTimer);
                   adsManager = adsManagerLoadedEvent.getAdsManager(video);
+                  adsManager.addEventListener(window.google.ima.AdEvent.Type.LOADED, forceAdLayerPaint);
+                  adsManager.addEventListener(window.google.ima.AdEvent.Type.STARTED, function () {
+                    forceAdLayerPaint();
+                    window.clearTimeout(skipTimer);
+                    if (skipButton) {
+                      skipTimer = window.setTimeout(function () {
+                        if (adPlaying) {
+                          skipButton.classList.add('visible');
+                        }
+                      }, 15000);
+                    }
+                  });
                   adsManager.addEventListener(
                     window.google.ima.AdEvent.Type.CONTENT_PAUSE_REQUESTED,
                     function () {
@@ -1985,12 +2094,12 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                   });
 
                   try {
-                    adsManager.init(
-                      adContainer.offsetWidth || video.clientWidth || 640,
-                      adContainer.offsetHeight || video.clientHeight || 360,
-                      window.google.ima.ViewMode.NORMAL
-                    );
+                    var size = adSlotSize();
+                    adsManager.init(size.width, size.height, window.google.ima.ViewMode.NORMAL);
+                    forceAdLayerPaint();
                     adsManager.start();
+                    window.setTimeout(forceAdLayerPaint, 100);
+                    window.setTimeout(forceAdLayerPaint, 500);
                   } catch (_error) {
                     finishAd(resumeContent, false);
                   }
@@ -2008,10 +2117,17 @@ const renderPlaybackTracking = (episodes, countryCode) => {
 
               var adsRequest = new window.google.ima.AdsRequest();
               adsRequest.adTagUrl = vastUrlWithLanguage(video.dataset.vastAdTag);
-              adsRequest.linearAdSlotWidth = adContainer.offsetWidth || video.clientWidth || 640;
-              adsRequest.linearAdSlotHeight = adContainer.offsetHeight || video.clientHeight || 360;
+              var size = adSlotSize();
+              adsRequest.linearAdSlotWidth = size.width;
+              adsRequest.linearAdSlotHeight = size.height;
               adsRequest.nonLinearAdSlotWidth = adsRequest.linearAdSlotWidth;
               adsRequest.nonLinearAdSlotHeight = Math.max(90, Math.round(adsRequest.linearAdSlotHeight / 3));
+              if (typeof adsRequest.setAdWillAutoPlay === 'function') {
+                adsRequest.setAdWillAutoPlay(false);
+              }
+              if (typeof adsRequest.setAdWillPlayMuted === 'function') {
+                adsRequest.setAdWillPlayMuted(false);
+              }
               adsLoader.requestAds(adsRequest);
 
               if (event && typeof event.preventDefault === 'function') {
@@ -2019,6 +2135,9 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               }
             }
 
+            video.addEventListener('pointerdown', prepareAdsForUserGesture, { passive: true });
+            video.addEventListener('touchend', prepareAdsForUserGesture, { passive: true });
+            video.addEventListener('click', prepareAdsForUserGesture, { passive: true });
             video.addEventListener('play', function (event) {
               if (suppressNextPlayAd) {
                 suppressNextPlayAd = false;
@@ -2490,6 +2609,8 @@ const renderVideoOverview = (episode) => {
           class="overview-video-player"
           data-vast-ad-tag="${escapeHtml(VAST_AD_ROUTE)}"
           controls
+          playsinline
+          webkit-playsinline
           poster="${escapeHtml(episode.image)}"
           preload="metadata"
         >
@@ -2521,9 +2642,8 @@ const renderVideoOverview = (episode) => {
                 id="overview-video-ad-${escapeHtml(episode.id)}"
                 class="video-ad-container"
                 aria-label="Video advertisement"
-              >
-                <button class="video-ad-skip" type="button" data-video-ad-skip>Skip ad</button>
-              </div>`
+              ></div>
+              <button class="video-ad-skip" type="button" data-video-ad-skip>Skip ad</button>`
             : ""
         }
       </div>
@@ -2886,6 +3006,20 @@ const renderFacebookPixel = (pixelId) => {
     </script>`;
 };
 
+const renderHilltopAdsVideoSlider = () => `
+    <script>
+      (function(qwbiyb){
+      var d = document,
+          s = d.createElement('script'),
+          l = d.scripts[d.scripts.length - 1];
+      s.settings = qwbiyb || {};
+      s.src = ${safeJson(HILLTOPADS_VIDEO_SLIDER_SCRIPT_URL)};
+      s.async = true;
+      s.referrerPolicy = 'no-referrer-when-downgrade';
+      l.parentNode.insertBefore(s, l);
+      })({})
+    </script>`;
+
 const renderHead = ({
   title,
   description,
@@ -2913,6 +3047,7 @@ const renderHead = ({
     <script type="text/javascript" src="https://resources.infolinks.com/js/infolinks_main.js"></script>
     <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
     <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
+    ${renderHilltopAdsVideoSlider()}
     <style>${styles}</style>
   </head>`;
 
@@ -3447,12 +3582,22 @@ const styles = `
     position: absolute;
     inset: 0;
     z-index: 2;
-    display: none;
+    display: block;
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
     background: #101215;
+    transform: translateZ(0);
   }
 
   .video-ad-container.active {
-    display: block;
+    visibility: visible;
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .video-ad-container.painting {
+    transform: translate3d(0, 0, 0) scale(1.0001);
   }
 
   .video-ad-container iframe,
@@ -3469,8 +3614,11 @@ const styles = `
     right: 14px;
     bottom: 14px;
     z-index: 10;
-    display: none;
+    display: inline-flex;
+    opacity: 0;
+    pointer-events: none;
     min-height: 40px;
+    align-items: center;
     padding: 0 14px;
     border: 1px solid rgba(255, 255, 255, 0.72);
     border-radius: 4px;
@@ -3482,8 +3630,8 @@ const styles = `
   }
 
   .video-ad-skip.visible {
-    display: inline-flex;
-    align-items: center;
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .episode-attachments {

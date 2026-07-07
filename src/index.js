@@ -34,7 +34,10 @@ const ADSTERRA_BANNER_SCRIPT_URL =
   "https://www.highperformanceformat.com/8ce72288f86a6c1f5e7fef247bea3264/invoke.js";
 const VAST_AD_TAG_URL =
   "https://funny-tooth.com/dymdFqz.dzGzNsvnZ/GkUW/iehmn9eu/ZoU-lykZPiTjcbyXMBDAE/x/NlDNEotLN/zhIZw/MUTyEc0/NsSoZysdaPW-1Npxd/Dc0Gxs";
+const VAST_AD_ROUTE = "/vast-ad.xml";
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
+const VAST_FETCH_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 const stripHtml = (value = "") =>
   String(value)
@@ -1015,6 +1018,32 @@ const jsonResponse = (
     }
   });
 
+const handleVastAdTag = async (request) => {
+  const response = await fetch(VAST_AD_TAG_URL, {
+    headers: {
+      accept: "application/xml,text/xml;q=0.9,*/*;q=0.1",
+      referer: new URL("/", request.url).href,
+      "user-agent": VAST_FETCH_USER_AGENT
+    }
+  });
+
+  if (!response.ok) {
+    return new Response(null, {
+      status: response.status,
+      headers: {
+        "cache-control": "no-store"
+      }
+    });
+  }
+
+  const headers = new Headers();
+  headers.set("content-type", response.headers.get("content-type") || "application/xml;charset=UTF-8");
+  headers.set("cache-control", "no-store");
+  headers.set("access-control-allow-origin", "*");
+
+  return new Response(request.method === "HEAD" ? null : response.body, { status: response.status, headers });
+};
+
 const renderPodcastApi = (episodes, origin) => ({
   apiVersion: "1.0",
   podcast: {
@@ -1847,18 +1876,31 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               midroll: false,
               postroll: false
             };
+            var failedAdBreaks = {
+              preroll: false,
+              midroll: false,
+              postroll: false
+            };
             var adPlaying = false;
             var currentAdBreak = "";
             var adsLoader = null;
             var adsManager = null;
             var skipTimer = 0;
+            var adRequestTimer = 0;
+            var suppressNextPlayAd = false;
 
-            function finishAd(resumeContent) {
+            function finishAd(resumeContent, adCompleted) {
               if (!adPlaying && !currentAdBreak) return;
 
               adPlaying = false;
+              if (adCompleted && currentAdBreak) {
+                completedAdBreaks[currentAdBreak] = true;
+              } else if (currentAdBreak) {
+                failedAdBreaks[currentAdBreak] = true;
+              }
               currentAdBreak = "";
               window.clearTimeout(skipTimer);
+              window.clearTimeout(adRequestTimer);
               video.dataset.vastAdPlaying = 'false';
               adContainer.classList.remove('active');
               if (skipButton) {
@@ -1868,8 +1910,14 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               if (adsManager && typeof adsManager.destroy === 'function') {
                 adsManager.destroy();
               }
+              if (adsLoader && typeof adsLoader.destroy === 'function') {
+                adsLoader.destroy();
+              }
+              adsManager = null;
+              adsLoader = null;
 
               if (resumeContent) {
+                suppressNextPlayAd = true;
                 video.play().catch(function () {});
               }
             }
@@ -1891,12 +1939,14 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                 window.google.ima.settings.setLocale(adLanguage);
               }
 
-              completedAdBreaks[adBreak] = true;
               adPlaying = true;
               currentAdBreak = adBreak;
               video.dataset.vastAdPlaying = 'true';
               video.pause();
               adContainer.classList.add('active');
+              adRequestTimer = window.setTimeout(function () {
+                finishAd(resumeContent, false);
+              }, 8000);
               if (skipButton) {
                 skipButton.classList.remove('visible');
                 skipTimer = window.setTimeout(function () {
@@ -1913,6 +1963,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               adsLoader.addEventListener(
                 window.google.ima.AdsManagerLoadedEvent.Type.ADS_MANAGER_LOADED,
                 function (adsManagerLoadedEvent) {
+                  window.clearTimeout(adRequestTimer);
                   adsManager = adsManagerLoadedEvent.getAdsManager(video);
                   adsManager.addEventListener(
                     window.google.ima.AdEvent.Type.CONTENT_PAUSE_REQUESTED,
@@ -1923,14 +1974,14 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                   adsManager.addEventListener(
                     window.google.ima.AdEvent.Type.CONTENT_RESUME_REQUESTED,
                     function () {
-                      finishAd(resumeContent);
+                      finishAd(resumeContent, true);
                     }
                   );
                   adsManager.addEventListener(window.google.ima.AdEvent.Type.ALL_ADS_COMPLETED, function () {
-                    finishAd(resumeContent);
+                    finishAd(resumeContent, true);
                   });
                   adsManager.addEventListener(window.google.ima.AdErrorEvent.Type.AD_ERROR, function () {
-                    finishAd(resumeContent);
+                    finishAd(resumeContent, false);
                   });
 
                   try {
@@ -1941,7 +1992,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                     );
                     adsManager.start();
                   } catch (_error) {
-                    finishAd(resumeContent);
+                    finishAd(resumeContent, false);
                   }
                 },
                 false
@@ -1950,7 +2001,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               adsLoader.addEventListener(
                 window.google.ima.AdErrorEvent.Type.AD_ERROR,
                 function () {
-                  finishAd(resumeContent);
+                  finishAd(resumeContent, false);
                 },
                 false
               );
@@ -1969,10 +2020,20 @@ const renderPlaybackTracking = (episodes, countryCode) => {
             }
 
             video.addEventListener('play', function (event) {
+              if (suppressNextPlayAd) {
+                suppressNextPlayAd = false;
+                return;
+              }
               requestAd('preroll', true, event);
             });
             video.addEventListener('timeupdate', function () {
-              if (adPlaying || completedAdBreaks.midroll || !completedAdBreaks.preroll) return;
+              if (
+                adPlaying ||
+                completedAdBreaks.midroll ||
+                (!completedAdBreaks.preroll && !failedAdBreaks.preroll)
+              ) {
+                return;
+              }
               if (!Number(video.duration) || video.duration <= 0) return;
 
               if ((Number(video.currentTime) / Number(video.duration)) >= 0.5) {
@@ -1984,7 +2045,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
             });
             if (skipButton) {
               skipButton.addEventListener('click', function () {
-                finishAd(currentAdBreak !== 'postroll');
+                finishAd(currentAdBreak !== 'postroll', true);
               });
             }
           });
@@ -2427,7 +2488,7 @@ const renderVideoOverview = (episode) => {
     ? `<video
           id="overview-video-${escapeHtml(episode.id)}"
           class="overview-video-player"
-          data-vast-ad-tag="${escapeHtml(VAST_AD_TAG_URL)}"
+          data-vast-ad-tag="${escapeHtml(VAST_AD_ROUTE)}"
           controls
           poster="${escapeHtml(episode.image)}"
           preload="metadata"
@@ -5622,6 +5683,10 @@ export default {
 
     if (url.pathname === "/ads.txt") {
       return Response.redirect(ADS_TXT_REDIRECT_URL, 301);
+    }
+
+    if (url.pathname === VAST_AD_ROUTE && (request.method === "GET" || request.method === "HEAD")) {
+      return handleVastAdTag(request);
     }
 
     if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {

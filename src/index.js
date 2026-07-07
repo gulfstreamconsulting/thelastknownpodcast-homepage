@@ -20,6 +20,7 @@ const safeJson = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
 
 const SPREAKER_API_BASE = "https://api.spreaker.com/v2";
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_BYTES = 500 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
 const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data";
 const EPISODES_PER_PAGE = 9;
@@ -31,6 +32,9 @@ const ADSTERRA_NATIVE_CONTAINER_ID = "container-8fee276f31bbe673bacbd151f123599f
 const ADSTERRA_BANNER_KEY = "8ce72288f86a6c1f5e7fef247bea3264";
 const ADSTERRA_BANNER_SCRIPT_URL =
   "https://www.highperformanceformat.com/8ce72288f86a6c1f5e7fef247bea3264/invoke.js";
+const VAST_AD_TAG_URL =
+  "https://funny-tooth.com/dymdFqz.dzGzNsvnZ/GkUW/iehmn9eu/ZoU-lykZPiTjcbyXMBDAE/x/NlDNEotLN/zhIZw/MUTyEc0/NsSoZysdaPW-1Npxd/Dc0Gxs";
+const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 
 const stripHtml = (value = "") =>
   String(value)
@@ -336,6 +340,7 @@ const attachmentManifestKey = (episodeId) => `episodes/${episodeId}/manifest.jso
 const emptyEpisodeContent = () => ({
   attachments: [],
   videoUrl: "",
+  videoAsset: null,
   mapLocations: [],
   article: {
     title: "",
@@ -351,6 +356,22 @@ const normalizeArticle = (article) => ({
   body: String(article?.body ?? "").trim().slice(0, 80000),
   updatedAt: String(article?.updatedAt ?? "").trim().slice(0, 40)
 });
+
+const normalizeVideoAsset = (asset) => {
+  if (!asset?.objectKey) {
+    return null;
+  }
+
+  return {
+    id: String(asset.id ?? "video"),
+    objectKey: String(asset.objectKey),
+    filename: sanitizeFilename(asset.filename || "episode-video.mp4"),
+    contentType: String(asset.contentType || "application/octet-stream"),
+    size: Number.isFinite(Number(asset.size)) ? Number(asset.size) : 0,
+    uploadedAt: String(asset.uploadedAt ?? ""),
+    sourceUrl: String(asset.sourceUrl ?? "").slice(0, 2000)
+  };
+};
 
 const normalizeMapLocation = (location) => {
   const label = fallbackText(location?.label, "Case location").slice(0, 140);
@@ -465,6 +486,7 @@ const loadEpisodeContent = async (env, episodeId) => {
       attachments: Array.isArray(manifest.attachments) ? manifest.attachments : [],
       article: normalizeArticle(manifest.article),
       mapLocations: normalizeMapLocations(manifest.mapLocations),
+      videoAsset: normalizeVideoAsset(manifest.videoAsset),
       videoUrl:
         typeof manifest.videoUrl === "string"
           ? manifest.videoUrl
@@ -487,7 +509,8 @@ const saveEpisodeContent = (env, episodeId, content) =>
         attachments: content.attachments ?? [],
         article: normalizeArticle(content.article),
         mapLocations: normalizeMapLocations(content.mapLocations),
-        videoUrl: content.videoUrl ?? ""
+        videoUrl: content.videoUrl ?? "",
+        videoAsset: normalizeVideoAsset(content.videoAsset)
       },
       null,
       2
@@ -509,6 +532,7 @@ const loadApiEpisodeCatalog = async (env) => {
       episode.attachments = content.attachments;
       episode.article = content.article;
       episode.videoUrl = content.videoUrl;
+      episode.videoAsset = content.videoAsset;
       episode.mapLocations = content.mapLocations;
     })
   );
@@ -537,6 +561,72 @@ const buildAttachment = (episodeId, file, title, description) => {
     size: file.size,
     uploadedAt: new Date().toISOString()
   };
+};
+
+const videoFilenameFromUrl = (value) => {
+  try {
+    const url = new URL(value);
+    return sanitizeFilename(url.pathname.split("/").filter(Boolean).pop() || "episode-video.mp4");
+  } catch {
+    return "episode-video.mp4";
+  }
+};
+
+const videoAssetPath = (episodeId) =>
+  `${CONTENT_ROUTE_PREFIX}/${encodeURIComponent(episodeId)}/video`;
+
+const isVideoContentType = (contentType = "") =>
+  contentType.toLowerCase().startsWith("video/");
+
+const isLikelyVideoFilename = (filename = "") =>
+  /\.(m4v|mov|mp4|mpeg|mpg|ogv|webm)$/i.test(filename);
+
+const videoContentTypeFromFilename = (filename = "") => {
+  const normalized = filename.toLowerCase();
+
+  if (normalized.endsWith(".mp4") || normalized.endsWith(".m4v")) return "video/mp4";
+  if (normalized.endsWith(".mov")) return "video/quicktime";
+  if (normalized.endsWith(".ogv")) return "video/ogg";
+  if (normalized.endsWith(".webm")) return "video/webm";
+  if (normalized.endsWith(".mpeg") || normalized.endsWith(".mpg")) return "video/mpeg";
+
+  return "";
+};
+
+const buildVideoAsset = (episodeId, file, sourceUrl = "") => {
+  const id = crypto.randomUUID();
+  const filename = sanitizeFilename(file.name || "episode-video.mp4");
+  const contentType = file.type || videoContentTypeFromFilename(filename) || "application/octet-stream";
+
+  return {
+    id,
+    objectKey: `episodes/${episodeId}/video/${id}/${filename}`,
+    filename,
+    contentType,
+    size: file.size,
+    uploadedAt: new Date().toISOString(),
+    sourceUrl
+  };
+};
+
+const buildImportedVideoAsset = (episodeId, sourceUrl, contentType, size = 0) => {
+  const id = crypto.randomUUID();
+  const filename = videoFilenameFromUrl(sourceUrl);
+
+  return {
+    id,
+    objectKey: `episodes/${episodeId}/video/${id}/${filename}`,
+    filename,
+    contentType: contentType || videoContentTypeFromFilename(filename) || "application/octet-stream",
+    size,
+    uploadedAt: new Date().toISOString(),
+    sourceUrl
+  };
+};
+
+const deleteVideoAsset = (env, videoAsset) => {
+  const asset = normalizeVideoAsset(videoAsset);
+  return asset ? env.EPISODE_CONTENT.delete(asset.objectKey) : Promise.resolve();
 };
 
 const parseYouTubeStartSeconds = (value) => {
@@ -885,7 +975,18 @@ const serializeEpisode = (episode, origin) => ({
       }
     : null,
   article: normalizeArticle(episode.article),
-  videoUrl: episode.videoUrl || null,
+  videoUrl: episode.videoAsset
+    ? absoluteUrl(videoAssetPath(episode.id), origin)
+    : episode.videoUrl || null,
+  youtubeUrl: episode.videoUrl || null,
+  videoAsset: episode.videoAsset
+    ? {
+        filename: episode.videoAsset.filename,
+        mimeType: episode.videoAsset.contentType,
+        sizeBytes: episode.videoAsset.size,
+        url: absoluteUrl(videoAssetPath(episode.id), origin)
+      }
+    : null,
   mapLocations: normalizeMapLocations(episode.mapLocations),
   attachments: (episode.attachments ?? []).map((attachment) =>
     serializeAttachment(attachment, episode, origin)
@@ -1546,10 +1647,20 @@ const renderPlaybackTracking = (episodes, countryCode) => {
     .map((episode) => ({
       elementId: `overview-video-${episode.id}`,
       episodeId: episode.id,
-      episodeTitle: episode.title
+      episodeTitle: episode.title,
+      provider: "youtube"
+    }));
+  const hostedVideoPlayers = episodes
+    .filter((episode) => normalizeVideoAsset(episode.videoAsset))
+    .map((episode) => ({
+      elementId: `overview-video-${episode.id}`,
+      adContainerId: `overview-video-ad-${episode.id}`,
+      episodeId: episode.id,
+      episodeTitle: episode.title,
+      provider: "r2"
     }));
 
-  if (!audioPlayers.length && !videoPlayers.length) {
+  if (!audioPlayers.length && !videoPlayers.length && !hostedVideoPlayers.length) {
     return "";
   }
 
@@ -1559,6 +1670,9 @@ const renderPlaybackTracking = (episodes, countryCode) => {
         var countryCode = ${safeJson(countryCode)};
         var audioPlayers = ${safeJson(audioPlayers)};
         var videoPlayers = ${safeJson(videoPlayers)};
+        var hostedVideoPlayers = ${safeJson(hostedVideoPlayers)};
+        var imaSdkUrl = ${safeJson(IMA_SDK_URL)};
+        var adLanguage = 'en';
         var milestones = [20, 50, 75];
 
         function sendPlaybackEvent(type, episode, position, duration, mediaType, extraParameters) {
@@ -1677,6 +1791,270 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           });
         }
 
+        function loadImaSdk(callback) {
+          if (window.google && window.google.ima) {
+            callback();
+            return;
+          }
+
+          var existingScript = document.querySelector('script[data-ima-sdk]');
+
+          if (existingScript) {
+            existingScript.addEventListener('load', callback, { once: true });
+            return;
+          }
+
+          var script = document.createElement('script');
+          script.src = imaSdkUrl;
+          script.async = true;
+          script.dataset.imaSdk = 'true';
+          script.addEventListener('load', callback, { once: true });
+          document.head.appendChild(script);
+        }
+
+        function vastUrlWithLanguage(value) {
+          try {
+            var url = new URL(value, window.location.href);
+            url.searchParams.set('hl', adLanguage);
+            url.searchParams.set('lang', adLanguage);
+            url.searchParams.set('language', adLanguage);
+            return url.href;
+          } catch (_error) {
+            return value;
+          }
+        }
+
+        function initializeVastAds() {
+          if (!hostedVideoPlayers.length) return;
+
+          hostedVideoPlayers.forEach(function (episode) {
+            var video = document.getElementById(episode.elementId);
+            var adContainer = document.getElementById(episode.adContainerId);
+            var skipButton = adContainer ? adContainer.querySelector('[data-video-ad-skip]') : null;
+
+            if (
+              !video ||
+              !adContainer ||
+              !video.dataset.vastAdTag ||
+              video.dataset.vastInitialized === 'true'
+            ) {
+              return;
+            }
+
+            video.dataset.vastInitialized = 'true';
+            var completedAdBreaks = {
+              preroll: false,
+              midroll: false,
+              postroll: false
+            };
+            var adPlaying = false;
+            var currentAdBreak = "";
+            var adsLoader = null;
+            var adsManager = null;
+            var skipTimer = 0;
+
+            function finishAd(resumeContent) {
+              if (!adPlaying && !currentAdBreak) return;
+
+              adPlaying = false;
+              currentAdBreak = "";
+              window.clearTimeout(skipTimer);
+              video.dataset.vastAdPlaying = 'false';
+              adContainer.classList.remove('active');
+              if (skipButton) {
+                skipButton.classList.remove('visible');
+              }
+
+              if (adsManager && typeof adsManager.destroy === 'function') {
+                adsManager.destroy();
+              }
+
+              if (resumeContent) {
+                video.play().catch(function () {});
+              }
+            }
+
+            function requestAd(adBreak, resumeContent, event) {
+              if (adPlaying || completedAdBreaks[adBreak]) return;
+
+              if (!window.google || !window.google.ima) {
+                loadImaSdk(function () {
+                  requestAd(adBreak, resumeContent, event);
+                });
+                return;
+              }
+
+              if (
+                window.google.ima.settings &&
+                typeof window.google.ima.settings.setLocale === 'function'
+              ) {
+                window.google.ima.settings.setLocale(adLanguage);
+              }
+
+              completedAdBreaks[adBreak] = true;
+              adPlaying = true;
+              currentAdBreak = adBreak;
+              video.dataset.vastAdPlaying = 'true';
+              video.pause();
+              adContainer.classList.add('active');
+              if (skipButton) {
+                skipButton.classList.remove('visible');
+                skipTimer = window.setTimeout(function () {
+                  if (adPlaying) {
+                    skipButton.classList.add('visible');
+                  }
+                }, 15000);
+              }
+
+              var adDisplayContainer = new window.google.ima.AdDisplayContainer(adContainer, video);
+              adDisplayContainer.initialize();
+              adsLoader = new window.google.ima.AdsLoader(adDisplayContainer);
+
+              adsLoader.addEventListener(
+                window.google.ima.AdsManagerLoadedEvent.Type.ADS_MANAGER_LOADED,
+                function (adsManagerLoadedEvent) {
+                  adsManager = adsManagerLoadedEvent.getAdsManager(video);
+                  adsManager.addEventListener(
+                    window.google.ima.AdEvent.Type.CONTENT_PAUSE_REQUESTED,
+                    function () {
+                      video.pause();
+                    }
+                  );
+                  adsManager.addEventListener(
+                    window.google.ima.AdEvent.Type.CONTENT_RESUME_REQUESTED,
+                    function () {
+                      finishAd(resumeContent);
+                    }
+                  );
+                  adsManager.addEventListener(window.google.ima.AdEvent.Type.ALL_ADS_COMPLETED, function () {
+                    finishAd(resumeContent);
+                  });
+                  adsManager.addEventListener(window.google.ima.AdErrorEvent.Type.AD_ERROR, function () {
+                    finishAd(resumeContent);
+                  });
+
+                  try {
+                    adsManager.init(
+                      adContainer.offsetWidth || video.clientWidth || 640,
+                      adContainer.offsetHeight || video.clientHeight || 360,
+                      window.google.ima.ViewMode.NORMAL
+                    );
+                    adsManager.start();
+                  } catch (_error) {
+                    finishAd(resumeContent);
+                  }
+                },
+                false
+              );
+
+              adsLoader.addEventListener(
+                window.google.ima.AdErrorEvent.Type.AD_ERROR,
+                function () {
+                  finishAd(resumeContent);
+                },
+                false
+              );
+
+              var adsRequest = new window.google.ima.AdsRequest();
+              adsRequest.adTagUrl = vastUrlWithLanguage(video.dataset.vastAdTag);
+              adsRequest.linearAdSlotWidth = adContainer.offsetWidth || video.clientWidth || 640;
+              adsRequest.linearAdSlotHeight = adContainer.offsetHeight || video.clientHeight || 360;
+              adsRequest.nonLinearAdSlotWidth = adsRequest.linearAdSlotWidth;
+              adsRequest.nonLinearAdSlotHeight = Math.max(90, Math.round(adsRequest.linearAdSlotHeight / 3));
+              adsLoader.requestAds(adsRequest);
+
+              if (event && typeof event.preventDefault === 'function') {
+                event.preventDefault();
+              }
+            }
+
+            video.addEventListener('play', function (event) {
+              requestAd('preroll', true, event);
+            });
+            video.addEventListener('timeupdate', function () {
+              if (adPlaying || completedAdBreaks.midroll || !completedAdBreaks.preroll) return;
+              if (!Number(video.duration) || video.duration <= 0) return;
+
+              if ((Number(video.currentTime) / Number(video.duration)) >= 0.5) {
+                requestAd('midroll', true);
+              }
+            });
+            video.addEventListener('ended', function () {
+              requestAd('postroll', false);
+            });
+            if (skipButton) {
+              skipButton.addEventListener('click', function () {
+                finishAd(currentAdBreak !== 'postroll');
+              });
+            }
+          });
+
+          loadImaSdk(function () {});
+        }
+
+        function initializeNativeVideoTracking() {
+          if (!hostedVideoPlayers.length) return;
+
+          hostedVideoPlayers.forEach(function (episode) {
+            var video = document.getElementById(episode.elementId);
+            if (!video || video.dataset.analyticsInitialized === 'true') return;
+
+            video.dataset.analyticsInitialized = 'true';
+            var completedMilestones = {};
+
+            function durationMs() {
+              return Number(video.duration) > 0 ? Number(video.duration) * 1000 : 0;
+            }
+
+            function positionMs() {
+              return Number(video.currentTime) > 0 ? Number(video.currentTime) * 1000 : 0;
+            }
+
+            video.addEventListener('play', function () {
+              if (video.dataset.vastAdPlaying === 'true') return;
+              sendPlaybackEvent('play', episode, positionMs(), durationMs(), 'video', {
+                player_provider: episode.provider
+              });
+            });
+
+            video.addEventListener('pause', function () {
+              if (video.dataset.vastAdPlaying === 'true' || video.ended) return;
+              sendPlaybackEvent('pause', episode, positionMs(), durationMs(), 'video', {
+                player_provider: episode.provider
+              });
+            });
+
+            video.addEventListener('timeupdate', function () {
+              var duration = durationMs();
+              if (duration <= 0 || video.dataset.vastAdPlaying === 'true') return;
+
+              var position = positionMs();
+              var progress = (position / duration) * 100;
+
+              milestones.forEach(function (milestone) {
+                if (completedMilestones[milestone] || progress < milestone) return;
+
+                completedMilestones[milestone] = true;
+                sendPlaybackEvent(
+                  'progress_' + milestone,
+                  episode,
+                  position,
+                  duration,
+                  'video',
+                  { progress_percent: milestone, player_provider: episode.provider }
+                );
+              });
+            });
+
+            video.addEventListener('ended', function () {
+              sendPlaybackEvent('ended', episode, positionMs(), durationMs(), 'video', {
+                progress_percent: 100,
+                player_provider: episode.provider
+              });
+            });
+          });
+        }
+
         function initializeYouTubeTracking() {
           if (!videoPlayers.length) return;
 
@@ -1772,6 +2150,8 @@ const renderPlaybackTracking = (episodes, countryCode) => {
         }
 
         initializeAudioTracking(0);
+        initializeVastAds();
+        initializeNativeVideoTracking();
         loadYouTubeApi();
       })();
     </script>`;
@@ -2036,18 +2416,28 @@ const renderAttachments = (episode) => {
 };
 
 const renderVideoOverview = (episode) => {
+  const hostedVideo = normalizeVideoAsset(episode.videoAsset);
   const video = parseVideoUrl(episode.videoUrl);
 
-  if (!video) {
+  if (!hostedVideo && !video) {
     return "";
   }
 
-  return `
-    <section class="episode-video" id="video" aria-labelledby="video-overview-title">
-      <p class="section-kicker">Watch</p>
-      <h2 id="video-overview-title">Video overview</h2>
-      <div class="video-player">
-        <iframe
+  const player = hostedVideo
+    ? `<video
+          id="overview-video-${escapeHtml(episode.id)}"
+          class="overview-video-player"
+          data-vast-ad-tag="${escapeHtml(VAST_AD_TAG_URL)}"
+          controls
+          poster="${escapeHtml(episode.image)}"
+          preload="metadata"
+        >
+          <source src="${escapeHtml(videoAssetPath(episode.id))}" type="${escapeHtml(
+            hostedVideo.contentType
+          )}">
+          <a href="${escapeHtml(videoAssetPath(episode.id))}" download>Download video</a>
+        </video>`
+    : `<iframe
           id="overview-video-${escapeHtml(episode.id)}"
           class="overview-video-player"
           src="${escapeHtml(video.embedUrl)}"
@@ -2056,7 +2446,25 @@ const renderVideoOverview = (episode) => {
           allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
           allowfullscreen
           referrerpolicy="strict-origin-when-cross-origin"
-        ></iframe>
+        ></iframe>`;
+
+  return `
+    <section class="episode-video" id="video" aria-labelledby="video-overview-title">
+      <p class="section-kicker">Watch</p>
+      <h2 id="video-overview-title">Video overview</h2>
+      <div class="video-player${hostedVideo ? " video-player-hosted" : ""}">
+        ${player}
+        ${
+          hostedVideo
+            ? `<div
+                id="overview-video-ad-${escapeHtml(episode.id)}"
+                class="video-ad-container"
+                aria-label="Video advertisement"
+              >
+                <button class="video-ad-skip" type="button" data-video-ad-skip>Skip ad</button>
+              </div>`
+            : ""
+        }
       </div>
     </section>`;
 };
@@ -2169,7 +2577,9 @@ const renderEpisodeArticle = (episode) => {
 const renderEpisodeJumpNav = (episode, relatedEpisodes = []) => {
   const article = normalizeArticle(episode.article);
   const links = [
-    parseVideoUrl(episode.videoUrl) ? { href: "#video", label: "Video" } : null,
+    normalizeVideoAsset(episode.videoAsset) || parseVideoUrl(episode.videoUrl)
+      ? { href: "#video", label: "Video" }
+      : null,
     normalizeMapLocations(episode.mapLocations).length ? { href: "#locations", label: "Locations" } : null,
     episode.attachments?.length ? { href: "#materials", label: "Materials" } : null,
     article.body ? { href: "#companion-article", label: "Companion article" } : null,
@@ -2425,6 +2835,8 @@ const renderHead = ({
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer-when-downgrade" />
+    <meta name="cb1e08e3957bbffb41bece25fd13463e6be4fded" content="cb1e08e3957bbffb41bece25fd13463e6be4fded" />
     <title>${escapeHtml(title)}</title>
     <meta name="description" content="${escapeHtml(description)}">
     <meta property="og:title" content="${escapeHtml(title)}">
@@ -2957,12 +3369,60 @@ const styles = `
     box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
   }
 
-  .video-player iframe {
+  .video-player iframe,
+  .video-player video {
     display: block;
     width: 100%;
     height: 100%;
     border: 0;
     background: #101215;
+  }
+
+  .video-player-hosted {
+    isolation: isolate;
+  }
+
+  .video-ad-container {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: none;
+    background: #101215;
+  }
+
+  .video-ad-container.active {
+    display: block;
+  }
+
+  .video-ad-container iframe,
+  .video-ad-container video,
+  .video-ad-container > div,
+  .video-ad-container > div > div {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+  }
+
+  .video-ad-skip {
+    position: absolute;
+    right: 14px;
+    bottom: 14px;
+    z-index: 10;
+    display: none;
+    min-height: 40px;
+    padding: 0 14px;
+    border: 1px solid rgba(255, 255, 255, 0.72);
+    border-radius: 4px;
+    background: rgba(16, 18, 21, 0.9);
+    color: white;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 900;
+  }
+
+  .video-ad-skip.visible {
+    display: inline-flex;
+    align-items: center;
   }
 
   .episode-attachments {
@@ -4203,6 +4663,7 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
       const content = contentByEpisode.get(episode.id);
       return (
         content?.videoUrl ||
+        content?.videoAsset ||
         content?.attachments?.length ||
         content?.mapLocations?.length ||
         normalizeArticle(content?.article).body
@@ -4211,6 +4672,7 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
     .map((episode) => {
       const content = contentByEpisode.get(episode.id) ?? emptyEpisodeContent();
       const video = parseVideoUrl(content.videoUrl);
+      const hostedVideo = normalizeVideoAsset(content.videoAsset);
       const article = normalizeArticle(content.article);
       const articleOverview = article.body
         ? `
@@ -4230,15 +4692,29 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
               </form>
             </div>`
         : "";
-      const videoOverview = content.videoUrl
+      const videoOverview = hostedVideo || content.videoUrl
         ? `
             <div class="admin-attachment">
               <div>
-                <strong>${video ? "YouTube video overview" : "Unsupported video overview URL"}</strong>
+                <strong>${
+                  hostedVideo
+                    ? "Hosted video overview"
+                    : video
+                      ? "YouTube video overview"
+                      : "Unsupported video overview URL"
+                }</strong>
                 <div><a href="${escapeHtml(
-                  video?.url ?? content.videoUrl
-                )}" target="_blank" rel="noopener">${escapeHtml(video?.url ?? content.videoUrl)}</a></div>
-                ${video ? "" : "<div>Replace this with a YouTube link or remove it.</div>"}
+                  hostedVideo ? videoAssetPath(episode.id) : video?.url ?? content.videoUrl
+                )}" target="_blank" rel="noopener">${
+                  hostedVideo
+                    ? escapeHtml(`${hostedVideo.filename} · ${formatFileSize(hostedVideo.size)}`)
+                    : escapeHtml(video?.url ?? content.videoUrl)
+                }</a></div>
+                ${
+                  !hostedVideo && !video
+                    ? "<div>Replace this with a YouTube link, hosted video, or remove it.</div>"
+                    : ""
+                }
               </div>
               <form method="post" action="/admin/content/video">
                 <input type="hidden" name="episodeId" value="${escapeHtml(episode.id)}">
@@ -4367,14 +4843,18 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
       <section class="admin-panel">
         <p class="section-kicker">Episode media</p>
         <h2>Add media in one pass</h2>
-        <p>Choose one episode, then save its YouTube overview and supporting files together.</p>
+        <p>Choose one episode, then save its hosted video, YouTube fallback, and supporting files together.</p>
         <form class="admin-form" method="post" action="/admin/content/media" enctype="multipart/form-data">
           <label>
             Episode
             <select name="episodeId" required>${episodeOptions}</select>
           </label>
           <label>
-            YouTube overview URL
+            Hosted video file (maximum ${escapeHtml(formatFileSize(MAX_VIDEO_UPLOAD_BYTES))})
+            <input type="file" name="videoFile" accept="video/*">
+          </label>
+          <label>
+            YouTube overview URL fallback
             <input
               type="url"
               name="videoUrl"
@@ -4393,6 +4873,27 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
             <button class="button secondary" type="button" data-add-upload>Add another file</button>
           </fieldset>
           <button class="button" type="submit">Save episode media</button>
+        </form>
+      </section>
+      <section class="admin-panel">
+        <p class="section-kicker">Video import</p>
+        <h2>Copy a video URL to R2</h2>
+        <p>This copies URLs that return video bytes directly. YouTube watch URLs need a downloader service before the Worker can import them.</p>
+        <form class="admin-form" method="post" action="/admin/content/video/import">
+          <label>
+            Episode
+            <select name="episodeId" required>${episodeOptions}</select>
+          </label>
+          <label>
+            Video source URL
+            <input
+              type="url"
+              name="sourceUrl"
+              placeholder="https://example.com/video.mp4"
+              required
+            >
+          </label>
+          <button class="button" type="submit">Copy video to R2</button>
         </form>
       </section>
       <section class="admin-panel">
@@ -4491,8 +4992,11 @@ const serveAttachment = async (request, env, pathname) => {
 
   const episodeId = decodeURIComponent(match[1]);
   const attachmentId = decodeURIComponent(match[2]);
-  const attachments = await loadAttachments(env, episodeId);
-  const attachment = attachments.find((item) => item.id === attachmentId);
+  const content = await loadEpisodeContent(env, episodeId);
+  const attachment =
+    attachmentId === "video"
+      ? normalizeVideoAsset(content.videoAsset)
+      : content.attachments.find((item) => item.id === attachmentId);
 
   if (!attachment) {
     return new Response("Not found", { status: 404 });
@@ -4515,9 +5019,16 @@ const serveAttachment = async (request, env, pathname) => {
   headers.set("x-content-type-options", "nosniff");
   headers.set("content-security-policy", "sandbox; default-src 'none'");
   headers.set("cross-origin-resource-policy", "same-origin");
+  headers.set("accept-ranges", "bytes");
   headers.set(
     "content-disposition",
-    `${attachment.type === "image" || attachment.type === "pdf" ? "inline" : "attachment"}; filename="${attachment.filename.replaceAll('"', "")}"`
+    `${
+      attachment.type === "image" ||
+      attachment.type === "pdf" ||
+      isVideoContentType(attachment.contentType)
+        ? "inline"
+        : "attachment"
+    }; filename="${attachment.filename.replaceAll('"', "")}"`
   );
 
   if (range && object.range) {
@@ -4574,6 +5085,8 @@ const handleAdminPage = async (request, env, url) => {
     articleRemoved: "Article removed.",
     uploaded: "Content uploaded successfully.",
     deleted: "Content deleted.",
+    videoImported: "Video copied to R2.",
+    videoImportUnsupported: "That URL does not return a video file directly. YouTube watch URLs need a downloader service before this Worker can copy them.",
     mapSaved: "Map location saved.",
     mapSavedNoGeocode: "Map location saved, but no coordinates were found. Add latitude and longitude manually to show an embedded map.",
     mapRemoved: "Map location removed.",
@@ -4708,6 +5221,8 @@ const handleMediaBundle = async (request, env) => {
   const form = await request.formData();
   const episodeId = String(form.get("episodeId") ?? "").trim();
   const videoInput = String(form.get("videoUrl") ?? "").trim();
+  const videoFile = form.get("videoFile");
+  const hasVideoFile = videoFile instanceof File && videoFile.size > 0;
   const removeVideo = form.get("removeVideo") === "1";
   const video = videoInput ? parseVideoUrl(videoInput) : null;
 
@@ -4717,6 +5232,26 @@ const handleMediaBundle = async (request, env) => {
 
   if (videoInput && !video) {
     return new Response("A valid YouTube URL is required", { status: 400 });
+  }
+
+  if (hasVideoFile && videoInput) {
+    return new Response("Upload a hosted video file or save a YouTube URL, not both", { status: 400 });
+  }
+
+  if (removeVideo && (hasVideoFile || videoInput)) {
+    return new Response("Remove the existing video or save a replacement, not both", { status: 400 });
+  }
+
+  if (hasVideoFile) {
+    if (videoFile.size > MAX_VIDEO_UPLOAD_BYTES) {
+      return new Response(`Videos must be ${formatFileSize(MAX_VIDEO_UPLOAD_BYTES)} or smaller`, {
+        status: 413
+      });
+    }
+
+    if (!isVideoContentType(videoFile.type) && !isLikelyVideoFilename(videoFile.name)) {
+      return new Response("Upload a video file such as MP4, WebM, MOV, or M4V", { status: 400 });
+    }
   }
 
   const episodes = await loadEpisodes();
@@ -4755,6 +5290,8 @@ const handleMediaBundle = async (request, env) => {
   }
 
   const uploadedAttachments = [];
+  let uploadedVideoAsset = null;
+  let previousVideoAsset = null;
 
   try {
     for (const { file, attachment } of attachmentsToUpload) {
@@ -4765,17 +5302,40 @@ const handleMediaBundle = async (request, env) => {
       uploadedAttachments.push(attachment);
     }
 
+    if (hasVideoFile) {
+      uploadedVideoAsset = buildVideoAsset(episodeId, videoFile);
+      await env.EPISODE_CONTENT.put(uploadedVideoAsset.objectKey, videoFile.stream(), {
+        httpMetadata: { contentType: uploadedVideoAsset.contentType },
+        customMetadata: { episodeId, videoAssetId: uploadedVideoAsset.id }
+      });
+    }
+
     const content = await loadEpisodeContent(env, episodeId);
-    const nextVideoUrl = removeVideo ? "" : video ? video.url : content.videoUrl;
+    previousVideoAsset = normalizeVideoAsset(content.videoAsset);
+    const replacingVideo = removeVideo || video || uploadedVideoAsset;
+    const nextVideoUrl = removeVideo || uploadedVideoAsset ? "" : video ? video.url : content.videoUrl;
+    const nextVideoAsset = uploadedVideoAsset
+      ? uploadedVideoAsset
+      : replacingVideo
+        ? null
+        : content.videoAsset;
 
     await saveEpisodeContent(env, episodeId, {
       ...content,
       videoUrl: nextVideoUrl,
+      videoAsset: nextVideoAsset,
       attachments: [...content.attachments, ...uploadedAttachments]
     });
+
+    if (previousVideoAsset && replacingVideo) {
+      await deleteVideoAsset(env, previousVideoAsset);
+    }
   } catch (error) {
     await Promise.all(
-      uploadedAttachments.map((attachment) => env.EPISODE_CONTENT.delete(attachment.objectKey))
+      [
+        ...uploadedAttachments.map((attachment) => env.EPISODE_CONTENT.delete(attachment.objectKey)),
+        uploadedVideoAsset ? env.EPISODE_CONTENT.delete(uploadedVideoAsset.objectKey) : null
+      ].filter(Boolean)
     );
     throw error;
   }
@@ -4812,15 +5372,122 @@ const handleVideoOverview = async (request, env) => {
   }
 
   const content = await loadEpisodeContent(env, episodeId);
+  const previousVideoAsset = normalizeVideoAsset(content.videoAsset);
   await saveEpisodeContent(env, episodeId, {
     ...content,
-    videoUrl: video?.url ?? ""
+    videoUrl: video?.url ?? "",
+    videoAsset: null
   });
+
+  if (previousVideoAsset) {
+    await deleteVideoAsset(env, previousVideoAsset);
+  }
 
   return adminRedirect(
     request,
     video ? "?status=videoSaved" : "?status=videoRemoved"
   );
+};
+
+const handleVideoImport = async (request, env) => {
+  if (!isAdmin(request, env)) {
+    return adminUnauthorized();
+  }
+
+  if (!sameOriginRequest(request)) {
+    return new Response("Invalid request origin", { status: 403 });
+  }
+
+  if (!env.EPISODE_CONTENT) {
+    return new Response("Content storage is not configured", { status: 503 });
+  }
+
+  const form = await request.formData();
+  const episodeId = String(form.get("episodeId") ?? "").trim();
+  const sourceInput = String(form.get("sourceUrl") ?? "").trim();
+
+  if (!episodeId || !sourceInput) {
+    return new Response("Episode and video source URL are required", { status: 400 });
+  }
+
+  let sourceUrl;
+
+  try {
+    sourceUrl = new URL(sourceInput);
+  } catch {
+    return new Response("A valid video source URL is required", { status: 400 });
+  }
+
+  if (sourceUrl.protocol !== "https:") {
+    return new Response("Video source URL must use HTTPS", { status: 400 });
+  }
+
+  if (parseVideoUrl(sourceUrl.href)) {
+    return adminRedirect(request, "?status=videoImportUnsupported");
+  }
+
+  const episodes = await loadEpisodes();
+
+  if (!episodes.some((episode) => episode.id === episodeId)) {
+    return adminRedirect(request, "?status=missing");
+  }
+
+  const response = await fetch(sourceUrl.href, {
+    headers: {
+      accept: "video/*,application/octet-stream;q=0.8,*/*;q=0.1",
+      "user-agent": `${podcast.name} video importer (${podcast.email})`
+    }
+  });
+
+  if (!response.ok || !response.body) {
+    return new Response(`Unable to fetch video source: ${response.status}`, { status: 502 });
+  }
+
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "";
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  const filename = videoFilenameFromUrl(sourceUrl.href);
+
+  if (!isVideoContentType(contentType) && !isLikelyVideoFilename(filename)) {
+    return adminRedirect(request, "?status=videoImportUnsupported");
+  }
+
+  if (contentLength > MAX_VIDEO_UPLOAD_BYTES) {
+    return new Response(`Videos must be ${formatFileSize(MAX_VIDEO_UPLOAD_BYTES)} or smaller`, {
+      status: 413
+    });
+  }
+
+  const importedVideoAsset = buildImportedVideoAsset(
+    episodeId,
+    sourceUrl.href,
+    contentType || "application/octet-stream",
+    contentLength
+  );
+
+  try {
+    await env.EPISODE_CONTENT.put(importedVideoAsset.objectKey, response.body, {
+      httpMetadata: { contentType: importedVideoAsset.contentType },
+      customMetadata: { episodeId, videoAssetId: importedVideoAsset.id, sourceUrl: sourceUrl.href }
+    });
+
+    const content = await loadEpisodeContent(env, episodeId);
+    const previousVideoAsset = normalizeVideoAsset(content.videoAsset);
+
+    await saveEpisodeContent(env, episodeId, {
+      ...content,
+      videoUrl: "",
+      videoAsset: importedVideoAsset
+    });
+
+    if (previousVideoAsset) {
+      await deleteVideoAsset(env, previousVideoAsset);
+    }
+  } catch (error) {
+    await env.EPISODE_CONTENT.delete(importedVideoAsset.objectKey);
+    throw error;
+  }
+
+  return adminRedirect(request, "?status=videoImported");
 };
 
 const handleMapLocation = async (request, env) => {
@@ -5006,6 +5673,10 @@ export default {
         return handleVideoOverview(request, env);
       }
 
+      if (url.pathname === "/admin/content/video/import" && request.method === "POST") {
+        return handleVideoImport(request, env);
+      }
+
       if (url.pathname === "/admin/content/map" && request.method === "POST") {
         return handleMapLocation(request, env);
       }
@@ -5070,6 +5741,7 @@ export default {
         episode.attachments = episodeContent.attachments;
         episode.article = episodeContent.article;
         episode.videoUrl = episodeContent.videoUrl;
+        episode.videoAsset = episodeContent.videoAsset;
         episode.mapLocations = episodeContent.mapLocations;
         ctx.waitUntil(notifyEpisodeView(env, request, episode));
 

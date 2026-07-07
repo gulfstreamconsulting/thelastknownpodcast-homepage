@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "WRANGLER_WRITE_LOGS=false wrangler dev",
     "deploy": "WRANGLER_WRITE_LOGS=false wrangler deploy",
-    "check": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run"
+    "check": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run",
+    "migrate:youtube-videos": "node scripts/migrate_youtube_videos_to_r2.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.20.0"

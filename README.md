@@ -48,7 +48,7 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 
 ## Episode Content
 
-The password-protected `/admin/content` page lets you choose one episode and save its YouTube overview plus several supporting files in a single submit. Uploaded images, PDFs, and other supporting files are stored in Cloudflare R2. Video overviews are rendered with a YouTube player on the episode detail page. Each uploaded file has a display title and description and appears on the same page.
+The password-protected `/admin/content` page lets you choose one episode and save its hosted video, YouTube fallback, and several supporting files in a single submit. Uploaded videos, images, PDFs, and other supporting files are stored in Cloudflare R2. Video overviews are rendered with an R2-backed native video player when a hosted video is available, with existing YouTube links still supported as a fallback. Hosted episode videos request VAST pre-roll, mid-roll, and post-roll ads through the Google IMA SDK while preserving playback analytics, and show a skip control after 15 seconds. The video import form can copy URLs that return video bytes directly; YouTube watch URLs need a downloader service before the Worker can import them. Each uploaded file has a display title and description and appears on the same page.
 
 Create the configured R2 bucket once:
 
@@ -70,6 +70,37 @@ ADMIN_PASSWORD=choose-a-long-password
 ```
 
 Uploads are limited to 25 MB. Attachment files and their metadata manifests are both stored in the `EPISODE_CONTENT` R2 binding.
+
+### Migrating YouTube videos to R2
+
+The local migration script reads `/api/podcast`, finds episodes with a `youtubeUrl` and no hosted `videoAsset`, downloads each video with `yt-dlp`, and uploads it through the admin media API.
+
+Install `yt-dlp` first, then preview the work:
+
+```bash
+brew install yt-dlp
+```
+
+```bash
+DRY_RUN=1 SITE_URL=https://thelastknownpodcast.com npm run migrate:youtube-videos
+```
+
+Run the migration with admin credentials:
+
+```bash
+SITE_URL=https://thelastknownpodcast.com \
+ADMIN_USERNAME=admin \
+ADMIN_PASSWORD=choose-a-long-password \
+npm run migrate:youtube-videos
+```
+
+Optional controls:
+
+- `LIMIT=1` migrates only the first matching episode.
+- `EPISODE_ID=12345` migrates one episode.
+- `DOWNLOAD_DIR=downloads/youtube-video-migration` changes the temporary download directory.
+- `KEEP_DOWNLOADS=1` keeps downloaded files after upload.
+- `YT_DLP_BIN=/path/to/yt-dlp` uses a custom `yt-dlp` binary.
 
 ## Development
 

@@ -35,7 +35,7 @@ const ADSTERRA_BANNER_SCRIPT_URL =
 const HILLTOPADS_VIDEO_SLIDER_SCRIPT_URL =
   "//prizefamily.com/bmX/VxsZd.Gala0qYJWhcK/peDmW9euAZkUglakXP_TVcEyBMODVMWw-O/DkEItMNVzeITwlMXzaA/4TNKQs";
 const VAST_AD_TAG_URL =
-  "https://funny-tooth.com/dymdFqz.dzGzNsvnZ/GkUW/iehmn9eu/ZoU-lykZPiTjcbyXMBDAE/x/NlDNEotLN/zhIZw/MUTyEc0/NsSoZysdaPW-1Npxd/Dc0Gxs";
+  "https://s.magsrv.com/v1/vast.php?idz=5971644";
 const VAST_AD_ROUTE = "/vast-ad.xml";
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const VAST_FETCH_USER_AGENT =
@@ -547,6 +547,24 @@ const loadApiEpisodeCatalog = async (env) => {
   return episodes;
 };
 
+const loadApiEpisodeDetail = async (request, ctx, env, episodeSlug) => {
+  const pageData = await loadEpisodePageData(request, ctx, episodeSlug);
+
+  if (!pageData) {
+    return null;
+  }
+
+  const { episode, episodes } = pageData;
+  const content = await loadEpisodeContent(env, episode.id);
+  episode.attachments = content.attachments;
+  episode.article = content.article;
+  episode.videoUrl = content.videoUrl;
+  episode.videoAsset = content.videoAsset;
+  episode.mapLocations = content.mapLocations;
+
+  return { episode, episodes };
+};
+
 const saveAttachments = async (env, episodeId, attachments) => {
   const content = await loadEpisodeContent(env, episodeId);
   return saveEpisodeContent(env, episodeId, { ...content, attachments });
@@ -978,6 +996,11 @@ const absoluteUrl = (value, origin) => {
   return new URL(value, origin).href;
 };
 
+const parsePositiveInteger = (value, fallback = 1) => {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 const serializeAttachment = (attachment, episode, origin) => ({
   id: attachment.id,
   type: attachment.type,
@@ -988,6 +1011,41 @@ const serializeAttachment = (attachment, episode, origin) => ({
   sizeBytes: attachment.size ?? null,
   url: absoluteUrl(attachmentPath(episode.id, attachment.id), origin)
 });
+
+const serializeMapLocation = (location) => ({
+  ...location,
+  mapUrl: mapSearchUrl(location),
+  embedUrl: mapEmbedUrl(location) || null
+});
+
+const serializeVideo = (episode, origin) => {
+  const hostedVideo = normalizeVideoAsset(episode.videoAsset);
+  const youtubeVideo = parseVideoUrl(episode.videoUrl);
+
+  if (hostedVideo) {
+    return {
+      provider: "hosted",
+      url: absoluteUrl(videoAssetPath(episode.id), origin),
+      posterUrl: absoluteUrl(episode.image, origin),
+      mimeType: hostedVideo.contentType,
+      filename: hostedVideo.filename,
+      sizeBytes: hostedVideo.size,
+      vastAdTagUrl: absoluteUrl(VAST_AD_ROUTE, origin)
+    };
+  }
+
+  if (youtubeVideo) {
+    return {
+      provider: "youtube",
+      url: youtubeVideo.url,
+      embedUrl: youtubeVideo.embedUrl,
+      videoId: youtubeVideo.videoId,
+      posterUrl: absoluteUrl(episode.image, origin)
+    };
+  }
+
+  return null;
+};
 
 const serializeEpisode = (episode, origin) => ({
   id: episode.id,
@@ -1007,7 +1065,9 @@ const serializeEpisode = (episode, origin) => ({
   transcript: episode.transcript
     ? {
         url: episode.transcript.url,
-        mimeType: episode.transcript.type
+        mimeType: episode.transcript.type,
+        paragraphs: episode.transcriptContent?.paragraphs ?? null,
+        sourceUrl: episode.transcriptContent?.sourceUrl ?? episode.transcript.url
       }
     : null,
   article: normalizeArticle(episode.article),
@@ -1023,11 +1083,77 @@ const serializeEpisode = (episode, origin) => ({
         url: absoluteUrl(videoAssetPath(episode.id), origin)
       }
     : null,
-  mapLocations: normalizeMapLocations(episode.mapLocations),
+  video: serializeVideo(episode, origin),
+  mapLocations: normalizeMapLocations(episode.mapLocations).map(serializeMapLocation),
   attachments: (episode.attachments ?? []).map((attachment) =>
     serializeAttachment(attachment, episode, origin)
   )
 });
+
+const serializeCategory = (category, origin) => ({
+  id: category.slug,
+  slug: category.slug,
+  label: category.label,
+  description: category.description,
+  episodeCount: category.episodes.length,
+  url: absoluteUrl(`/?category=${encodeURIComponent(category.slug)}#cases`, origin)
+});
+
+const serializePagination = (
+  totalItems,
+  currentPage,
+  perPage,
+  selectedCategory,
+  origin
+) => {
+  const totalPages = Math.max(1, Math.ceil(totalItems / perPage));
+  const normalizedPage = Math.min(Math.max(1, currentPage), totalPages);
+  const pageStart = (normalizedPage - 1) * perPage;
+  const itemStart = totalItems ? pageStart + 1 : 0;
+  const itemEnd = Math.min(pageStart + perPage, totalItems);
+  const pageUrl = (page) => absoluteUrl(homepageCasesHref(selectedCategory, page), origin);
+
+  return {
+    page: normalizedPage,
+    perPage,
+    totalPages,
+    totalItems,
+    itemStart,
+    itemEnd,
+    previousPageUrl: normalizedPage > 1 ? pageUrl(normalizedPage - 1) : null,
+    nextPageUrl: normalizedPage < totalPages ? pageUrl(normalizedPage + 1) : null
+  };
+};
+
+const episodeSectionAvailability = (episode, relatedEpisodes = []) => {
+  const article = normalizeArticle(episode.article);
+  return {
+    video: Boolean(normalizeVideoAsset(episode.videoAsset) || parseVideoUrl(episode.videoUrl)),
+    locations: normalizeMapLocations(episode.mapLocations).length > 0,
+    materials: (episode.attachments ?? []).length > 0,
+    companionArticle: Boolean(article.body),
+    transcript: (episode.transcriptContent?.paragraphs ?? []).length > 0,
+    relatedEpisodes: relatedEpisodes.length > 0
+  };
+};
+
+const serializeEpisodeJumpNav = (episode, relatedEpisodes, origin) => {
+  const available = episodeSectionAvailability(episode, relatedEpisodes);
+  const sections = [
+    available.video ? { id: "video", label: "Video" } : null,
+    available.locations ? { id: "locations", label: "Locations" } : null,
+    available.materials ? { id: "materials", label: "Materials" } : null,
+    available.companionArticle ? { id: "companion-article", label: "Companion article" } : null,
+    available.transcript ? { id: "transcript", label: "Transcript" } : null,
+    available.relatedEpisodes ? { id: "related-episodes", label: "Related episodes" } : null
+  ].filter(Boolean);
+
+  return sections.map((section) => ({
+    ...section,
+    anchor: `#${section.id}`,
+    url: absoluteUrl(`${episodePath(episode)}#${section.id}`, origin)
+  }));
+};
 
 const API_HEADERS = {
   "access-control-allow-origin": "*",
@@ -1078,7 +1204,7 @@ const handleVastAdTag = async (request) => {
 };
 
 const renderPodcastApi = (episodes, origin) => ({
-  apiVersion: "1.0",
+  apiVersion: "1.1",
   podcast: {
     name: podcast.name,
     tagline: podcast.tagline,
@@ -1095,11 +1221,199 @@ const renderPodcastApi = (episodes, origin) => ({
       }))
   },
   episodes: episodes.map((episode) => serializeEpisode(episode, origin)),
+  screens: {
+    home: renderHomeApi(episodes, origin)
+  },
   meta: {
     episodeCount: episodes.length,
     generatedAt: new Date().toISOString()
   }
 });
+
+const renderHomeApi = (
+  episodes,
+  origin,
+  { selectedCategory = null, requestedPage = 1 } = {}
+) => {
+  const featuredEpisode = episodes[0] ?? null;
+  const categories = buildEpisodeCategories(episodes);
+  const activeCategory = categories.find((category) => category.slug === selectedCategory);
+  const visibleEpisodes = activeCategory?.episodes ?? episodes;
+  const pagination = serializePagination(
+    visibleEpisodes.length,
+    requestedPage,
+    EPISODES_PER_PAGE,
+    activeCategory?.slug ?? null,
+    origin
+  );
+  const pageStart = (pagination.page - 1) * pagination.perPage;
+  const paginatedEpisodes = visibleEpisodes.slice(pageStart, pageStart + pagination.perPage);
+
+  return {
+    id: "home",
+    title: activeCategory ? `${activeCategory.label} Episodes` : podcast.name,
+    description: activeCategory?.description ?? podcast.description,
+    hero: {
+      eyebrow: "True crime podcast",
+      title: podcast.name,
+      subtitle: podcast.tagline,
+      imageUrl: absoluteUrl(podcast.heroImage, origin),
+      actions: [
+        {
+          id: "listen",
+          label: "Listen now",
+          type: "anchor",
+          url: absoluteUrl("/#listen", origin)
+        },
+        featuredEpisode
+          ? {
+              id: "episode-details",
+              label: "Episode details",
+              type: "episode",
+              url: absoluteUrl(episodePath(featuredEpisode), origin),
+              episodeId: featuredEpisode.id,
+              episodeSlug: featuredEpisode.slug
+            }
+          : null,
+        {
+          id: "support",
+          label: "Support the show",
+          type: "external",
+          url: DIRECT_SUPPORT_URL
+        }
+      ].filter(Boolean)
+    },
+    featuredEpisode: featuredEpisode ? serializeEpisode(featuredEpisode, origin) : null,
+    categories: [
+      {
+        id: "all",
+        slug: null,
+        label: "All episodes",
+        description: "Browse every case in the podcast archive.",
+        episodeCount: episodes.length,
+        url: absoluteUrl("/#cases", origin),
+        selected: !activeCategory
+      },
+      ...categories.map((category) => ({
+        ...serializeCategory(category, origin),
+        selected: activeCategory?.slug === category.slug
+      }))
+    ],
+    archive: {
+      id: "cases",
+      title: activeCategory
+        ? activeCategory.label
+        : "Built around timelines, records, and what can be verified.",
+      selectedCategory: activeCategory ? serializeCategory(activeCategory, origin) : null,
+      episodes: paginatedEpisodes.map((episode) => serializeEpisode(episode, origin)),
+      pagination
+    },
+    sections: [
+      { id: "listen", type: "featuredEpisode", title: "Latest episode" },
+      { id: "categories", type: "categoryBrowser", title: "Explore by topic" },
+      { id: "cases", type: "episodeArchive", title: "Case files" }
+    ]
+  };
+};
+
+const renderEpisodeDetailApi = (episode, episodes, origin) => {
+  const relatedEpisodes = selectRelatedEpisodes(episode, episodes);
+  const article = normalizeArticle(episode.article);
+  const serializedEpisode = serializeEpisode(episode, origin);
+
+  return {
+    id: "episode-detail",
+    title: episode.title,
+    description: episode.summary,
+    episode: serializedEpisode,
+    breadcrumbs: [
+      { label: "Home", url: absoluteUrl("/", origin) },
+      { label: "Episodes", url: absoluteUrl("/#cases", origin) },
+      { label: episode.title, url: absoluteUrl(episodePath(episode), origin) }
+    ],
+    hero: {
+      eyebrow: episode.status,
+      title: episode.title,
+      publishedAtDisplay: episode.publishedAt ?? "Episode",
+      lede: episode.detail ?? episode.summary,
+      artworkUrl: serializedEpisode.artworkUrl,
+      actions: [
+        {
+          id: "listen-spreaker",
+          label: "Listen on Spreaker",
+          type: "external",
+          url: episode.href
+        },
+        {
+          id: "support",
+          label: "Support the show",
+          type: "external",
+          url: DIRECT_SUPPORT_URL
+        },
+        (episode.transcriptContent?.paragraphs ?? []).length
+          ? {
+              id: "read-transcript",
+              label: "Read episode transcript",
+              type: "section",
+              anchor: "#transcript"
+            }
+          : null
+      ].filter(Boolean),
+      player: serializedEpisode.player
+    },
+    navigation: serializeEpisodeJumpNav(episode, relatedEpisodes, origin),
+    sections: {
+      video: serializedEpisode.video
+        ? {
+            id: "video",
+            title: "Video overview",
+            media: serializedEpisode.video
+          }
+        : null,
+      locations: serializedEpisode.mapLocations.length
+        ? {
+            id: "locations",
+            title: "Case locations",
+            locations: serializedEpisode.mapLocations
+          }
+        : null,
+      materials: serializedEpisode.attachments.length
+        ? {
+            id: "materials",
+            title: "Episode materials",
+            attachments: serializedEpisode.attachments
+          }
+        : null,
+      companionArticle: article.body
+        ? {
+            id: "companion-article",
+            title: article.title || `${episode.title} companion article`,
+            excerpt: article.excerpt || null,
+            bodyMarkdown: article.body,
+            updatedAt: article.updatedAt || null
+          }
+        : null,
+      transcript: (episode.transcriptContent?.paragraphs ?? []).length
+        ? {
+            id: "transcript",
+            title: `${episode.title} transcript`,
+            intro: "Transcript excerpt supplied by Spreaker.",
+            sourceUrl: episode.transcriptContent.sourceUrl,
+            paragraphs: episode.transcriptContent.paragraphs
+          }
+        : null,
+      relatedEpisodes: relatedEpisodes.length
+        ? {
+            id: "related-episodes",
+            title: `More episodes from ${podcast.name}`,
+            episodes: relatedEpisodes.map((relatedEpisode) =>
+              serializeEpisode(relatedEpisode, origin)
+            )
+          }
+        : null
+    }
+  };
+};
 
 const STATIC_PAGES = [
   {
@@ -1667,36 +1981,46 @@ const renderSpreakerPlayer = (episode) => `
   >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
 
 const renderAdsterraNativeAd = (placement = "episode") => {
-  const adMarkup = `<script async="async" data-cfasync="false" src="${ADSTERRA_NATIVE_SCRIPT_URL}"></script>
-<div id="${ADSTERRA_NATIVE_CONTAINER_ID}"></div>`;
-
-  return `
-    <aside class="native-ad native-ad-${escapeHtml(placement)}" aria-label="Advertisement">
-      <iframe
-        title="Advertisement"
-        loading="lazy"
-        srcdoc="${escapeHtml(adMarkup)}"
-        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin"
-        referrerpolicy="no-referrer-when-downgrade"
-      ></iframe>
-    </aside>`;
+  return `<!-- Adsterra native ad disabled (${escapeHtml(placement)}). -->`;
 };
 
 const appendNativeAd = (html, placement) => (html ? `${html}${renderAdsterraNativeAd(placement)}` : "");
 
-const renderAdsterraBannerAd = (placement = "page") => `
+const renderAdsterraBannerAd = (placement = "page") =>
+  `<!-- Adsterra banner ad disabled (${escapeHtml(placement)}). -->`;
+
+const renderEzoClickBannerAd = (placement = "page") => `
   <aside class="banner-ad banner-ad-${escapeHtml(placement)}" aria-label="Advertisement">
-    <script>
-      atOptions = {
-        'key' : '${ADSTERRA_BANNER_KEY}',
-        'format' : 'iframe',
-        'height' : 60,
-        'width' : 468,
-        'params' : {}
-      };
-    </script>
-    <script src="${ADSTERRA_BANNER_SCRIPT_URL}"></script>
+    <ins class="eas6a97888e10" data-zoneid="5971630"></ins>
+    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
   </aside>`;
+
+const renderEzoClickRecommendationWidget = () => `
+  <aside class="recommendation-widget" aria-label="Recommended content">
+    <script async type="application/javascript" src="https://a.magsrv.com/ad-provider.js"></script>
+    <ins class="eas6a97888e20" data-zoneid="5971632"></ins>
+    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
+  </aside>`;
+
+const renderEzoClickOutstreamVideoAd = () => `
+  <aside class="outstream-video-ad" aria-label="Video advertisement">
+    <script async type="application/javascript" src="https://a.magsrv.com/ad-provider.js"></script>
+    <ins class="eas6a97888e37" data-zoneid="5971634"></ins>
+    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
+  </aside>`;
+
+const renderEzoClickVideoSliderAd = () => `
+  <aside class="video-slider-ad" aria-label="Video advertisement">
+    <ins class="eas6a97888e31" data-zoneid="5971640"></ins>
+    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
+  </aside>`;
+
+const renderEzoClickFullPageInterstitialAd = () => `
+  <div class="full-page-interstitial-ad" aria-label="Advertisement">
+    <script async type="application/javascript" src="https://a.pemsrv.com/ad-provider.js"></script>
+    <ins class="eas6a97888e33" data-zoneid="5971646"></ins>
+    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
+  </div>`;
 
 const renderPlaybackTracking = (episodes, countryCode) => {
   const audioPlayers = episodes.map((episode) => ({
@@ -1894,6 +2218,9 @@ const renderPlaybackTracking = (episodes, countryCode) => {
             var adContainer = document.getElementById(episode.adContainerId);
             var videoPlayer = adContainer ? adContainer.closest('.video-player') : null;
             var skipButton = videoPlayer ? videoPlayer.querySelector('[data-video-ad-skip]') : null;
+            var startButton = videoPlayer ? videoPlayer.querySelector('[data-video-ad-start]') : null;
+            var isMobileBrowser = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+              (navigator.maxTouchPoints > 1 && window.matchMedia('(pointer: coarse)').matches);
 
             if (
               !video ||
@@ -1934,7 +2261,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                 window.google.ima.settings &&
                 typeof window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus === 'function'
               ) {
-                window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus(true);
+                window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus(false);
               }
 
               if (!adDisplayContainer) {
@@ -2034,7 +2361,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                 window.google.ima.settings &&
                 typeof window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus === 'function'
               ) {
-                window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus(true);
+                window.google.ima.settings.setDisableCustomPlaybackForIOS10Plus(false);
               }
 
               adPlaying = true;
@@ -2135,9 +2462,17 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               }
             }
 
-            video.addEventListener('pointerdown', prepareAdsForUserGesture, { passive: true });
-            video.addEventListener('touchend', prepareAdsForUserGesture, { passive: true });
-            video.addEventListener('click', prepareAdsForUserGesture, { passive: true });
+            if (startButton) {
+              startButton.addEventListener('click', function (event) {
+                event.preventDefault();
+                if (startButton) startButton.hidden = true;
+                initializeAdDisplayContainer();
+                requestAd('preroll', true, event);
+              });
+            }
+            video.addEventListener('pointerdown', prepareAdsForUserGesture, { passive: true, capture: true });
+            video.addEventListener('touchstart', prepareAdsForUserGesture, { passive: true, capture: true });
+            video.addEventListener('click', prepareAdsForUserGesture, { passive: true, capture: true });
             video.addEventListener('play', function (event) {
               if (suppressNextPlayAd) {
                 suppressNextPlayAd = false;
@@ -2147,6 +2482,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
             });
             video.addEventListener('timeupdate', function () {
               if (
+                isMobileBrowser ||
                 adPlaying ||
                 completedAdBreaks.midroll ||
                 (!completedAdBreaks.preroll && !failedAdBreaks.preroll)
@@ -2643,7 +2979,11 @@ const renderVideoOverview = (episode) => {
                 class="video-ad-container"
                 aria-label="Video advertisement"
               ></div>
-              <button class="video-ad-skip" type="button" data-video-ad-skip>Skip ad</button>`
+              <button class="video-ad-skip" type="button" data-video-ad-skip>Skip ad</button>
+              <button class="video-ad-start" type="button" data-video-ad-start aria-label="Play video">
+                <span aria-hidden="true">▶</span>
+                Play video
+              </button>`
             : ""
         }
       </div>
@@ -3032,6 +3372,7 @@ const renderHead = ({
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer-when-downgrade" />
     <meta name="cb1e08e3957bbffb41bece25fd13463e6be4fded" content="cb1e08e3957bbffb41bece25fd13463e6be4fded" />
+    <meta name="6a97888e-site-verification" content="ff34f22365342a73804b3a49a1bf4afe">
     <title>${escapeHtml(title)}</title>
     <meta name="description" content="${escapeHtml(description)}">
     <meta property="og:title" content="${escapeHtml(title)}">
@@ -3047,7 +3388,7 @@ const renderHead = ({
     <script type="text/javascript" src="https://resources.infolinks.com/js/infolinks_main.js"></script>
     <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
     <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
-    ${renderHilltopAdsVideoSlider()}
+    <!-- HilltopAds video slider multitag disabled. -->
     <style>${styles}</style>
   </head>`;
 
@@ -3632,6 +3973,31 @@ const styles = `
   .video-ad-skip.visible {
     opacity: 1;
     pointer-events: auto;
+  }
+
+  .video-ad-start {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    background: rgba(16, 18, 21, 0.42);
+    color: white;
+    cursor: pointer;
+    font: inherit;
+    font-size: 1.05rem;
+    font-weight: 900;
+  }
+
+  .video-ad-start span {
+    font-size: 1.4rem;
+  }
+
+  .video-ad-start[hidden] {
+    display: none;
   }
 
   .episode-attachments {
@@ -4572,7 +4938,7 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
       </section>
     </div>
 
-    ${renderAdsterraBannerAd("static")}
+    ${renderEzoClickBannerAd("static")}
 
     <main>
       <article class="section static-page">
@@ -4594,6 +4960,9 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
     </main>
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickFullPageInterstitialAd()}
+    ${renderEzoClickVideoSliderAd()}
+    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 
@@ -4643,7 +5012,7 @@ const renderPage = (
       </section>
     </div>
 
-    ${renderAdsterraBannerAd("home")}
+    ${renderEzoClickBannerAd("home")}
 
     <main>
       <section class="section episode-layout" id="listen">
@@ -4700,6 +5069,9 @@ const renderPage = (
     ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickFullPageInterstitialAd()}
+    ${renderEzoClickVideoSliderAd()}
+    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -4718,7 +5090,10 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     title: `${episode.title} | ${podcast.name}`,
     description: episode.summary,
     image: episode.image,
-    facebookPixelId: analytics.facebookPixelId
+    facebookPixelId: analytics.facebookPixelId,
+    extraHead: normalizeVideoAsset(episode.videoAsset)
+      ? `<script data-ima-sdk src="${escapeHtml(IMA_SDK_URL)}"></script>`
+      : ""
   })}
   <body>
     <div class="page-shell">
@@ -4755,7 +5130,8 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
       </section>
     </div>
 
-    ${renderAdsterraBannerAd("episode")}
+    ${renderEzoClickBannerAd("episode")}
+    ${renderEzoClickOutstreamVideoAd()}
 
     <main>
       ${renderEpisodeJumpNav(episode, relatedEpisodes)}
@@ -4777,6 +5153,9 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickFullPageInterstitialAd()}
+    ${renderEzoClickVideoSliderAd()}
+    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -4809,7 +5188,7 @@ const renderSearchPage = (query, results, analytics = {}) => {
         </div>
       </section>
     </div>
-    ${renderAdsterraBannerAd("search")}
+    ${renderEzoClickBannerAd("search")}
     <main>
       <section class="section">
         <div class="search-results-heading">
@@ -4833,6 +5212,9 @@ const renderSearchPage = (query, results, analytics = {}) => {
     </main>
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickFullPageInterstitialAd()}
+    ${renderEzoClickVideoSliderAd()}
+    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -5177,6 +5559,9 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
         });
       })();
     </script>
+    ${renderEzoClickFullPageInterstitialAd()}
+    ${renderEzoClickVideoSliderAd()}
+    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -5819,7 +6204,13 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const cacheControl = `public, max-age=${podcast.spreaker.cacheSeconds}`;
-    const isApiRequest = url.pathname === "/api/podcast" || url.pathname === "/api/podcast/";
+    const apiEpisodeMatch = url.pathname.match(/^\/api\/episodes\/([^/]+)\/?$/);
+    const isApiRequest =
+      url.pathname === "/api/podcast" ||
+      url.pathname === "/api/podcast/" ||
+      url.pathname === "/api/home" ||
+      url.pathname === "/api/home/" ||
+      Boolean(apiEpisodeMatch);
     const analytics = {
       countryCode: getCountryCode(request),
       facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
@@ -5850,6 +6241,61 @@ export default {
       }
 
       if (isApiRequest) {
+        if (url.pathname === "/api/home" || url.pathname === "/api/home/") {
+          const episodes = await loadApiEpisodeCatalog(env);
+          const selectedCategory = String(url.searchParams.get("category") ?? "").trim();
+          const requestedPage = parsePositiveInteger(url.searchParams.get("page"), 1);
+
+          return jsonResponse(
+            {
+              apiVersion: "1.1",
+              screen: renderHomeApi(episodes, url.origin, {
+                selectedCategory,
+                requestedPage
+              }),
+              meta: {
+                episodeCount: episodes.length,
+                generatedAt: new Date().toISOString()
+              }
+            },
+            200,
+            cacheControl,
+            request.method === "HEAD"
+          );
+        }
+
+        if (apiEpisodeMatch) {
+          const episodeSlug = decodeURIComponent(apiEpisodeMatch[1]);
+          const pageData = await loadApiEpisodeDetail(request, ctx, env, episodeSlug);
+
+          if (!pageData) {
+            return jsonResponse(
+              {
+                error: {
+                  code: "episode_not_found",
+                  message: "No episode was found for that slug."
+                }
+              },
+              404,
+              "no-store",
+              request.method === "HEAD"
+            );
+          }
+
+          return jsonResponse(
+            {
+              apiVersion: "1.1",
+              screen: renderEpisodeDetailApi(pageData.episode, pageData.episodes, url.origin),
+              meta: {
+                generatedAt: new Date().toISOString()
+              }
+            },
+            200,
+            cacheControl,
+            request.method === "HEAD"
+          );
+        }
+
         const episodes = await loadApiEpisodeCatalog(env);
         return jsonResponse(
           renderPodcastApi(episodes, url.origin),

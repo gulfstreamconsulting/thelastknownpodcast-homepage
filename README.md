@@ -32,9 +32,14 @@ The Worker exposes the podcast and episode catalog as JSON with CORS enabled:
 
 ```text
 GET /api/podcast
+GET /api/home
+GET /api/home?category=missing-persons&page=2
+GET /api/episodes/:slug
 ```
 
 During local development, use `http://localhost:8787/api/podcast`.
+
+`/api/podcast` remains the full catalog endpoint and now includes `screens.home` for clients that want one bootstrap payload. `/api/home` returns a focused native-screen payload for the homepage, including the hero, latest episode, generated categories, paginated archive, and section metadata. `/api/episodes/:slug` returns a native-screen payload for an episode detail page, including hero/player data, section navigation, optional hosted or YouTube video, case locations, materials, companion article markdown, transcript paragraphs, and related episodes.
 
 ## Playback Analytics
 

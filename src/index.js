@@ -3046,7 +3046,7 @@ const renderHead = ({
     </script>
     <script type="text/javascript" src="https://resources.infolinks.com/js/infolinks_main.js"></script>
     <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
-    <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
+    <!-- <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script> -->
     ${renderHilltopAdsVideoSlider()}
     <style>${styles}</style>
   </head>`;

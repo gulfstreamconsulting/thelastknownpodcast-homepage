@@ -26,14 +26,6 @@ const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data";
 const EPISODES_PER_PAGE = 9;
 const ADS_TXT_REDIRECT_URL = "https://srv.adstxtmanager.com/19390/thelastknownpodcast.com";
 const DIRECT_SUPPORT_URL = "https://omg10.com/4/11230976";
-const ADSTERRA_NATIVE_SCRIPT_URL =
-  "https://pl28638835.effectivecpmnetwork.com/8fee276f31bbe673bacbd151f123599f/invoke.js";
-const ADSTERRA_NATIVE_CONTAINER_ID = "container-8fee276f31bbe673bacbd151f123599f";
-const ADSTERRA_BANNER_KEY = "8ce72288f86a6c1f5e7fef247bea3264";
-const ADSTERRA_BANNER_SCRIPT_URL =
-  "https://www.highperformanceformat.com/8ce72288f86a6c1f5e7fef247bea3264/invoke.js";
-const HILLTOPADS_VIDEO_SLIDER_SCRIPT_URL =
-  "//prizefamily.com/bmX/VxsZd.Gala0qYJWhcK/peDmW9euAZkUglakXP_TVcEyBMODVMWw-O/DkEItMNVzeITwlMXzaA/4TNKQs";
 const VAST_AD_TAG_URL =
   "https://s.magsrv.com/v1/vast.php?idz=5971644";
 const VAST_AD_ROUTE = "/vast-ad.xml";
@@ -1980,18 +1972,16 @@ const renderSpreakerPlayer = (episode) => `
     data-title="${escapeHtml(episode.title)}"
   >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
 
-const renderAdsterraNativeAd = (placement = "episode") => {
-  return `<!-- Adsterra native ad disabled (${escapeHtml(placement)}). -->`;
-};
-
-const appendNativeAd = (html, placement) => (html ? `${html}${renderAdsterraNativeAd(placement)}` : "");
-
-const renderAdsterraBannerAd = (placement = "page") =>
-  `<!-- Adsterra banner ad disabled (${escapeHtml(placement)}). -->`;
-
 const renderEzoClickBannerAd = (placement = "page") => `
   <aside class="banner-ad banner-ad-${escapeHtml(placement)}" aria-label="Advertisement">
     <ins class="eas6a97888e10" data-zoneid="5971630"></ins>
+    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
+  </aside>`;
+
+const renderEzoClickStickyBannerAd = () => `
+  <aside class="sticky-banner-ad" aria-label="Advertisement">
+    <script async type="application/javascript" src="https://a.magsrv.com/ad-provider.js"></script>
+    <ins class="eas6a97888e17" data-zoneid="5972142"></ins>
     <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
   </aside>`;
 
@@ -2998,7 +2988,7 @@ const renderInlineMarkdown = (value) => {
     .replace(/\*([^*]+)\*/g, "<em>$1</em>");
 };
 
-const renderMarkdownBlocks = (value, options = {}) => {
+const renderMarkdownBlocks = (value) => {
   const lines = String(value ?? "").replace(/\r/g, "").split("\n");
   const blocks = [];
   let paragraph = [];
@@ -3012,9 +3002,6 @@ const renderMarkdownBlocks = (value, options = {}) => {
 
     paragraphCount += 1;
     blocks.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
-    if (options.insertAdAfterParagraph && paragraphCount === options.insertAdAfterParagraph) {
-      blocks.push(renderAdsterraNativeAd(options.adPlacement ?? "article-inline"));
-    }
     paragraph = [];
   };
 
@@ -3086,10 +3073,7 @@ const renderEpisodeArticle = (episode) => {
       ${article.updatedAt ? `<p class="article-updated">Last updated ${escapeHtml(article.updatedAt)}</p>` : ""}
       ${article.excerpt ? `<p class="article-excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
       <div class="article-body">
-        ${renderMarkdownBlocks(article.body, {
-          insertAdAfterParagraph: 3,
-          adPlacement: "article-inline"
-        })}
+        ${renderMarkdownBlocks(article.body)}
       </div>
       <a class="back-to-top" href="#episode-title">Back to top</a>
     </section>`;
@@ -3279,10 +3263,7 @@ const renderTranscript = (episode) => {
   const visibleParagraphs = episode.transcriptContent.paragraphs.slice(0, 3);
   const remainingParagraphs = episode.transcriptContent.paragraphs.slice(3);
   const transcriptPreview = visibleParagraphs
-    .map((paragraph, index) => {
-      const ad = index === 1 ? renderAdsterraNativeAd("transcript-inline") : "";
-      return `<p>${escapeHtml(paragraph)}</p>${ad}`;
-    })
+    .map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`)
     .join("");
 
   return `
@@ -3346,20 +3327,6 @@ const renderFacebookPixel = (pixelId) => {
     </script>`;
 };
 
-const renderHilltopAdsVideoSlider = () => `
-    <script>
-      (function(qwbiyb){
-      var d = document,
-          s = d.createElement('script'),
-          l = d.scripts[d.scripts.length - 1];
-      s.settings = qwbiyb || {};
-      s.src = ${safeJson(HILLTOPADS_VIDEO_SLIDER_SCRIPT_URL)};
-      s.async = true;
-      s.referrerPolicy = 'no-referrer-when-downgrade';
-      l.parentNode.insertBefore(s, l);
-      })({})
-    </script>`;
-
 const renderHead = ({
   title,
   description,
@@ -3387,8 +3354,7 @@ const renderHead = ({
     </script>
     <script type="text/javascript" src="https://resources.infolinks.com/js/infolinks_main.js"></script>
     <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
-    <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
-    <!-- HilltopAds video slider multitag disabled. -->
+    <!-- <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script> -->
     <style>${styles}</style>
   </head>`;
 
@@ -4960,6 +4926,7 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
     </main>
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickStickyBannerAd()}
     ${renderEzoClickFullPageInterstitialAd()}
     ${renderEzoClickVideoSliderAd()}
     ${renderEzoClickRecommendationWidget()}
@@ -5069,6 +5036,7 @@ const renderPage = (
     ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickStickyBannerAd()}
     ${renderEzoClickFullPageInterstitialAd()}
     ${renderEzoClickVideoSliderAd()}
     ${renderEzoClickRecommendationWidget()}
@@ -5136,11 +5104,11 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     <main>
       ${renderEpisodeJumpNav(episode, relatedEpisodes)}
       <article class="section episode-detail-layout">
-        ${appendNativeAd(videoOverview, "after-video")}
-        ${appendNativeAd(episodeMap, "after-locations")}
-        ${appendNativeAd(attachments, "after-materials")}
-        ${appendNativeAd(companionArticle, "after-article")}
-        ${appendNativeAd(transcript, "after-transcript")}
+        ${videoOverview}
+        ${episodeMap}
+        ${attachments}
+        ${companionArticle}
+        ${transcript}
       </article>
       ${renderRelatedEpisodes(episode, relatedEpisodes)}
       ${renderFooter({
@@ -5153,6 +5121,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickStickyBannerAd()}
     ${renderEzoClickFullPageInterstitialAd()}
     ${renderEzoClickVideoSliderAd()}
     ${renderEzoClickRecommendationWidget()}
@@ -5212,6 +5181,7 @@ const renderSearchPage = (query, results, analytics = {}) => {
     </main>
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
+    ${renderEzoClickStickyBannerAd()}
     ${renderEzoClickFullPageInterstitialAd()}
     ${renderEzoClickVideoSliderAd()}
     ${renderEzoClickRecommendationWidget()}
@@ -5559,6 +5529,7 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
         });
       })();
     </script>
+    ${renderEzoClickStickyBannerAd()}
     ${renderEzoClickFullPageInterstitialAd()}
     ${renderEzoClickVideoSliderAd()}
     ${renderEzoClickRecommendationWidget()}

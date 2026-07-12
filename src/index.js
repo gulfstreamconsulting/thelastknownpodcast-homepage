@@ -1950,6 +1950,8 @@ const renderAdsterraNativeAd = (placement = "episode") => {
       <iframe
         title="Advertisement"
         loading="lazy"
+        scrolling="no"
+        onload="const frame = this; const resizeAd = () => { const documentElement = frame.contentDocument && frame.contentDocument.documentElement; const body = frame.contentDocument && frame.contentDocument.body; if (!documentElement || !body) return; frame.style.height = Math.max(documentElement.scrollHeight, body.scrollHeight) + 'px'; }; resizeAd(); new ResizeObserver(resizeAd).observe(frame.contentDocument.documentElement);"
         srcdoc="${escapeHtml(adMarkup)}"
         sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin"
         referrerpolicy="no-referrer-when-downgrade"
@@ -3992,11 +3994,13 @@ const styles = `
     display: block;
     width: 100%;
     height: 380px;
+    overflow: hidden;
     border: 0;
     background: transparent;
   }
 
-  .native-ad-episode-top {
+  .native-ad-episode-top,
+  .native-ad-home {
     width: min(calc(100% - 40px), 1180px);
     margin: 28px auto;
   }
@@ -4940,6 +4944,8 @@ const renderPage = (
           </div>
         </div>
       </section>
+
+      ${renderAdsterraNativeAd("home")}
 
       ${renderCategoryBrowser(categories, activeCategory?.slug ?? null, episodes.length)}
 

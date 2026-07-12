@@ -26,20 +26,7 @@ const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data";
 const EPISODES_PER_PAGE = 9;
 const ADS_TXT_REDIRECT_URL = "https://srv.adstxtmanager.com/19390/thelastknownpodcast.com";
 const DIRECT_SUPPORT_URL = "https://omg10.com/4/11230976";
-const ADSTERRA_NATIVE_SCRIPT_URL =
-  "https://pl28638835.effectivecpmnetwork.com/8fee276f31bbe673bacbd151f123599f/invoke.js";
-const ADSTERRA_NATIVE_CONTAINER_ID = "container-8fee276f31bbe673bacbd151f123599f";
-const ADSTERRA_BANNER_KEY = "8ce72288f86a6c1f5e7fef247bea3264";
-const ADSTERRA_BANNER_SCRIPT_URL =
-  "https://www.highperformanceformat.com/8ce72288f86a6c1f5e7fef247bea3264/invoke.js";
-const HILLTOPADS_VIDEO_SLIDER_SCRIPT_URL =
-  "//prizefamily.com/bmX/VxsZd.Gala0qYJWhcK/peDmW9euAZkUglakXP_TVcEyBMODVMWw-O/DkEItMNVzeITwlMXzaA/4TNKQs";
-const VAST_AD_TAG_URL =
-  "https://s.magsrv.com/v1/vast.php?idz=5971644";
-const VAST_AD_ROUTE = "/vast-ad.xml";
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
-const VAST_FETCH_USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const BOT_USER_AGENT_PATTERN =
   /\b(bot|crawl|crawler|spider|slurp|preview|facebookexternalhit|discordbot|twitterbot|linkedinbot|slackbot|telegrambot|whatsapp|embedly|pinterest|google-inspectiontool|gptbot|chatgpt-user|ccbot|claudebot|perplexitybot|bytespider|yandex|duckduckbot|baiduspider|semrushbot|ahrefsbot|mj12bot|dotbot|petalbot|headlesschrome|lighthouse|pagespeed|pingdom|gtmetrix|uptimerobot|curl|wget|python-requests|go-http-client|java|axios|undici)\b/i;
 
@@ -1030,7 +1017,7 @@ const serializeVideo = (episode, origin) => {
       mimeType: hostedVideo.contentType,
       filename: hostedVideo.filename,
       sizeBytes: hostedVideo.size,
-      vastAdTagUrl: absoluteUrl(VAST_AD_ROUTE, origin)
+      vastAdTagUrl: null
     };
   }
 
@@ -1176,32 +1163,6 @@ const jsonResponse = (
       "cache-control": cacheControl
     }
   });
-
-const handleVastAdTag = async (request) => {
-  const response = await fetch(VAST_AD_TAG_URL, {
-    headers: {
-      accept: "application/xml,text/xml;q=0.9,*/*;q=0.1",
-      referer: new URL("/", request.url).href,
-      "user-agent": VAST_FETCH_USER_AGENT
-    }
-  });
-
-  if (!response.ok) {
-    return new Response(null, {
-      status: response.status,
-      headers: {
-        "cache-control": "no-store"
-      }
-    });
-  }
-
-  const headers = new Headers();
-  headers.set("content-type", response.headers.get("content-type") || "application/xml;charset=UTF-8");
-  headers.set("cache-control", "no-store");
-  headers.set("access-control-allow-origin", "*");
-
-  return new Response(request.method === "HEAD" ? null : response.body, { status: response.status, headers });
-};
 
 const renderPodcastApi = (episodes, origin) => ({
   apiVersion: "1.1",
@@ -1981,46 +1942,23 @@ const renderSpreakerPlayer = (episode) => `
   >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
 
 const renderAdsterraNativeAd = (placement = "episode") => {
-  return `<!-- Adsterra native ad disabled (${escapeHtml(placement)}). -->`;
-};
+  const adMarkup = `<script async="async" data-cfasync="false" src="https://pl28638835.effectivecpmnetwork.com/8fee276f31bbe673bacbd151f123599f/invoke.js"></script>
+<div id="container-8fee276f31bbe673bacbd151f123599f"></div>`;
 
-const appendNativeAd = (html, placement) => (html ? `${html}${renderAdsterraNativeAd(placement)}` : "");
+  return `
+    <aside class="native-ad native-ad-${escapeHtml(placement)}" aria-label="Advertisement">
+      <iframe
+        title="Advertisement"
+        loading="lazy"
+        srcdoc="${escapeHtml(adMarkup)}"
+        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+        referrerpolicy="no-referrer-when-downgrade"
+      ></iframe>
+    </aside>`;
+};
 
 const renderAdsterraBannerAd = (placement = "page") =>
   `<!-- Adsterra banner ad disabled (${escapeHtml(placement)}). -->`;
-
-const renderEzoClickBannerAd = (placement = "page") => `
-  <aside class="banner-ad banner-ad-${escapeHtml(placement)}" aria-label="Advertisement">
-    <ins class="eas6a97888e10" data-zoneid="5971630"></ins>
-    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
-  </aside>`;
-
-const renderEzoClickRecommendationWidget = () => `
-  <aside class="recommendation-widget" aria-label="Recommended content">
-    <script async type="application/javascript" src="https://a.magsrv.com/ad-provider.js"></script>
-    <ins class="eas6a97888e20" data-zoneid="5971632"></ins>
-    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
-  </aside>`;
-
-const renderEzoClickOutstreamVideoAd = () => `
-  <aside class="outstream-video-ad" aria-label="Video advertisement">
-    <script async type="application/javascript" src="https://a.magsrv.com/ad-provider.js"></script>
-    <ins class="eas6a97888e37" data-zoneid="5971634"></ins>
-    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
-  </aside>`;
-
-const renderEzoClickVideoSliderAd = () => `
-  <aside class="video-slider-ad" aria-label="Video advertisement">
-    <ins class="eas6a97888e31" data-zoneid="5971640"></ins>
-    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
-  </aside>`;
-
-const renderEzoClickFullPageInterstitialAd = () => `
-  <div class="full-page-interstitial-ad" aria-label="Advertisement">
-    <script async type="application/javascript" src="https://a.pemsrv.com/ad-provider.js"></script>
-    <ins class="eas6a97888e33" data-zoneid="5971646"></ins>
-    <script>(AdProvider = window.AdProvider || []).push({"serve": {}});</script>
-  </div>`;
 
 const renderPlaybackTracking = (episodes, countryCode) => {
   const audioPlayers = episodes.map((episode) => ({
@@ -2666,7 +2604,6 @@ const renderPlaybackTracking = (episodes, countryCode) => {
         }
 
         initializeAudioTracking(0);
-        initializeVastAds();
         initializeNativeVideoTracking();
         loadYouTubeApi();
       })();
@@ -2943,7 +2880,6 @@ const renderVideoOverview = (episode) => {
     ? `<video
           id="overview-video-${escapeHtml(episode.id)}"
           class="overview-video-player"
-          data-vast-ad-tag="${escapeHtml(VAST_AD_ROUTE)}"
           controls
           playsinline
           webkit-playsinline
@@ -2972,20 +2908,6 @@ const renderVideoOverview = (episode) => {
       <h2 id="video-overview-title">Video overview</h2>
       <div class="video-player${hostedVideo ? " video-player-hosted" : ""}">
         ${player}
-        ${
-          hostedVideo
-            ? `<div
-                id="overview-video-ad-${escapeHtml(episode.id)}"
-                class="video-ad-container"
-                aria-label="Video advertisement"
-              ></div>
-              <button class="video-ad-skip" type="button" data-video-ad-skip>Skip ad</button>
-              <button class="video-ad-start" type="button" data-video-ad-start aria-label="Play video">
-                <span aria-hidden="true">▶</span>
-                Play video
-              </button>`
-            : ""
-        }
       </div>
     </section>`;
 };
@@ -3067,6 +2989,13 @@ const renderMarkdownBlocks = (value, options = {}) => {
 
   flushParagraph();
   flushList();
+
+  if (
+    options.insertAdAfterParagraph &&
+    paragraphCount < options.insertAdAfterParagraph
+  ) {
+    blocks.push(renderAdsterraNativeAd(options.adPlacement ?? "article-inline"));
+  }
 
   return blocks.join("");
 };
@@ -3280,7 +3209,8 @@ const renderTranscript = (episode) => {
   const remainingParagraphs = episode.transcriptContent.paragraphs.slice(3);
   const transcriptPreview = visibleParagraphs
     .map((paragraph, index) => {
-      const ad = index === 1 ? renderAdsterraNativeAd("transcript-inline") : "";
+      const adIndex = Math.min(1, visibleParagraphs.length - 1);
+      const ad = index === adIndex ? renderAdsterraNativeAd("transcript-inline") : "";
       return `<p>${escapeHtml(paragraph)}</p>${ad}`;
     })
     .join("");
@@ -3346,20 +3276,6 @@ const renderFacebookPixel = (pixelId) => {
     </script>`;
 };
 
-const renderHilltopAdsVideoSlider = () => `
-    <script>
-      (function(qwbiyb){
-      var d = document,
-          s = d.createElement('script'),
-          l = d.scripts[d.scripts.length - 1];
-      s.settings = qwbiyb || {};
-      s.src = ${safeJson(HILLTOPADS_VIDEO_SLIDER_SCRIPT_URL)};
-      s.async = true;
-      s.referrerPolicy = 'no-referrer-when-downgrade';
-      l.parentNode.insertBefore(s, l);
-      })({})
-    </script>`;
-
 const renderHead = ({
   title,
   description,
@@ -3372,7 +3288,6 @@ const renderHead = ({
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer-when-downgrade" />
     <meta name="cb1e08e3957bbffb41bece25fd13463e6be4fded" content="cb1e08e3957bbffb41bece25fd13463e6be4fded" />
-    <meta name="6a97888e-site-verification" content="ff34f22365342a73804b3a49a1bf4afe">
     <title>${escapeHtml(title)}</title>
     <meta name="description" content="${escapeHtml(description)}">
     <meta property="og:title" content="${escapeHtml(title)}">
@@ -3381,14 +3296,7 @@ const renderHead = ({
     ${extraHead}
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(facebookPixelId)}
-    <script type="text/javascript">
-      var infolinks_pid = 3446247;
-      var infolinks_wsid = 0;
-    </script>
-    <script type="text/javascript" src="https://resources.infolinks.com/js/infolinks_main.js"></script>
     <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
-    <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
-    <!-- HilltopAds video slider multitag disabled. -->
     <style>${styles}</style>
   </head>`;
 
@@ -4086,6 +3994,11 @@ const styles = `
     height: 380px;
     border: 0;
     background: transparent;
+  }
+
+  .native-ad-episode-top {
+    width: min(calc(100% - 40px), 1180px);
+    margin: 28px auto;
   }
 
   .article-body .native-ad,
@@ -4938,8 +4851,6 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
       </section>
     </div>
 
-    ${renderEzoClickBannerAd("static")}
-
     <main>
       <article class="section static-page">
         <p class="section-kicker">${escapeHtml(page.kicker)}</p>
@@ -4960,9 +4871,6 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
     </main>
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
-    ${renderEzoClickFullPageInterstitialAd()}
-    ${renderEzoClickVideoSliderAd()}
-    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 
@@ -5011,8 +4919,6 @@ const renderPage = (
         </div>
       </section>
     </div>
-
-    ${renderEzoClickBannerAd("home")}
 
     <main>
       <section class="section episode-layout" id="listen">
@@ -5069,9 +4975,6 @@ const renderPage = (
     ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
-    ${renderEzoClickFullPageInterstitialAd()}
-    ${renderEzoClickVideoSliderAd()}
-    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -5090,10 +4993,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     title: `${episode.title} | ${podcast.name}`,
     description: episode.summary,
     image: episode.image,
-    facebookPixelId: analytics.facebookPixelId,
-    extraHead: normalizeVideoAsset(episode.videoAsset)
-      ? `<script data-ima-sdk src="${escapeHtml(IMA_SDK_URL)}"></script>`
-      : ""
+    facebookPixelId: analytics.facebookPixelId
   })}
   <body>
     <div class="page-shell">
@@ -5130,17 +5030,16 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
       </section>
     </div>
 
-    ${renderEzoClickBannerAd("episode")}
-    ${renderEzoClickOutstreamVideoAd()}
+    ${renderAdsterraNativeAd("episode-top")}
 
     <main>
       ${renderEpisodeJumpNav(episode, relatedEpisodes)}
       <article class="section episode-detail-layout">
-        ${appendNativeAd(videoOverview, "after-video")}
-        ${appendNativeAd(episodeMap, "after-locations")}
-        ${appendNativeAd(attachments, "after-materials")}
-        ${appendNativeAd(companionArticle, "after-article")}
-        ${appendNativeAd(transcript, "after-transcript")}
+        ${videoOverview}
+        ${episodeMap}
+        ${attachments}
+        ${companionArticle}
+        ${transcript}
       </article>
       ${renderRelatedEpisodes(episode, relatedEpisodes)}
       ${renderFooter({
@@ -5153,9 +5052,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
-    ${renderEzoClickFullPageInterstitialAd()}
-    ${renderEzoClickVideoSliderAd()}
-    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -5188,7 +5084,6 @@ const renderSearchPage = (query, results, analytics = {}) => {
         </div>
       </section>
     </div>
-    ${renderEzoClickBannerAd("search")}
     <main>
       <section class="section">
         <div class="search-results-heading">
@@ -5212,9 +5107,6 @@ const renderSearchPage = (query, results, analytics = {}) => {
     </main>
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
-    ${renderEzoClickFullPageInterstitialAd()}
-    ${renderEzoClickVideoSliderAd()}
-    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -5559,9 +5451,6 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
         });
       })();
     </script>
-    ${renderEzoClickFullPageInterstitialAd()}
-    ${renderEzoClickVideoSliderAd()}
-    ${renderEzoClickRecommendationWidget()}
   </body>
 </html>`;
 };
@@ -6222,10 +6111,6 @@ export default {
 
     if (url.pathname === "/ads.txt") {
       return Response.redirect(ADS_TXT_REDIRECT_URL, 301);
-    }
-
-    if (url.pathname === VAST_AD_ROUTE && (request.method === "GET" || request.method === "HEAD")) {
-      return handleVastAdTag(request);
     }
 
     if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {

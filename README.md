@@ -53,7 +53,7 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 
 ## Episode Content
 
-The password-protected `/admin/content` page lets you choose one episode and save its hosted video, YouTube fallback, and several supporting files in a single submit. Uploaded videos, images, PDFs, and other supporting files are stored in Cloudflare R2. Video overviews are rendered with an R2-backed native video player when a hosted video is available, with existing YouTube links still supported as a fallback. Hosted episode videos request VAST pre-roll, mid-roll, and post-roll ads through the Google IMA SDK while preserving playback analytics, and show a skip control after 15 seconds. The video import form can copy URLs that return video bytes directly; YouTube watch URLs need a downloader service before the Worker can import them. Each uploaded file has a display title and description and appears on the same page.
+The password-protected `/admin/content` page lets you choose one episode and save its hosted video, YouTube fallback, and several supporting files in a single submit. Uploaded videos, images, PDFs, and other supporting files are stored in Cloudflare R2. Video overviews are rendered with an R2-backed native video player when a hosted video is available, with existing YouTube links still supported as a fallback. The video import form can copy URLs that return video bytes directly; YouTube watch URLs need a downloader service before the Worker can import them. Each uploaded file has a display title and description and appears on the same page.
 
 Create the configured R2 bucket once:
 

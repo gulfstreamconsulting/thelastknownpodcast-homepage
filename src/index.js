@@ -854,8 +854,8 @@ const detectDevice = (userAgent = "") => {
   return "Desktop";
 };
 
-const isLikelyBotRequest = (request) => {
-  if (request.method !== "GET") {
+const isLikelyBotRequest = (request, expectedMethod = "GET") => {
+  if (request.method !== expectedMethod) {
     return true;
   }
 
@@ -908,16 +908,16 @@ const getCountryCode = (request) => {
   return /^[A-Z]{2}$/.test(country) ? country : "XX";
 };
 
-const notifyEpisodeView = (env, request, episode) => {
+const notifyEpisodeView = (env, request, episode, expectedMethod = "GET") => {
   if (!env.DISCORD_WEBHOOK_URL) {
     return Promise.resolve();
   }
 
-  if (isLikelyBotRequest(request)) {
+  if (isLikelyBotRequest(request, expectedMethod)) {
     return Promise.resolve();
   }
 
-  const url = new URL(request.url);
+  const url = new URL(episodePath(episode), request.url);
   const client = getClientInfo(request);
   const payload = {
     username: podcast.name,
@@ -2645,6 +2645,26 @@ const renderEpisodeJumpNavTracking = (episode, countryCode) => `
           window.fbq('trackCustom', eventName, parameters);
         }
       });
+    })();
+  </script>`;
+
+const renderEpisodeViewNotification = (episode) => `
+  <script>
+    (function () {
+      var endpoint = ${safeJson(`/analytics/episode-view/${episode.slug}`)};
+
+      window.addEventListener('load', function () {
+        window.setTimeout(function () {
+          if (document.visibilityState !== 'visible') return;
+
+          fetch(endpoint, {
+            method: 'POST',
+            credentials: 'same-origin',
+            keepalive: true,
+            headers: { 'content-type': 'text/plain;charset=UTF-8' }
+          }).catch(function () {});
+        }, 3000);
+      }, { once: true });
     })();
   </script>`;
 
@@ -5054,6 +5074,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
+    ${renderEpisodeViewNotification(episode)}
     ${renderPlaybackTracking([episode], analytics.countryCode)}
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
@@ -6124,6 +6145,31 @@ export default {
     }
 
     try {
+      const episodeViewMatch = url.pathname.match(/^\/analytics\/episode-view\/([^/]+)\/?$/);
+
+      if (episodeViewMatch) {
+        if (request.method !== "POST") {
+          return new Response("Method not allowed", {
+            status: 405,
+            headers: { allow: "POST" }
+          });
+        }
+
+        if (request.headers.get("origin") !== url.origin) {
+          return new Response("Forbidden", { status: 403 });
+        }
+
+        const episodeSlug = decodeURIComponent(episodeViewMatch[1]);
+        const pageData = await loadEpisodePageData(request, ctx, episodeSlug);
+
+        if (!pageData) {
+          return new Response("Not found", { status: 404 });
+        }
+
+        ctx.waitUntil(notifyEpisodeView(env, request, pageData.episode, "POST"));
+        return new Response(null, { status: 204 });
+      }
+
       if (isApiRequest && !["GET", "HEAD"].includes(request.method)) {
         return jsonResponse(
           { error: { code: "method_not_allowed", message: "Use GET for this endpoint." } },
@@ -6293,8 +6339,6 @@ export default {
         episode.videoUrl = episodeContent.videoUrl;
         episode.videoAsset = episodeContent.videoAsset;
         episode.mapLocations = episodeContent.mapLocations;
-        ctx.waitUntil(notifyEpisodeView(env, request, episode));
-
         return new Response(renderEpisodePage(episode, episodes, analytics), {
           headers: {
             "content-type": "text/html;charset=UTF-8",

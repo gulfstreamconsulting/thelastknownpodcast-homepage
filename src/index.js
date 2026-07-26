@@ -1966,7 +1966,8 @@ const renderPlaybackTracking = (episodes, countryCode) => {
   const audioPlayers = episodes.map((episode) => ({
     elementId: `spreaker-player-${episode.id}`,
     episodeId: episode.id,
-    episodeTitle: episode.title
+    episodeTitle: episode.title,
+    provider: "spreaker"
   }));
   const videoPlayers = episodes
     .filter((episode) => parseVideoUrl(episode.videoUrl))
@@ -2057,6 +2058,19 @@ const renderPlaybackTracking = (episodes, countryCode) => {
             var previousPlaying = false;
             var polling = false;
             var completedMilestones = {};
+            var playbackEnded = false;
+
+            function audioParameters(extraParameters) {
+              var parameters = { player_provider: episode.provider };
+
+              if (extraParameters) {
+                Object.keys(extraParameters).forEach(function (key) {
+                  parameters[key] = extraParameters[key];
+                });
+              }
+
+              return parameters;
+            }
 
             window.setInterval(function () {
               if (polling) return;
@@ -2068,10 +2082,48 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                   if (!initialized) {
                     initialized = true;
                     if (playing) {
-                      sendPlaybackEvent('play', episode, position, duration, 'audio');
+                      sendPlaybackEvent(
+                        'play',
+                        episode,
+                        position,
+                        duration,
+                        'audio',
+                        audioParameters()
+                      );
                     }
                   } else if (playing !== previousPlaying) {
-                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, position, duration, 'audio');
+                    var numericPosition = Number(position) || 0;
+                    var numericDuration = Number(duration) || 0;
+                    var ended =
+                      !playing &&
+                      previousPlaying &&
+                      numericDuration > 0 &&
+                      numericPosition >= numericDuration * 0.99;
+
+                    if (ended && !playbackEnded) {
+                      playbackEnded = true;
+                      sendPlaybackEvent(
+                        'ended',
+                        episode,
+                        position,
+                        duration,
+                        'audio',
+                        audioParameters({ progress_percent: 100 })
+                      );
+                    } else if (!ended) {
+                      if (playing && playbackEnded) {
+                        playbackEnded = false;
+                        completedMilestones = {};
+                      }
+                      sendPlaybackEvent(
+                        playing ? 'play' : 'pause',
+                        episode,
+                        position,
+                        duration,
+                        'audio',
+                        audioParameters()
+                      );
+                    }
                   }
 
                   previousPlaying = playing;
@@ -2089,7 +2141,7 @@ const renderPlaybackTracking = (episodes, countryCode) => {
                         position,
                         duration,
                         'audio',
-                        { progress_percent: milestone }
+                        audioParameters({ progress_percent: milestone })
                       );
                     });
                   }
@@ -2099,9 +2151,16 @@ const renderPlaybackTracking = (episodes, countryCode) => {
 
                 if (positionRequested === false) {
                   if (!initialized && playing) {
-                    sendPlaybackEvent('play', episode, 0, 0, 'audio');
+                    sendPlaybackEvent('play', episode, 0, 0, 'audio', audioParameters());
                   } else if (initialized && playing !== previousPlaying) {
-                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, 0, 0, 'audio');
+                    sendPlaybackEvent(
+                      playing ? 'play' : 'pause',
+                      episode,
+                      0,
+                      0,
+                      'audio',
+                      audioParameters()
+                    );
                   }
 
                   initialized = true;
@@ -4904,7 +4963,8 @@ const renderPage = (
   ${renderHead({
     title,
     description: activeCategory?.description ?? podcast.description,
-    facebookPixelId: analytics.facebookPixelId
+    facebookPixelId: analytics.facebookPixelId,
+    extraHead: '<meta name="msvalidate.01" content="2C1F3DCBA6D63B5423690DD0F356E1A1" />'
   })}
   <body>
     <div class="site-shell">

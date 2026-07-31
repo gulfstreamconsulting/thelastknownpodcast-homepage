@@ -39,7 +39,7 @@ GET /api/episodes/:slug
 
 During local development, use `http://localhost:8787/api/podcast`.
 
-`/api/podcast` remains the full catalog endpoint and now includes `screens.home` for clients that want one bootstrap payload. `/api/home` returns a focused native-screen payload for the homepage, including the hero, latest episode, generated categories, paginated archive, and section metadata. `/api/episodes/:slug` returns a native-screen payload for an episode detail page, including hero/player data, section navigation, optional hosted or YouTube video, case locations, materials, companion article markdown, transcript paragraphs, and related episodes.
+`/api/podcast` remains the full catalog endpoint and includes `screens.home` for clients that want one bootstrap payload. `/api/home` returns a focused native-screen payload for the homepage, including the hero, latest episode, generated categories, paginated archive, and section metadata. `/api/episodes/:slug` returns a native-screen payload for an episode detail page, including hero/player data, section navigation, optional hosted or YouTube video, case locations, materials, companion article markdown, transcript paragraphs, and related episodes. API version 1.2 identifies Spotify as the listening provider: serialized episodes include `spotifyUrl`, while `player` includes Spotify `provider`, `resource`, `url`, and `embedUrl` values.
 
 ## Playback Analytics
 
@@ -67,7 +67,7 @@ Set the admin password as a Worker secret:
 npx wrangler secret put ADMIN_PASSWORD
 ```
 
-The username defaults to `admin`. To use a different username, set `ADMIN_USERNAME` as a Worker variable or secret. For local development, add both values to `.dev.vars`:
+The username comes from the `ADMIN_USERNAME` variable in `wrangler.jsonc`, and the password comes from the required `ADMIN_PASSWORD` Worker secret. To use a different username, update the Wrangler variable. For local development, add both values to `.dev.vars`:
 
 ```dotenv
 ADMIN_USERNAME=admin

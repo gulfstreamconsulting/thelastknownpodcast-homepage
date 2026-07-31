@@ -12,6 +12,10 @@ export const podcast = {
     episodeLimit: 50,
     cacheSeconds: 300
   },
+  spotify: {
+    showId: "4xQgDo7HrshInQEzjhkiq1",
+    showUrl: "https://open.spotify.com/show/4xQgDo7HrshInQEzjhkiq1"
+  },
   episodeMedia: {
     // Add supplemental media by Spreaker episode slug:
     // "brian-shaffer-the-man-who-never-left-the-bar": [
@@ -42,7 +46,7 @@ export const podcast = {
     },
     {
       label: "Spotify",
-      href: "#"
+      href: "https://open.spotify.com/show/4xQgDo7HrshInQEzjhkiq1"
     },
     {
       label: "YouTube",

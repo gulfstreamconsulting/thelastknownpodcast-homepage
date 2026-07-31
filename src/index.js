@@ -795,15 +795,14 @@ const parseBasicAuth = (request) => {
 };
 
 const isAdmin = (request, env) => {
-  if (!env.ADMIN_PASSWORD) {
+  if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD) {
     return false;
   }
 
   const credentials = parseBasicAuth(request);
-  const expectedUsername = env.ADMIN_USERNAME || "admin";
 
   return (
-    credentials?.username === expectedUsername &&
+    credentials?.username === env.ADMIN_USERNAME &&
     credentials?.password === env.ADMIN_PASSWORD
   );
 };
@@ -908,30 +907,35 @@ const getCountryCode = (request) => {
   return /^[A-Z]{2}$/.test(country) ? country : "XX";
 };
 
-const notifyEpisodeView = (env, request, episode, expectedMethod = "GET") => {
+const notifyPageView = (env, request, pageUrl, episode = null) => {
   if (!env.DISCORD_WEBHOOK_URL) {
     return Promise.resolve();
   }
 
-  if (isLikelyBotRequest(request, expectedMethod)) {
+  if (isLikelyBotRequest(request, "POST")) {
     return Promise.resolve();
   }
 
-  const url = new URL(episodePath(episode), request.url);
+  const url = new URL(pageUrl);
   const client = getClientInfo(request);
+  const pageLabel = episode?.title ?? (url.pathname === "/" ? "Home page" : url.pathname);
   const payload = {
     username: podcast.name,
-    content: `Episode detail page viewed: ${episode.title}`,
+    content: episode ? `Episode detail page viewed: ${episode.title}` : `Page viewed: ${pageLabel}`,
     allowed_mentions: { parse: [] },
     embeds: [
       {
-        title: episode.title,
+        title: pageLabel,
         url: url.href,
-        description: episode.summary,
-        thumbnail: { url: episode.image },
+        ...(episode?.summary ? { description: episode.summary } : {}),
+        ...(episode?.image ? { thumbnail: { url: episode.image } } : {}),
         fields: [
-          { name: "Published", value: episode.publishedAt, inline: true },
-          { name: "Episode ID", value: episode.id, inline: true },
+          ...(episode
+            ? [
+                { name: "Published", value: fallbackText(episode.publishedAt), inline: true },
+                { name: "Episode ID", value: fallbackText(episode.id), inline: true }
+              ]
+            : [{ name: "Page", value: limitField(url.pathname + url.search, 900), inline: false }]),
           { name: "Device", value: client.device, inline: true },
           { name: "Country", value: fallbackText(client.country), inline: true },
           { name: "Region", value: fallbackText(client.region), inline: true },
@@ -1043,11 +1047,13 @@ const serializeEpisode = (episode, origin) => ({
   publishedAt: episode.publishedDate,
   publishedAtDisplay: episode.publishedAt,
   detailPageUrl: absoluteUrl(episodePath(episode), origin),
-  spreakerUrl: episode.spreakerUrl,
+  spotifyUrl: podcast.spotify.showUrl,
   artworkUrl: absoluteUrl(episode.image, origin),
   player: {
-    provider: "spreaker",
-    resource: episode.spreakerResource
+    provider: "spotify",
+    resource: `spotify:show:${podcast.spotify.showId}`,
+    url: podcast.spotify.showUrl,
+    embedUrl: `https://open.spotify.com/embed/show/${podcast.spotify.showId}`
   },
   transcript: episode.transcript
     ? {
@@ -1165,7 +1171,7 @@ const jsonResponse = (
   });
 
 const renderPodcastApi = (episodes, origin) => ({
-  apiVersion: "1.1",
+  apiVersion: "1.2",
   podcast: {
     name: podcast.name,
     tagline: podcast.tagline,
@@ -1300,10 +1306,10 @@ const renderEpisodeDetailApi = (episode, episodes, origin) => {
       artworkUrl: serializedEpisode.artworkUrl,
       actions: [
         {
-          id: "listen-spreaker",
-          label: "Listen on Spreaker",
+          id: "listen-spotify",
+          label: "Listen on Spotify",
           type: "external",
-          url: episode.href
+          url: podcast.spotify.showUrl
         },
         {
           id: "support",
@@ -2648,14 +2654,15 @@ const renderEpisodeJumpNavTracking = (episode, countryCode) => `
     })();
   </script>`;
 
-const renderEpisodeViewNotification = (episode) => `
+const renderPageViewNotification = () => `
   <script>
     (function () {
-      var endpoint = ${safeJson(`/analytics/episode-view/${episode.slug}`)};
-
       window.addEventListener('load', function () {
         window.setTimeout(function () {
           if (document.visibilityState !== 'visible') return;
+
+          var viewedPath = (window.location.pathname + window.location.search).slice(0, 900);
+          var endpoint = '/analytics/page-view?path=' + encodeURIComponent(viewedPath);
 
           fetch(endpoint, {
             method: 'POST',
@@ -4893,6 +4900,7 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
       </article>
       ${renderFooter()}
     </main>
+    ${renderPageViewNotification()}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
@@ -4998,6 +5006,7 @@ const renderPage = (
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
+    ${renderPageViewNotification()}
     ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
@@ -5074,7 +5083,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     </main>
 
     <script async src="https://widget.spreaker.com/widgets.js"></script>
-    ${renderEpisodeViewNotification(episode)}
+    ${renderPageViewNotification()}
     ${renderPlaybackTracking([episode], analytics.countryCode)}
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
@@ -5132,6 +5141,7 @@ const renderSearchPage = (query, results, analytics = {}) => {
       </section>
       ${renderFooter()}
     </main>
+    ${renderPageViewNotification()}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
@@ -5478,6 +5488,7 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
         });
       })();
     </script>
+    ${renderPageViewNotification()}
   </body>
 </html>`;
 };
@@ -5557,9 +5568,9 @@ const serveAttachment = async (request, env, pathname) => {
 const handleAdminPage = async (request, env, url) => {
   if (!isAdmin(request, env)) {
     return adminUnauthorized(
-      env.ADMIN_PASSWORD
+      env.ADMIN_USERNAME && env.ADMIN_PASSWORD
         ? "Authentication required"
-        : "Set the ADMIN_PASSWORD Worker secret before using this tool."
+        : "Set the ADMIN_USERNAME Worker variable and ADMIN_PASSWORD Worker secret before using this tool."
     );
   }
 
@@ -6145,9 +6156,7 @@ export default {
     }
 
     try {
-      const episodeViewMatch = url.pathname.match(/^\/analytics\/episode-view\/([^/]+)\/?$/);
-
-      if (episodeViewMatch) {
+      if (url.pathname === "/analytics/page-view") {
         if (request.method !== "POST") {
           return new Response("Method not allowed", {
             status: 405,
@@ -6159,14 +6168,24 @@ export default {
           return new Response("Forbidden", { status: 403 });
         }
 
-        const episodeSlug = decodeURIComponent(episodeViewMatch[1]);
-        const pageData = await loadEpisodePageData(request, ctx, episodeSlug);
+        const viewedPath = String(url.searchParams.get("path") ?? "");
 
-        if (!pageData) {
-          return new Response("Not found", { status: 404 });
+        if (!viewedPath.startsWith("/") || viewedPath.length > 900) {
+          return new Response("Invalid page path", { status: 400 });
         }
 
-        ctx.waitUntil(notifyEpisodeView(env, request, pageData.episode, "POST"));
+        const pageUrl = new URL(viewedPath, url.origin);
+
+        if (pageUrl.origin !== url.origin) {
+          return new Response("Invalid page origin", { status: 400 });
+        }
+
+        const episodeSlug = episodeSlugFromPath(pageUrl.pathname);
+        const pageData = episodeSlug
+          ? await loadEpisodePageData(request, ctx, episodeSlug)
+          : null;
+
+        ctx.waitUntil(notifyPageView(env, request, pageUrl, pageData?.episode));
         return new Response(null, { status: 204 });
       }
 
@@ -6185,7 +6204,7 @@ export default {
 
           return jsonResponse(
             {
-              apiVersion: "1.1",
+              apiVersion: "1.2",
               screen: renderHomeApi(episodes, url.origin, {
                 selectedCategory,
                 requestedPage
@@ -6221,7 +6240,7 @@ export default {
 
           return jsonResponse(
             {
-              apiVersion: "1.1",
+              apiVersion: "1.2",
               screen: renderEpisodeDetailApi(pageData.episode, pageData.episodes, url.origin),
               meta: {
                 generatedAt: new Date().toISOString()

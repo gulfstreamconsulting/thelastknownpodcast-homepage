@@ -1,18 +1,18 @@
 # The Last Known Podcast
 
-A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the Spreaker episode API.
+A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the Spotify for Creators RSS feed.
 
-The dynamic `/sitemap.xml` includes the homepage, static pages, archive pagination, generated category archive pages, and every current Spreaker episode page. New episodes are added automatically.
+The dynamic `/sitemap.xml` includes the homepage, static pages, archive pagination, generated category archive pages, and every current episode page. New episodes are added automatically.
 
-The sitewide search form uses `/search?q=...` to search the titles and descriptions of all current Spreaker episodes.
+The sitewide search form uses `/search?q=...` to search the titles and descriptions of all current episodes.
 
-Homepage categories are generated automatically from current Spreaker episode titles and descriptions. Category links filter the episode archive with `/?category=...`.
+Homepage categories are generated automatically from current episode titles and descriptions. Category links filter the episode archive with `/?category=...`.
 
-When Spreaker provides an episode transcript, the Worker fetches it and embeds the full text in the server-rendered episode page so visitors and search engines can read it.
+When the RSS feed provides an episode transcript, the Worker fetches it and embeds the full text in the server-rendered episode page so visitors and search engines can read it.
 
 ## Edit Site Config
 
-Update `src/podcast.config.js` to change the show copy, Spreaker show ID, platform links, email address, Google Analytics ID, and API cache duration.
+Update `src/podcast.config.js` to change the show copy, Spotify RSS feed, platform links, email address, Google Analytics ID, and API cache duration.
 
 Placeholder links use `"#"` for Apple Podcasts, Spotify, and YouTube. Replace those with the real podcast URLs when they are available.
 
@@ -43,7 +43,7 @@ During local development, use `http://localhost:8787/api/podcast`.
 
 ## Playback Analytics
 
-The Spreaker audio player and YouTube video overview player report play, pause, ended, and milestone transitions to Google Analytics and Meta Pixel with country-specific event names such as `audio_play_US`, `video_pause_GB`, and `video_progress_50_US`. Event parameters include the episode ID, title, country code, media type, playback position, and duration.
+The audio player and YouTube video overview player report play, pause, ended, and milestone transitions to Google Analytics and Meta Pixel with country-specific event names such as `audio_play_US`, `video_pause_GB`, and `video_progress_50_US`. Event parameters include the episode ID, title, country code, media type, playback position, and duration.
 
 Google Analytics uses the configured measurement ID in `src/podcast.config.js`. To enable the matching Facebook custom events, set the Meta Pixel ID as a Worker secret or variable:
 

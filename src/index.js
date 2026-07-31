@@ -18,11 +18,10 @@ const escapeXml = (value) =>
 
 const safeJson = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
 
-const SPREAKER_API_BASE = "https://api.spreaker.com/v2";
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_BYTES = 500 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
-const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data";
+const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data-v2";
 const EPISODES_PER_PAGE = 9;
 const ADS_TXT_REDIRECT_URL = "https://srv.adstxtmanager.com/19390/thelastknownpodcast.com";
 const DIRECT_SUPPORT_URL = "https://omg10.com/4/11230976";
@@ -99,70 +98,115 @@ const formatStaticPageSitemapDate = (value) => {
   return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
 };
 
-const fetchSpreakerJson = async (path) => {
-  const apiUrl = path.startsWith("http") ? path : `${SPREAKER_API_BASE}${path}`;
-  const response = await fetch(apiUrl, {
+const decodeXml = (value = "") =>
+  String(value)
+    .replace(/^<!\[CDATA\[|\]\]>$/g, "")
+    .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([\da-f]+);/gi, (_match, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replaceAll("&nbsp;", " ")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">");
+
+const xmlElement = (xml, tag) => {
+  const match = String(xml).match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"));
+  return match ? decodeXml(match[1].trim()) : "";
+};
+
+const xmlAttribute = (xml, tag, attribute) => {
+  const match = String(xml).match(new RegExp(`<${tag}\\b[^>]*\\b${attribute}=(?:"([^"]*)"|'([^']*)')[^>]*>`, "i"));
+  return decodeXml(match?.[1] ?? match?.[2] ?? "");
+};
+
+const slugify = (value) =>
+  normalizeSearchText(value).replaceAll(" ", "-") || "episode";
+
+const formatRssDate = (value, display = false) => {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return display ? "Episode" : null;
+  }
+
+  return display
+    ? new Intl.DateTimeFormat("en-US", { month: "long", day: "numeric", year: "numeric" }).format(date)
+    : date.toISOString().slice(0, 10);
+};
+
+const fetchPodcastFeed = async () => {
+  const response = await fetch(podcast.feed.url, {
     headers: {
-      accept: "application/json",
+      accept: "application/rss+xml, application/xml, text/xml",
       "user-agent": "The Last Known Podcast Website"
     },
     cf: {
-      cacheTtl: podcast.spreaker.cacheSeconds,
+      cacheTtl: podcast.feed.cacheSeconds,
       cacheEverything: true
     }
   });
 
   if (!response.ok) {
-    throw new Error(`Spreaker API returned ${response.status}`);
+    throw new Error(`Spotify RSS feed returned ${response.status}`);
   }
 
-  return response.json();
+  return response.text();
 };
 
-const selectTranscript = (episode) => {
-  const transcripts = Array.isArray(episode.transcripts_generated)
-    ? episode.transcripts_generated
-    : [];
-  const preferredTypes = ["text/plain", "text/vtt", "application/x-subrip"];
-
-  for (const transcriptType of preferredTypes) {
-    const transcript = transcripts.find((item) => item.transcript_type === transcriptType);
-
-    if (transcript?.transcript_url) {
-      return {
-        url: transcript.transcript_url,
-        type: transcript.transcript_type
-      };
+const fetchSpotifyEpisodeLinks = async () => {
+  const response = await fetch(podcast.spotify.showUrl, {
+    headers: {
+      accept: "text/html",
+      "user-agent": "Mozilla/5.0 (compatible; The Last Known Podcast Website)"
+    },
+    cf: {
+      cacheTtl: podcast.feed.cacheSeconds,
+      cacheEverything: true
     }
+  });
+
+  if (!response.ok) {
+    return new Map();
   }
 
-  return episode.transcript_url
-    ? {
-        url: episode.transcript_url,
-        type: episode.transcript_type || "text/plain"
-      }
-    : null;
+  const html = await response.text();
+  const links = new Map();
+  const episodePattern = /<a href="\/episode\/([A-Za-z0-9]+)"[^>]*><h4[^>]*>([\s\S]*?)<\/h4>/g;
+
+  for (const match of html.matchAll(episodePattern)) {
+    const title = decodeXml(match[2].replace(/<[^>]*>/g, "").trim());
+    links.set(slugify(title), `https://open.spotify.com/episode/${match[1]}`);
+  }
+
+  return links;
 };
 
-const normalizeEpisode = (episode) => {
-  const description = stripHtml(episode.description_html ?? episode.description ?? "");
-  const detail = description || `${episode.title} from ${podcast.name}.`;
+const normalizeFeedEpisode = (item, channelImage) => {
+  const title = xmlElement(item, "title");
+  const descriptionHtml = xmlElement(item, "description") || xmlElement(item, "content:encoded");
+  const description = stripHtml(descriptionHtml);
+  const detail = description || `${title} from ${podcast.name}.`;
   const summary = truncateText(detail);
+  const guid = xmlElement(item, "guid");
+  const href = xmlElement(item, "link");
+  const published = xmlElement(item, "pubDate");
+  const transcriptUrl = xmlAttribute(item, "podcast:transcript", "url");
+  const transcriptType = xmlAttribute(item, "podcast:transcript", "type") || "text/plain";
 
   return {
-    id: String(episode.episode_id),
-    slug: episode.slug || String(episode.episode_id),
+    id: guid || href || slugify(title),
+    slug: slugify(title),
     status: "Episode",
-    title: episode.title,
+    title,
     summary,
     detail,
-    publishedAt: formatPublishedDate(episode.published_at),
-    publishedDate: formatSitemapDate(episode.published_at),
-    href: episode.site_url,
-    spreakerUrl: episode.site_url,
-    spreakerResource: `episode_id=${episode.episode_id}`,
-    transcript: selectTranscript(episode),
-    image: episode.image_original_url ?? episode.image_url ?? podcast.heroImage,
+    publishedAt: formatRssDate(published, true),
+    publishedDate: formatRssDate(published),
+    href,
+    audioUrl: xmlAttribute(item, "enclosure", "url"),
+    transcript: transcriptUrl ? { url: transcriptUrl, type: transcriptType } : null,
+    image: xmlAttribute(item, "itunes:image", "href") || channelImage || podcast.heroImage,
     body: description
       .split(/\n+/)
       .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
@@ -171,22 +215,35 @@ const normalizeEpisode = (episode) => {
 };
 
 const loadEpisodes = async () => {
-  const limit = podcast.spreaker.episodeLimit ?? 50;
-  let nextUrl = `/shows/${podcast.spreaker.showId}/episodes?limit=${encodeURIComponent(limit)}`;
-  const episodes = [];
+  const [xml, spotifyEpisodeLinks] = await Promise.all([
+    fetchPodcastFeed(),
+    fetchSpotifyEpisodeLinks()
+  ]);
+  const channelImage = xmlAttribute(xml.split("<item>")[0], "itunes:image", "href");
+  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].map((match) => match[1]);
+  const limit = podcast.feed.episodeLimit ?? 50;
+  const feedEpisodes = items.map((item) => normalizeFeedEpisode(item, channelImage));
+  const videoOverviewSuffix = /\s*-\s*video overview\s*$/i;
+  const videoOverviews = new Map(
+    feedEpisodes
+      .filter((episode) => videoOverviewSuffix.test(episode.title))
+      .map((episode) => [slugify(episode.title.replace(videoOverviewSuffix, "")), episode])
+  );
 
-  while (nextUrl) {
-    const data = await fetchSpreakerJson(nextUrl);
-    episodes.push(...(data.response?.items ?? []));
-    nextUrl = data.response?.next_url ?? null;
-  }
-
-  return episodes.map(normalizeEpisode);
-};
-
-const loadEpisodeDetails = async (episodeId) => {
-  const data = await fetchSpreakerJson(`/episodes/${episodeId}`);
-  return normalizeEpisode(data.response.episode);
+  return feedEpisodes
+    .filter((episode) => !videoOverviewSuffix.test(episode.title))
+    .filter((episode) => spotifyEpisodeLinks.has(slugify(episode.title)))
+    .slice(0, limit)
+    .map((episode) => {
+      const videoOverview = videoOverviews.get(slugify(episode.title));
+      return {
+        ...episode,
+        spotifyUrl: spotifyEpisodeLinks.get(slugify(episode.title)),
+        feedVideoUrl: videoOverview
+          ? spotifyEpisodeLinks.get(slugify(videoOverview.title)) || ""
+          : ""
+      };
+    });
 };
 
 const stripTranscriptCues = (value, type) => {
@@ -250,7 +307,7 @@ const loadEpisodeTranscript = async (episode) => {
 
   const transcriptUrl = new URL(episode.transcript.url);
 
-  if (transcriptUrl.protocol !== "https:" || transcriptUrl.hostname !== "transcription.spreaker.com") {
+  if (transcriptUrl.protocol !== "https:") {
     return null;
   }
 
@@ -260,13 +317,13 @@ const loadEpisodeTranscript = async (episode) => {
       "user-agent": "The Last Known Podcast Website"
     },
     cf: {
-      cacheTtl: podcast.spreaker.cacheSeconds,
+      cacheTtl: podcast.feed.cacheSeconds,
       cacheEverything: true
     }
   });
 
   if (!response.ok) {
-    console.error(`Spreaker transcript returned ${response.status} for episode ${episode.id}`);
+    console.error(`Transcript source returned ${response.status} for episode ${episode.id}`);
     return null;
   }
 
@@ -307,13 +364,7 @@ const loadEpisodePageData = async (request, ctx, episodeSlug) => {
     return null;
   }
 
-  let episode = listEpisode;
-
-  try {
-    episode = await loadEpisodeDetails(listEpisode.id);
-  } catch (error) {
-    console.error(`Unable to load details for episode ${listEpisode.id}`, error);
-  }
+  const episode = listEpisode;
 
   episode.transcriptContent = await loadEpisodeTranscript(episode);
 
@@ -321,7 +372,7 @@ const loadEpisodePageData = async (request, ctx, episodeSlug) => {
   const response = new Response(JSON.stringify(data), {
     headers: {
       "content-type": "application/json;charset=UTF-8",
-      "cache-control": `public, max-age=${podcast.spreaker.cacheSeconds}`
+      "cache-control": `public, max-age=${podcast.feed.cacheSeconds}`
     }
   });
   ctx.waitUntil(cache.put(cacheRequest, response));
@@ -517,6 +568,20 @@ const saveEpisodeContent = (env, episodeId, content) =>
 const loadAttachments = async (env, episodeId) =>
   (await loadEpisodeContent(env, episodeId)).attachments;
 
+const selectVideoUrl = (configuredUrl, spotifyEpisodeUrl) => {
+  try {
+    const hostname = new URL(configuredUrl).hostname.toLowerCase();
+
+    if (hostname === "creators.spotify.com" || hostname === "podcasters.spotify.com") {
+      return spotifyEpisodeUrl || "";
+    }
+  } catch {
+    // Empty and relative values fall through to the normal fallback.
+  }
+
+  return configuredUrl || spotifyEpisodeUrl || "";
+};
+
 const loadApiEpisodeCatalog = async (env) => {
   const episodes = await loadEpisodes();
 
@@ -525,7 +590,7 @@ const loadApiEpisodeCatalog = async (env) => {
       const content = await loadEpisodeContent(env, episode.id);
       episode.attachments = content.attachments;
       episode.article = content.article;
-      episode.videoUrl = content.videoUrl;
+      episode.videoUrl = selectVideoUrl(content.videoUrl, episode.feedVideoUrl);
       episode.videoAsset = content.videoAsset;
       episode.mapLocations = content.mapLocations;
     })
@@ -545,7 +610,7 @@ const loadApiEpisodeDetail = async (request, ctx, env, episodeSlug) => {
   const content = await loadEpisodeContent(env, episode.id);
   episode.attachments = content.attachments;
   episode.article = content.article;
-  episode.videoUrl = content.videoUrl;
+  episode.videoUrl = selectVideoUrl(content.videoUrl, episode.feedVideoUrl);
   episode.videoAsset = content.videoAsset;
   episode.mapLocations = content.mapLocations;
 
@@ -1035,6 +1100,15 @@ const serializeVideo = (episode, origin) => {
     };
   }
 
+  if (episode.videoUrl) {
+    return {
+      provider: "spotify",
+      url: episode.videoUrl,
+      embedUrl: episode.videoUrl,
+      posterUrl: absoluteUrl(episode.image, origin)
+    };
+  }
+
   return null;
 };
 
@@ -1047,13 +1121,13 @@ const serializeEpisode = (episode, origin) => ({
   publishedAt: episode.publishedDate,
   publishedAtDisplay: episode.publishedAt,
   detailPageUrl: absoluteUrl(episodePath(episode), origin),
-  spotifyUrl: podcast.spotify.showUrl,
+  spotifyUrl: episode.spotifyUrl,
   artworkUrl: absoluteUrl(episode.image, origin),
   player: {
     provider: "spotify",
-    resource: `spotify:show:${podcast.spotify.showId}`,
-    url: podcast.spotify.showUrl,
-    embedUrl: `https://open.spotify.com/embed/show/${podcast.spotify.showId}`
+    resource: episode.id,
+    url: episode.spotifyUrl,
+    embedUrl: episode.spotifyUrl
   },
   transcript: episode.transcript
     ? {
@@ -1066,8 +1140,10 @@ const serializeEpisode = (episode, origin) => ({
   article: normalizeArticle(episode.article),
   videoUrl: episode.videoAsset
     ? absoluteUrl(videoAssetPath(episode.id), origin)
-    : episode.videoUrl || null,
-  youtubeUrl: episode.videoUrl || null,
+    : episode.feedVideoUrl
+      ? episode.feedVideoUrl
+      : episode.videoUrl || null,
+  youtubeUrl: episode.feedVideoUrl ? null : episode.videoUrl || null,
   videoAsset: episode.videoAsset
     ? {
         filename: episode.videoAsset.filename,
@@ -1306,10 +1382,10 @@ const renderEpisodeDetailApi = (episode, episodes, origin) => {
       artworkUrl: serializedEpisode.artworkUrl,
       actions: [
         {
-          id: "listen-spotify",
-          label: "Listen on Spotify",
+          id: "play-episode",
+          label: "Play episode",
           type: "external",
-          url: podcast.spotify.showUrl
+          url: episode.spotifyUrl
         },
         {
           id: "support",
@@ -1364,7 +1440,7 @@ const renderEpisodeDetailApi = (episode, episodes, origin) => {
         ? {
             id: "transcript",
             title: `${episode.title} transcript`,
-            intro: "Transcript excerpt supplied by Spreaker.",
+            intro: "Episode transcript.",
             sourceUrl: episode.transcriptContent.sourceUrl,
             paragraphs: episode.transcriptContent.paragraphs
           }
@@ -1810,7 +1886,7 @@ const renderCategoryBrowser = (categories, selectedCategory, episodeCount) => `
     <p class="section-kicker">Explore by topic</p>
     <div class="category-heading">
       <h2>Follow the kind of case that interests you.</h2>
-      <p>Categories are generated from each episode’s title and description on Spreaker.</p>
+      <p>Categories are generated from each episode’s title and description.</p>
     </div>
     <div class="category-grid">
       <a class="category-card${selectedCategory ? "" : " active"}" href="/#cases">
@@ -1926,26 +2002,15 @@ const renderSiteHeader = ({ home = false, query = "" } = {}) => `
     ${renderSearchForm(query)}
   </header>`;
 
-const renderSpreakerPlayer = (episode) => `
+const renderAudioPlayer = (episode) => `
   <a
-    id="spreaker-player-${escapeHtml(episode.id)}"
-    class="spreaker-player"
-    href="${escapeHtml(episode.spreakerUrl)}"
-    data-resource="${escapeHtml(episode.spreakerResource)}"
-    data-width="100%"
-    data-height="200px"
-    data-theme="light"
-    data-playlist="false"
-    data-playlist-continuous="false"
-    data-chapters-image="true"
-    data-episode-image-position="right"
-    data-hide-logo="false"
-    data-hide-likes="false"
-    data-hide-comments="false"
-    data-hide-sharing="false"
-    data-hide-download="true"
-    data-title="${escapeHtml(episode.title)}"
-  >Listen to "${escapeHtml(episode.title)}" on Spreaker.</a>`;
+    id="audio-player-${escapeHtml(episode.id)}"
+    class="episode-audio-player"
+    href="${escapeHtml(episode.spotifyUrl)}"
+    target="_blank"
+    rel="noopener"
+    aria-label="Play ${escapeHtml(episode.title)} on Spotify"
+  >Play on Spotify</a>`;
 
 const renderAdsterraNativeAd = (placement = "episode") => {
   const adMarkup = `<script async="async" data-cfasync="false" src="https://pl28638835.effectivecpmnetwork.com/8fee276f31bbe673bacbd151f123599f/invoke.js"></script>
@@ -1970,7 +2035,7 @@ const renderAdsterraBannerAd = (placement = "page") =>
 
 const renderPlaybackTracking = (episodes, countryCode) => {
   const audioPlayers = episodes.map((episode) => ({
-    elementId: `spreaker-player-${episode.id}`,
+    elementId: `audio-player-${episode.id}`,
     episodeId: episode.id,
     episodeTitle: episode.title
   }));
@@ -2041,85 +2106,26 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           }
         }
 
-        function initializeAudioTracking(attempt) {
-          if (!window.SP || typeof window.SP.getWidget !== 'function') {
-            if (attempt < 20) {
-              window.setTimeout(function () {
-                initializeAudioTracking(attempt + 1);
-              }, 500);
-            }
-            return;
-          }
-
+        function initializeAudioTracking() {
           audioPlayers.forEach(function (episode) {
             var element = document.getElementById(episode.elementId);
             if (!element || element.dataset.analyticsInitialized === 'true') return;
-
-            var widget = window.SP.getWidget(episode.elementId);
-            if (!widget || typeof widget.getState !== 'function') return;
-
             element.dataset.analyticsInitialized = 'true';
-            var initialized = false;
-            var previousPlaying = false;
-            var polling = false;
             var completedMilestones = {};
-
-            window.setInterval(function () {
-              if (polling) return;
-              polling = true;
-
-              var stateRequested = widget.getState(function (_currentEpisode, _state, isPlaying) {
-                var playing = Boolean(isPlaying);
-                var positionRequested = widget.getPosition(function (position, _progress, duration) {
-                  if (!initialized) {
-                    initialized = true;
-                    if (playing) {
-                      sendPlaybackEvent('play', episode, position, duration, 'audio');
-                    }
-                  } else if (playing !== previousPlaying) {
-                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, position, duration, 'audio');
-                  }
-
-                  previousPlaying = playing;
-
-                  if (playing && Number(duration) > 0) {
-                    var progress = (Number(position) / Number(duration)) * 100;
-
-                    milestones.forEach(function (milestone) {
-                      if (completedMilestones[milestone] || progress < milestone) return;
-
-                      completedMilestones[milestone] = true;
-                      sendPlaybackEvent(
-                        'progress_' + milestone,
-                        episode,
-                        position,
-                        duration,
-                        'audio',
-                        { progress_percent: milestone }
-                      );
-                    });
-                  }
-
-                  polling = false;
-                });
-
-                if (positionRequested === false) {
-                  if (!initialized && playing) {
-                    sendPlaybackEvent('play', episode, 0, 0, 'audio');
-                  } else if (initialized && playing !== previousPlaying) {
-                    sendPlaybackEvent(playing ? 'play' : 'pause', episode, 0, 0, 'audio');
-                  }
-
-                  initialized = true;
-                  previousPlaying = playing;
-                  polling = false;
-                }
+            ['play', 'pause', 'ended'].forEach(function (type) {
+              element.addEventListener(type, function () {
+                sendPlaybackEvent(type, episode, element.currentTime * 1000, element.duration * 1000, 'audio');
               });
-
-              if (stateRequested === false) {
-                polling = false;
-              }
-            }, 1000);
+            });
+            element.addEventListener('timeupdate', function () {
+              if (!Number(element.duration)) return;
+              var progress = (element.currentTime / element.duration) * 100;
+              milestones.forEach(function (milestone) {
+                if (completedMilestones[milestone] || progress < milestone) return;
+                completedMilestones[milestone] = true;
+                sendPlaybackEvent('progress_' + milestone, episode, element.currentTime * 1000, element.duration * 1000, 'audio', { progress_percent: milestone });
+              });
+            });
           });
         }
 
@@ -2900,8 +2906,9 @@ const renderAttachments = (episode) => {
 const renderVideoOverview = (episode) => {
   const hostedVideo = normalizeVideoAsset(episode.videoAsset);
   const video = parseVideoUrl(episode.videoUrl);
+  const externalVideoUrl = !hostedVideo && !video ? episode.videoUrl : "";
 
-  if (!hostedVideo && !video) {
+  if (!hostedVideo && !video && !externalVideoUrl) {
     return "";
   }
 
@@ -2920,7 +2927,8 @@ const renderVideoOverview = (episode) => {
           )}">
           <a href="${escapeHtml(videoAssetPath(episode.id))}" download>Download video</a>
         </video>`
-    : `<iframe
+    : video
+      ? `<iframe
           id="overview-video-${escapeHtml(episode.id)}"
           class="overview-video-player"
           src="${escapeHtml(video.embedUrl)}"
@@ -2929,7 +2937,23 @@ const renderVideoOverview = (episode) => {
           allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
           allowfullscreen
           referrerpolicy="strict-origin-when-cross-origin"
-        ></iframe>`;
+        ></iframe>`
+      : `<a
+          id="overview-video-${escapeHtml(episode.id)}"
+          class="spotify-video-overview-link"
+          href="${escapeHtml(externalVideoUrl)}"
+          target="_blank"
+          rel="noopener"
+          aria-label="Watch ${escapeHtml(episode.title)} video overview on Spotify"
+        >
+          <img
+            class="overview-video-player"
+            src="${escapeHtml(episode.image)}"
+            alt="${escapeHtml(`${episode.title} video overview`)}"
+            loading="lazy"
+          >
+          <span class="button">Watch the video overview on Spotify</span>
+        </a>`;
 
   return `
     <section class="episode-video" id="video" aria-labelledby="video-overview-title">
@@ -3248,7 +3272,7 @@ const renderTranscript = (episode) => {
     <section class="episode-transcript" id="transcript" aria-labelledby="transcript-title">
       <p class="section-kicker">Full text</p>
       <h2 id="transcript-title">${escapeHtml(episode.title)} transcript</h2>
-      <p class="transcript-intro">Transcript excerpt supplied by Spreaker.</p>
+      <p class="transcript-intro">Episode transcript.</p>
       <div class="transcript-preview">
         ${transcriptPreview}
       </div>
@@ -3264,7 +3288,7 @@ const renderTranscript = (episode) => {
       }
       <a class="transcript-source" href="${escapeHtml(
         episode.transcriptContent.sourceUrl
-      )}" target="_blank" rel="noopener">View original transcript on Spreaker</a>
+      )}" target="_blank" rel="noopener">View original transcript</a>
       <a class="back-to-top" href="#episode-title">Back to top</a>
     </section>`;
 };
@@ -3850,6 +3874,31 @@ const styles = `
     height: 100%;
     border: 0;
     background: #101215;
+  }
+
+  .spotify-video-overview-link {
+    position: absolute;
+    inset: 0;
+    display: block;
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .spotify-video-overview-link img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    object-fit: cover;
+  }
+
+  .spotify-video-overview-link .button {
+    position: absolute;
+    left: 50%;
+    bottom: 24px;
+    z-index: 1;
+    transform: translateX(-50%);
+    white-space: nowrap;
   }
 
   .video-player-hosted {
@@ -4968,7 +5017,7 @@ const renderPage = (
           </h2>
           <p class="episode-summary">${escapeHtml(featuredEpisode.summary)}</p>
           <div class="player-wrap">
-            ${renderSpreakerPlayer(featuredEpisode)}
+            ${renderAudioPlayer(featuredEpisode)}
           </div>
         </div>
       </section>
@@ -5005,7 +5054,6 @@ const renderPage = (
       ${renderFooter()}
     </main>
 
-    <script async src="https://widget.spreaker.com/widgets.js"></script>
     ${renderPageViewNotification()}
     ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
@@ -5051,7 +5099,9 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
         <aside class="episode-play-panel" aria-label="Episode player">
           ${renderEpisodeImage(episode, "episode-meta-image")}
           <p class="section-kicker">${escapeHtml(episode.publishedAt ?? "Episode")}</p>
-          <a class="button" href="${escapeHtml(episode.href)}">Listen on Spreaker</a>
+          <a class="button" href="${escapeHtml(
+            episode.spotifyUrl
+          )}" target="_blank" rel="noopener">Play episode on Spotify</a>
           <a class="button secondary-dark" href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
           ${
             episode.transcriptContent
@@ -5059,7 +5109,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
               : ""
           }
           <div class="player-wrap">
-            ${renderSpreakerPlayer(episode)}
+            ${renderAudioPlayer(episode)}
           </div>
         </aside>
       </section>
@@ -5082,7 +5132,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
       })}
     </main>
 
-    <script async src="https://widget.spreaker.com/widgets.js"></script>
     ${renderPageViewNotification()}
     ${renderPlaybackTracking([episode], analytics.countryCode)}
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
@@ -5585,13 +5634,7 @@ const handleAdminPage = async (request, env, url) => {
     const listEpisode = episodes.find((episode) => episode.id === suggestEpisodeId);
 
     if (listEpisode) {
-      let suggestionEpisode = listEpisode;
-
-      try {
-        suggestionEpisode = await loadEpisodeDetails(listEpisode.id);
-      } catch (error) {
-        console.error(`Unable to load details for episode ${listEpisode.id}`, error);
-      }
+      const suggestionEpisode = listEpisode;
 
       suggestionEpisode.transcriptContent = await loadEpisodeTranscript(suggestionEpisode);
       locationSuggestionData = {
@@ -6130,7 +6173,7 @@ const handleDelete = async (request, env) => {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const cacheControl = `public, max-age=${podcast.spreaker.cacheSeconds}`;
+    const cacheControl = `public, max-age=${podcast.feed.cacheSeconds}`;
     const apiEpisodeMatch = url.pathname.match(/^\/api\/episodes\/([^/]+)\/?$/);
     const isApiRequest =
       url.pathname === "/api/podcast" ||
@@ -6355,7 +6398,7 @@ export default {
         const episodeContent = await loadEpisodeContent(env, episode.id);
         episode.attachments = episodeContent.attachments;
         episode.article = episodeContent.article;
-        episode.videoUrl = episodeContent.videoUrl;
+        episode.videoUrl = selectVideoUrl(episodeContent.videoUrl, episode.feedVideoUrl);
         episode.videoAsset = episodeContent.videoAsset;
         episode.mapLocations = episodeContent.mapLocations;
         return new Response(renderEpisodePage(episode, episodes, analytics), {
@@ -6404,7 +6447,7 @@ export default {
         );
       }
 
-      return new Response(`Unable to load Spreaker episodes: ${error.message}`, {
+      return new Response(`Unable to load podcast episodes: ${error.message}`, {
         status: 502,
         headers: {
           "content-type": "text/plain;charset=UTF-8",

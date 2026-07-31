@@ -7,17 +7,17 @@ export const podcast = {
   email: "info@gulfstreamsoftwareconsultingllc.com",
   heroImage: "/hero.png",
   googleAnalyticsId: "G-E33WVYGYBT",
-  spreaker: {
-    showId: "6837695",
+  feed: {
+    url: "https://anchor.fm/s/115607ab4/podcast/rss",
     episodeLimit: 50,
     cacheSeconds: 300
   },
   spotify: {
-    showId: "4xQgDo7HrshInQEzjhkiq1",
-    showUrl: "https://open.spotify.com/show/4xQgDo7HrshInQEzjhkiq1"
+    showId: "033WJ1cMKIgiOKSOHMw5WW",
+    showUrl: "https://open.spotify.com/show/033WJ1cMKIgiOKSOHMw5WW"
   },
   episodeMedia: {
-    // Add supplemental media by Spreaker episode slug:
+    // Add supplemental media by episode slug:
     // "brian-shaffer-the-man-who-never-left-the-bar": [
     //   {
     //     type: "document",
@@ -37,16 +37,12 @@ export const podcast = {
   },
   links: [
     {
-      label: "Spreaker",
-      href: "https://www.spreaker.com/podcast/the-last-known--6837695"
-    },
-    {
       label: "Apple Podcasts",
       href: "#"
     },
     {
       label: "Spotify",
-      href: "https://open.spotify.com/show/4xQgDo7HrshInQEzjhkiq1"
+      href: "https://open.spotify.com/show/033WJ1cMKIgiOKSOHMw5WW"
     },
     {
       label: "YouTube",

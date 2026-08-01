@@ -1,20 +1,24 @@
 # The Last Known Podcast
 
-A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the Spreaker episode API.
+A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the public Spotify show catalog.
 
-The dynamic `/sitemap.xml` includes the homepage, static pages, archive pagination, generated category archive pages, and every current Spreaker episode page. New episodes are added automatically.
+The dynamic `/sitemap.xml` includes the homepage, static pages, archive pagination, generated category archive pages, and every current Spotify episode page. New episodes are added automatically.
 
-The sitewide search form uses `/search?q=...` to search the titles and descriptions of all current Spreaker episodes.
+The sitewide search form uses `/search?q=...` to search the titles and descriptions of all current Spotify episodes.
 
-Homepage categories are generated automatically from current Spreaker episode titles and descriptions. Category links filter the episode archive with `/?category=...`.
+Homepage categories are generated automatically from current Spotify episode titles and descriptions. Category links filter the episode archive with `/?category=...`.
 
-When Spreaker provides an episode transcript, the Worker fetches it and embeds the full text in the server-rendered episode page so visitors and search engines can read it.
+Spotify does not expose show transcripts in the public catalog, so transcript sections appear only when transcript data is available from another configured source.
 
 ## Edit Site Config
 
-Update `src/podcast.config.js` to change the show copy, Spreaker show ID, platform links, email address, Google Analytics ID, and API cache duration.
+Update `src/podcast.config.js` to change the show copy, Spotify show URL, platform links, email address, Google Analytics ID, and catalog cache duration.
 
-Placeholder links use `"#"` for Apple Podcasts, Spotify, and YouTube. Replace those with the real podcast URLs when they are available.
+Spotify episodes whose titles use a configured `spotify.videoOverviewTitleSuffixes` or `spotify.videoOverviewTitlePrefixes` value are treated as companion videos. They are omitted from the main episode catalog and matched to the audio episode with the same base title. Public video links use the matching Spotify episode rather than an R2-uploaded video.
+
+The Spotify show request uses a short time-bucketed cache key so newly published episodes normally appear on the website within about one minute of becoming available in the public catalog. Audio and video links use public `open.spotify.com/episode/...` URLs and can open in Spotify rather than Spotify for Creators.
+
+Placeholder links use `"#"` for platforms that are not configured yet. Replace those with the real podcast URLs when they are available.
 
 ## Discord Webhook
 
@@ -39,11 +43,11 @@ GET /api/episodes/:slug
 
 During local development, use `http://localhost:8787/api/podcast`.
 
-`/api/podcast` remains the full catalog endpoint and now includes `screens.home` for clients that want one bootstrap payload. `/api/home` returns a focused native-screen payload for the homepage, including the hero, latest episode, generated categories, paginated archive, and section metadata. `/api/episodes/:slug` returns a native-screen payload for an episode detail page, including hero/player data, section navigation, optional hosted or YouTube video, case locations, materials, companion article markdown, transcript paragraphs, and related episodes.
+`/api/podcast` remains the full catalog endpoint and includes `screens.home` for clients that want one bootstrap payload. `/api/home` returns a focused native-screen payload for the homepage, including the hero, latest episode, generated categories, paginated archive, and section metadata. `/api/episodes/:slug` returns a native-screen payload for an episode detail page, including hero/player data, section navigation, optional hosted or YouTube video, case locations, materials, companion article markdown, transcript paragraphs, and related episodes. API version 1.2 exposes `spotifyUrl`, `audioUrl`, and a Spotify player descriptor on each episode.
 
 ## Playback Analytics
 
-The Spreaker audio player and YouTube video overview player report play, pause, ended, and milestone transitions to Google Analytics and Meta Pixel with country-specific event names such as `audio_play_US`, `video_pause_GB`, and `video_progress_50_US`. Event parameters include the episode ID, title, country code, media type, playback position, and duration.
+Audio playback uses Spotify's episode embed. Spotify does not expose embed playback state to the site's analytics script, so site analytics do not report play, pause, ended, or progress events for these embeds.
 
 Google Analytics uses the configured measurement ID in `src/podcast.config.js`. To enable the matching Facebook custom events, set the Meta Pixel ID as a Worker secret or variable:
 
@@ -53,7 +57,7 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 
 ## Episode Content
 
-The password-protected `/admin/content` page lets you choose one episode and save its hosted video, YouTube fallback, and several supporting files in a single submit. Uploaded videos, images, PDFs, and other supporting files are stored in Cloudflare R2. Video overviews are rendered with an R2-backed native video player when a hosted video is available, with existing YouTube links still supported as a fallback. The video import form can copy URLs that return video bytes directly; YouTube watch URLs need a downloader service before the Worker can import them. Each uploaded file has a display title and description and appears on the same page.
+The password-protected `/admin/content` page lets you manage companion articles, maps, and supporting files. Images, PDFs, and other supporting files are stored in Cloudflare R2. Public video overview links are discovered from matching Spotify episodes and do not use legacy R2 or YouTube video assets.
 
 Create the configured R2 bucket once:
 
@@ -76,9 +80,9 @@ ADMIN_PASSWORD=choose-a-long-password
 
 Uploads are limited to 25 MB. Attachment files and their metadata manifests are both stored in the `EPISODE_CONTENT` R2 binding.
 
-### Migrating YouTube videos to R2
+### Legacy YouTube-to-R2 migration
 
-The local migration script reads `/api/podcast`, finds episodes with a `youtubeUrl` and no hosted `videoAsset`, downloads each video with `yt-dlp`, and uploads it through the admin media API.
+The repository retains the old migration script for previously hosted assets. R2 video assets created by it are no longer selected by public episode pages or API video fields.
 
 Install `yt-dlp` first, then preview the work:
 

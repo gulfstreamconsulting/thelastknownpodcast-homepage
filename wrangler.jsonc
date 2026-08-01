@@ -3,6 +3,9 @@
 	"name": "the-last-known-podcast",
 	"main": "src/index.js",
 	"compatibility_date": "2026-06-03",
+	"vars": {
+		"ADMIN_USERNAME": "admin"
+	},
 	"assets": {
 		"directory": "./public",
 		"binding": "ASSETS"

@@ -71,7 +71,7 @@ Set the admin password as a Worker secret:
 npx wrangler secret put ADMIN_PASSWORD
 ```
 
-The username defaults to `admin`. To use a different username, set `ADMIN_USERNAME` as a Worker variable or secret. For local development, add both values to `.dev.vars`:
+The username comes from the `ADMIN_USERNAME` variable in `wrangler.jsonc`, and the password comes from the required `ADMIN_PASSWORD` Worker secret. To use a different username, update the Wrangler variable. For local development, add both values to `.dev.vars`:
 
 ```dotenv
 ADMIN_USERNAME=admin

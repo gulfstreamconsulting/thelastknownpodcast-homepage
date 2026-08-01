@@ -609,6 +609,20 @@ const saveEpisodeContent = (env, episodeId, content) =>
 const loadAttachments = async (env, episodeId) =>
   (await loadEpisodeContent(env, episodeId)).attachments;
 
+const selectVideoUrl = (configuredUrl, spotifyEpisodeUrl) => {
+  try {
+    const hostname = new URL(configuredUrl).hostname.toLowerCase();
+
+    if (hostname === "creators.spotify.com" || hostname === "podcasters.spotify.com") {
+      return spotifyEpisodeUrl || "";
+    }
+  } catch {
+    // Empty and relative values fall through to the normal fallback.
+  }
+
+  return configuredUrl || spotifyEpisodeUrl || "";
+};
+
 const loadApiEpisodeCatalog = async (env) => {
   const episodes = await loadEpisodes();
 
@@ -617,7 +631,7 @@ const loadApiEpisodeCatalog = async (env) => {
       const content = await loadEpisodeContent(env, episode.id);
       episode.attachments = content.attachments;
       episode.article = content.article;
-      episode.videoUrl = content.videoUrl;
+      episode.videoUrl = selectVideoUrl(content.videoUrl, episode.feedVideoUrl);
       episode.videoAsset = content.videoAsset;
       episode.mapLocations = content.mapLocations;
     })
@@ -637,7 +651,7 @@ const loadApiEpisodeDetail = async (request, ctx, env, episodeSlug) => {
   const content = await loadEpisodeContent(env, episode.id);
   episode.attachments = content.attachments;
   episode.article = content.article;
-  episode.videoUrl = content.videoUrl;
+  episode.videoUrl = selectVideoUrl(content.videoUrl, episode.feedVideoUrl);
   episode.videoAsset = content.videoAsset;
   episode.mapLocations = content.mapLocations;
 
@@ -887,15 +901,14 @@ const parseBasicAuth = (request) => {
 };
 
 const isAdmin = (request, env) => {
-  if (!env.ADMIN_PASSWORD) {
+  if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD) {
     return false;
   }
 
   const credentials = parseBasicAuth(request);
-  const expectedUsername = env.ADMIN_USERNAME || "admin";
 
   return (
-    credentials?.username === expectedUsername &&
+    credentials?.username === env.ADMIN_USERNAME &&
     credentials?.password === env.ADMIN_PASSWORD
   );
 };
@@ -946,8 +959,8 @@ const detectDevice = (userAgent = "") => {
   return "Desktop";
 };
 
-const isLikelyBotRequest = (request) => {
-  if (request.method !== "GET") {
+const isLikelyBotRequest = (request, expectedMethod = "GET") => {
+  if (request.method !== expectedMethod) {
     return true;
   }
 
@@ -1000,30 +1013,35 @@ const getCountryCode = (request) => {
   return /^[A-Z]{2}$/.test(country) ? country : "XX";
 };
 
-const notifyEpisodeView = (env, request, episode) => {
+const notifyPageView = (env, request, pageUrl, episode = null) => {
   if (!env.DISCORD_WEBHOOK_URL) {
     return Promise.resolve();
   }
 
-  if (isLikelyBotRequest(request)) {
+  if (isLikelyBotRequest(request, "POST")) {
     return Promise.resolve();
   }
 
-  const url = new URL(request.url);
+  const url = new URL(pageUrl);
   const client = getClientInfo(request);
+  const pageLabel = episode?.title ?? (url.pathname === "/" ? "Home page" : url.pathname);
   const payload = {
     username: podcast.name,
-    content: `Episode detail page viewed: ${episode.title}`,
+    content: episode ? `Episode detail page viewed: ${episode.title}` : `Page viewed: ${pageLabel}`,
     allowed_mentions: { parse: [] },
     embeds: [
       {
-        title: episode.title,
+        title: pageLabel,
         url: url.href,
-        description: episode.summary,
-        thumbnail: { url: episode.image },
+        ...(episode?.summary ? { description: episode.summary } : {}),
+        ...(episode?.image ? { thumbnail: { url: episode.image } } : {}),
         fields: [
-          { name: "Published", value: episode.publishedAt, inline: true },
-          { name: "Episode ID", value: episode.id, inline: true },
+          ...(episode
+            ? [
+                { name: "Published", value: fallbackText(episode.publishedAt), inline: true },
+                { name: "Episode ID", value: fallbackText(episode.id), inline: true }
+              ]
+            : [{ name: "Page", value: limitField(url.pathname + url.search, 900), inline: false }]),
           { name: "Device", value: client.device, inline: true },
           { name: "Country", value: fallbackText(client.country), inline: true },
           { name: "Region", value: fallbackText(client.region), inline: true },
@@ -1105,6 +1123,15 @@ const serializeVideo = (episode) => {
       title: episode.spotifyVideoOverview.title,
       url: episode.spotifyVideoOverview.url,
       posterUrl: episode.spotifyVideoOverview.image
+    };
+  }
+
+  if (episode.videoUrl) {
+    return {
+      provider: "spotify",
+      url: episode.videoUrl,
+      embedUrl: episode.videoUrl,
+      posterUrl: absoluteUrl(episode.image, origin)
     };
   }
 
@@ -1375,7 +1402,7 @@ const renderEpisodeDetailApi = (episode, episodes, origin) => {
           id: "listen-spotify",
           label: "Listen on Spotify",
           type: "external",
-          url: episode.href
+          url: episode.spotifyUrl
         },
         {
           id: "support",
@@ -1430,7 +1457,7 @@ const renderEpisodeDetailApi = (episode, episodes, origin) => {
         ? {
             id: "transcript",
             title: `${episode.title} transcript`,
-            intro: "Transcript supplied with the podcast feed.",
+            intro: "Episode transcript.",
             sourceUrl: episode.transcriptContent.sourceUrl,
             paragraphs: episode.transcriptContent.paragraphs
           }
@@ -2692,6 +2719,27 @@ const renderEpisodeJumpNavTracking = (episode, countryCode) => `
     })();
   </script>`;
 
+const renderPageViewNotification = () => `
+  <script>
+    (function () {
+      window.addEventListener('load', function () {
+        window.setTimeout(function () {
+          if (document.visibilityState !== 'visible') return;
+
+          var viewedPath = (window.location.pathname + window.location.search).slice(0, 900);
+          var endpoint = '/analytics/page-view?path=' + encodeURIComponent(viewedPath);
+
+          fetch(endpoint, {
+            method: 'POST',
+            credentials: 'same-origin',
+            keepalive: true,
+            headers: { 'content-type': 'text/plain;charset=UTF-8' }
+          }).catch(function () {});
+        }, 3000);
+      }, { once: true });
+    })();
+  </script>`;
+
 const renderTimeOnSiteTracking = (countryCode) => `
   <script>
     (function () {
@@ -3240,7 +3288,7 @@ const renderTranscript = (episode) => {
     <section class="episode-transcript" id="transcript" aria-labelledby="transcript-title">
       <p class="section-kicker">Full text</p>
       <h2 id="transcript-title">${escapeHtml(episode.title)} transcript</h2>
-      <p class="transcript-intro">Transcript supplied with the podcast feed.</p>
+      <p class="transcript-intro">Episode transcript.</p>
       <div class="transcript-preview">
         ${transcriptPreview}
       </div>
@@ -3879,6 +3927,31 @@ const styles = `
     height: 100%;
     border: 0;
     background: #101215;
+  }
+
+  .spotify-video-overview-link {
+    position: absolute;
+    inset: 0;
+    display: block;
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .spotify-video-overview-link img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    object-fit: cover;
+  }
+
+  .spotify-video-overview-link .button {
+    position: absolute;
+    left: 50%;
+    bottom: 24px;
+    z-index: 1;
+    transform: translateX(-50%);
+    white-space: nowrap;
   }
 
   .video-player-hosted {
@@ -4954,6 +5027,7 @@ const renderStaticPage = (page, analytics = {}) => `<!doctype html>
       </article>
       ${renderFooter()}
     </main>
+    ${renderPageViewNotification()}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
@@ -5059,6 +5133,7 @@ const renderPage = (
       ${renderFooter()}
     </main>
 
+    ${renderPageViewNotification()}
     ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
@@ -5134,6 +5209,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
       })}
     </main>
 
+    ${renderPageViewNotification()}
     ${renderPlaybackTracking([episode], analytics.countryCode)}
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
@@ -5191,6 +5267,7 @@ const renderSearchPage = (query, results, analytics = {}) => {
       </section>
       ${renderFooter()}
     </main>
+    ${renderPageViewNotification()}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
@@ -5537,6 +5614,7 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
         });
       })();
     </script>
+    ${renderPageViewNotification()}
   </body>
 </html>`;
 };
@@ -5616,9 +5694,9 @@ const serveAttachment = async (request, env, pathname) => {
 const handleAdminPage = async (request, env, url) => {
   if (!isAdmin(request, env)) {
     return adminUnauthorized(
-      env.ADMIN_PASSWORD
+      env.ADMIN_USERNAME && env.ADMIN_PASSWORD
         ? "Authentication required"
-        : "Set the ADMIN_PASSWORD Worker secret before using this tool."
+        : "Set the ADMIN_USERNAME Worker variable and ADMIN_PASSWORD Worker secret before using this tool."
     );
   }
 
@@ -6197,6 +6275,39 @@ export default {
     }
 
     try {
+      if (url.pathname === "/analytics/page-view") {
+        if (request.method !== "POST") {
+          return new Response("Method not allowed", {
+            status: 405,
+            headers: { allow: "POST" }
+          });
+        }
+
+        if (request.headers.get("origin") !== url.origin) {
+          return new Response("Forbidden", { status: 403 });
+        }
+
+        const viewedPath = String(url.searchParams.get("path") ?? "");
+
+        if (!viewedPath.startsWith("/") || viewedPath.length > 900) {
+          return new Response("Invalid page path", { status: 400 });
+        }
+
+        const pageUrl = new URL(viewedPath, url.origin);
+
+        if (pageUrl.origin !== url.origin) {
+          return new Response("Invalid page origin", { status: 400 });
+        }
+
+        const episodeSlug = episodeSlugFromPath(pageUrl.pathname);
+        const pageData = episodeSlug
+          ? await loadEpisodePageData(request, ctx, episodeSlug)
+          : null;
+
+        ctx.waitUntil(notifyPageView(env, request, pageUrl, pageData?.episode));
+        return new Response(null, { status: 204 });
+      }
+
       if (isApiRequest && !["GET", "HEAD"].includes(request.method)) {
         return jsonResponse(
           { error: { code: "method_not_allowed", message: "Use GET for this endpoint." } },
@@ -6363,11 +6474,9 @@ export default {
         const episodeContent = await loadEpisodeContent(env, episode.id);
         episode.attachments = episodeContent.attachments;
         episode.article = episodeContent.article;
-        episode.videoUrl = episodeContent.videoUrl;
+        episode.videoUrl = selectVideoUrl(episodeContent.videoUrl, episode.feedVideoUrl);
         episode.videoAsset = episodeContent.videoAsset;
         episode.mapLocations = episodeContent.mapLocations;
-        ctx.waitUntil(notifyEpisodeView(env, request, episode));
-
         return new Response(renderEpisodePage(episode, episodes, analytics), {
           headers: {
             "content-type": "text/html;charset=UTF-8",

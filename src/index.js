@@ -21,7 +21,7 @@ const safeJson = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_BYTES = 500 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
-const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data-v2";
+const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data-v3";
 const EPISODES_PER_PAGE = 9;
 const ADS_TXT_REDIRECT_URL = "https://srv.adstxtmanager.com/19390/thelastknownpodcast.com";
 const DIRECT_SUPPORT_URL = "https://omg10.com/4/11230976";
@@ -232,13 +232,12 @@ const loadEpisodes = async () => {
 
   return feedEpisodes
     .filter((episode) => !videoOverviewSuffix.test(episode.title))
-    .filter((episode) => spotifyEpisodeLinks.has(slugify(episode.title)))
     .slice(0, limit)
     .map((episode) => {
       const videoOverview = videoOverviews.get(slugify(episode.title));
       return {
         ...episode,
-        spotifyUrl: spotifyEpisodeLinks.get(slugify(episode.title)),
+        spotifyUrl: spotifyEpisodeLinks.get(slugify(episode.title)) || podcast.spotify.showUrl,
         feedVideoUrl: videoOverview
           ? spotifyEpisodeLinks.get(slugify(videoOverview.title)) || ""
           : ""

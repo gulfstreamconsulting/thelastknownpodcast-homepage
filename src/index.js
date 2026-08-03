@@ -23,6 +23,11 @@ const MAX_VIDEO_UPLOAD_BYTES = 500 * 1024 * 1024;
 const CONTENT_ROUTE_PREFIX = "/episode-content";
 const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data-v3";
 const EPISODES_PER_PAGE = 9;
+const SPOTIFY_LANDING_PAGE_ENDPOINT = "/landing-page";
+const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
+const SPOTIFY_EPISODE_DEEP_LINK = "spotify:episode:4bEoyIS2hWGkl75Xj1oWZa";
+const SPOTIFY_EPISODE_URL =
+  "https://open.spotify.com/episode/4bEoyIS2hWGkl75Xj1oWZa?si=16NvQlJ9RDau-62VTUzqlw";
 const ADS_TXT_REDIRECT_URL = "https://srv.adstxtmanager.com/19390/thelastknownpodcast.com";
 const DIRECT_SUPPORT_URL = "https://omg10.com/4/11230976";
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
@@ -1067,6 +1072,123 @@ const notifyPageView = (env, request, pageUrl, episode = null) => {
   }).catch((error) => {
     console.error("Discord webhook notification failed", error);
   });
+};
+
+const handleSpotifyLandingClick = (request, env, ctx) => {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: {
+        allow: "POST",
+        "cache-control": "no-store"
+      }
+    });
+  }
+
+  const url = new URL(request.url);
+  const destination = url.searchParams.get("destination");
+
+  if (!new Set(["app", "browser"]).has(destination)) {
+    return new Response("Invalid destination", {
+      status: 400,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  if (env.IFTTT_WEBHOOK_URL) {
+    const destinationLabel = destination === "app" ? "Spotify app" : "web browser";
+
+    ctx.waitUntil(
+      fetch(env.IFTTT_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          value1: destinationLabel,
+          value2: String(request.headers.get("referer") ?? "").slice(0, 1000),
+          value3: SPOTIFY_EPISODE_URL
+        })
+      })
+        .then((iftttResponse) => {
+          if (!iftttResponse.ok) {
+            console.error("IFTTT webhook returned an error", iftttResponse.status);
+          }
+        })
+        .catch((error) => {
+          console.error("IFTTT webhook request failed", error);
+        })
+    );
+  } else {
+    console.error("IFTTT_WEBHOOK_URL is not configured");
+  }
+
+  return new Response(null, {
+    status: 204,
+    headers: { "cache-control": "no-store" }
+  });
+};
+
+const handleSpotifyLandingPage = (request) => {
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: {
+        allow: "GET",
+        "cache-control": "no-store"
+      }
+    });
+  }
+
+  return new Response(
+    `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Open episode in Spotify</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #121212; color: #fff; }
+      main { width: min(100%, 420px); text-align: center; }
+      h1 { margin: 0 0 12px; font-size: clamp(1.75rem, 8vw, 2.5rem); }
+      p { margin: 0 0 28px; color: #b3b3b3; line-height: 1.5; }
+      a { display: block; width: 100%; padding: 15px 20px; border-radius: 999px; font-weight: 700; text-decoration: none; }
+      .app { background: #1ed760; color: #000; }
+      .web { margin-top: 12px; border: 1px solid #727272; color: #fff; }
+      a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Listen on Spotify</h1>
+      <p>Open this episode in the Spotify app or continue in your browser.</p>
+      <a class="app" data-destination="app" href="${escapeHtml(SPOTIFY_EPISODE_DEEP_LINK)}">Open in Spotify</a>
+      <a class="web" data-destination="browser" href="${escapeHtml(SPOTIFY_EPISODE_URL)}">Continue in browser</a>
+    </main>
+    <script>
+      document.querySelectorAll("[data-destination]").forEach((link) => {
+        link.addEventListener("click", () => {
+          const trackingUrl = "${escapeHtml(SPOTIFY_LANDING_CLICK_ENDPOINT)}?destination=" +
+            encodeURIComponent(link.dataset.destination);
+
+          if (!navigator.sendBeacon || !navigator.sendBeacon(trackingUrl)) {
+            fetch(trackingUrl, { method: "POST", keepalive: true }).catch(() => {});
+          }
+        });
+      });
+    </script>
+  </body>
+</html>`,
+    {
+      headers: {
+        "content-type": "text/html;charset=UTF-8",
+        "cache-control": "no-store",
+        "x-robots-tag": "noindex, nofollow",
+        "x-content-type-options": "nosniff"
+      }
+    }
+  );
 };
 
 const renderEpisodeImage = (episode, className = "episode-art") => `
@@ -6261,6 +6383,19 @@ export default {
       countryCode: getCountryCode(request),
       facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
     };
+
+    if (url.pathname === SPOTIFY_LANDING_CLICK_ENDPOINT) {
+      try {
+        return handleSpotifyLandingClick(request, env, ctx);
+      } catch (error) {
+        console.error("Spotify landing-page click failed", error);
+        return new Response(null, { status: 204 });
+      }
+    }
+
+    if (url.pathname === SPOTIFY_LANDING_PAGE_ENDPOINT) {
+      return handleSpotifyLandingPage(request);
+    }
 
     if (request.method === "OPTIONS" && isApiRequest) {
       return new Response(null, { status: 204, headers: API_HEADERS });

@@ -30,6 +30,20 @@ npx wrangler secret put DISCORD_WEBHOOK_URL
 
 Episode detail pages send the Discord notification in the background with `ctx.waitUntil`, so page rendering does not wait for Discord.
 
+The Worker also exposes a Spotify landing page:
+
+```text
+GET /landing-page
+```
+
+The page offers a `spotify:episode:` deep link to open the Spotify app and an HTTPS fallback for listening in the browser. Loading the page does not fire a webhook. Tapping either button sends a background click request to `/landing-page/click`, queues an IFTTT event with `ctx.waitUntil`, and immediately continues to the selected Spotify destination.
+
+The IFTTT request sends the selected destination as `value1`, the landing-page referrer as `value2`, and the Spotify episode URL as `value3`. Store the complete private Maker Webhooks URL as a local value in `.dev.vars` or as a production Worker secret:
+
+```bash
+npx wrangler secret put IFTTT_WEBHOOK_URL
+```
+
 ## App API
 
 The Worker exposes the podcast and episode catalog as JSON with CORS enabled:

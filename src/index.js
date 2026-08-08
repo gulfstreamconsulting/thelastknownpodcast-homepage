@@ -28,8 +28,6 @@ const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
 const SPOTIFY_EPISODE_DEEP_LINK = "spotify:episode:4bEoyIS2hWGkl75Xj1oWZa";
 const SPOTIFY_EPISODE_URL =
   "https://open.spotify.com/episode/4bEoyIS2hWGkl75Xj1oWZa?si=16NvQlJ9RDau-62VTUzqlw";
-const ADS_TXT_REDIRECT_URL = "https://srv.adstxtmanager.com/19390/thelastknownpodcast.com";
-const DIRECT_SUPPORT_URL = "https://omg10.com/4/11230976";
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const BOT_USER_AGENT_PATTERN =
   /\b(bot|crawl|crawler|spider|slurp|preview|facebookexternalhit|discordbot|twitterbot|linkedinbot|slackbot|telegrambot|whatsapp|embedly|pinterest|google-inspectiontool|gptbot|chatgpt-user|ccbot|claudebot|perplexitybot|bytespider|yandex|duckduckbot|baiduspider|semrushbot|ahrefsbot|mj12bot|dotbot|petalbot|headlesschrome|lighthouse|pagespeed|pingdom|gtmetrix|uptimerobot|curl|wget|python-requests|go-http-client|java|axios|undici)\b/i;
@@ -1087,9 +1085,17 @@ const handleSpotifyLandingClick = (request, env, ctx) => {
 
   const url = new URL(request.url);
   const destination = url.searchParams.get("destination");
+  const episodeId = String(url.searchParams.get("episode") ?? "").trim();
 
-  if (!new Set(["app", "browser", "player"]).has(destination)) {
+  if (!new Set(["spotify", "app", "browser", "player"]).has(destination)) {
     return new Response("Invalid destination", {
+      status: 400,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  if (episodeId && !/^[a-zA-Z0-9]+$/.test(episodeId)) {
+    return new Response("Invalid episode", {
       status: 400,
       headers: { "cache-control": "no-store" }
     });
@@ -1097,6 +1103,7 @@ const handleSpotifyLandingClick = (request, env, ctx) => {
 
   if (env.IFTTT_WEBHOOK_URL) {
     const destinationLabels = {
+      spotify: "Spotify episode link",
       app: "Spotify app",
       browser: "web browser",
       player: "embedded Spotify player"
@@ -1110,7 +1117,9 @@ const handleSpotifyLandingClick = (request, env, ctx) => {
         body: JSON.stringify({
           value1: destinationLabel,
           value2: String(request.headers.get("referer") ?? "").slice(0, 1000),
-          value3: SPOTIFY_EPISODE_URL
+          value3: episodeId
+            ? `https://open.spotify.com/episode/${episodeId}`
+            : SPOTIFY_EPISODE_URL
         })
       })
         .then((iftttResponse) => {
@@ -1230,6 +1239,134 @@ const handleSpotifyLandingPage = (request) => {
   );
 };
 
+const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: {
+        allow: "GET, HEAD",
+        "cache-control": "no-store"
+      }
+    });
+  }
+
+  try {
+    const episodes = await loadEpisodeCatalog();
+    const countryCode = analytics.countryCode || "XX";
+
+    if (!episodes.length) {
+      return new Response("No episodes found", { status: 502 });
+    }
+
+    const episodeSections = episodes
+      .map(
+        (episode) => `
+          <article class="episode" id="${escapeHtml(episodeAnchor(episode))}">
+            <p class="published">${escapeHtml(episode.publishedAt)}</p>
+            <h2>${escapeHtml(episode.title)}</h2>
+            <p class="intro">${escapeHtml(episode.summary)}</p>
+            <a
+              class="spotify-link"
+              data-destination="spotify"
+              data-episode-id="${escapeHtml(episode.spotifyEpisodeId)}"
+              href="${escapeHtml(episode.spotifyUrl)}"
+            >Listen on Spotify</a>
+            <a class="direct-link" href="#${escapeHtml(episodeAnchor(episode))}">Direct link to this episode</a>
+          </article>`
+      )
+      .join("");
+    const body = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Listen to ${escapeHtml(podcast.name)} on Spotify</title>
+    ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
+    ${renderFacebookPixel(analytics.facebookPixelId)}
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body { margin: 0; min-height: 100vh; padding: 48px 24px; background: #121212; color: #fff; }
+      main { width: min(100%, 520px); margin: 0 auto; text-align: center; }
+      h1 { margin: 0 0 12px; font-size: clamp(1.75rem, 8vw, 2.5rem); }
+      .page-intro, .intro { color: #b3b3b3; line-height: 1.5; }
+      .page-intro { margin: 0 0 36px; }
+      .episode { padding: 36px 0; scroll-margin-top: 20px; border-top: 1px solid #404040; }
+      .episode:first-of-type { border-top: 0; }
+      .episode:target { margin-inline: -18px; padding-inline: 18px; border-radius: 18px; background: #1b1b1b; outline: 2px solid #1ed760; }
+      .published { margin: 0 0 8px; color: #1ed760; font-size: .78rem; font-weight: 800; text-transform: uppercase; }
+      h2 { margin: 0 0 12px; font-size: clamp(1.4rem, 6vw, 2rem); }
+      .intro { margin: 0 0 28px; }
+      a { text-decoration: none; }
+      .spotify-link { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; background: #1ed760; color: #000; font-size: 1.125rem; font-weight: 800; }
+      .direct-link { display: inline-block; margin-top: 14px; color: #b3b3b3; font-size: .875rem; font-weight: 700; text-decoration: underline; }
+      a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Listen on Spotify</h1>
+      <p class="page-intro">Choose an episode to listen on Spotify.</p>
+      ${episodeSections}
+    </main>
+    <script>
+      (function () {
+        const trackedDestinations = new Set();
+        const track = (destination, episodeId) => {
+          const key = destination + ":" + episodeId;
+          if (trackedDestinations.has(key)) return;
+          trackedDestinations.add(key);
+          const trackingUrl = "${escapeHtml(SPOTIFY_LANDING_CLICK_ENDPOINT)}?destination=" +
+            encodeURIComponent(destination) + "&episode=" + encodeURIComponent(episodeId);
+          const eventName = "thelastknownpodcast_landing_page_click_${escapeHtml(countryCode)}";
+          const parameters = {
+            country_code: "${escapeHtml(countryCode)}",
+            destination: destination,
+            episode_id: episodeId,
+            page_path: window.location.pathname
+          };
+
+          if (typeof window.gtag === "function") {
+            window.gtag("event", eventName, parameters);
+          }
+
+          if (typeof window.fbq === "function") {
+            window.fbq("trackCustom", eventName, parameters);
+          }
+
+          if (!navigator.sendBeacon || !navigator.sendBeacon(trackingUrl)) {
+            fetch(trackingUrl, { method: "POST", keepalive: true }).catch(() => {});
+          }
+        };
+        document.querySelectorAll("[data-destination]").forEach((link) => {
+          link.addEventListener("click", () => track(link.dataset.destination, link.dataset.episodeId));
+        });
+      })();
+    </script>
+    ${renderPageViewNotification()}
+    ${renderTimeOnSiteTracking(countryCode)}
+    ${renderScrollDepthTracking(countryCode)}
+  </body>
+</html>`;
+
+    return new Response(request.method === "HEAD" ? null : body, {
+      headers: {
+        "content-type": "text/html;charset=UTF-8",
+        "cache-control": "no-store",
+        "x-robots-tag": "noindex, nofollow",
+        "x-content-type-options": "nosniff"
+      }
+    });
+  } catch (error) {
+    return new Response(`Unable to load Spotify episodes: ${error.message}`, {
+      status: 502,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+};
+
 const renderEpisodeImage = (episode, className = "episode-art") => `
   <img
     class="${escapeHtml(className)}"
@@ -1239,6 +1376,7 @@ const renderEpisodeImage = (episode, className = "episode-art") => `
   >`;
 
 const episodePath = (episode) => `/episodes/${episode.slug}`;
+const episodeAnchor = (episode) => `episode-${episode.slug}`;
 
 const episodeSlugFromPath = (pathname) => {
   const match = pathname.match(/^\/episodes\/([^/]+)\/?$/);
@@ -2015,6 +2153,36 @@ const renderCases = (cases) =>
     })
     .join("");
 
+const renderLandingEpisodePlayers = (episodes) =>
+  episodes
+    .map(
+      (episode, index) => `
+        <article
+          class="landing-episode-player"
+          id="${escapeHtml(episodeAnchor(episode))}"
+          aria-labelledby="${escapeHtml(episodeAnchor(episode))}-title"
+        >
+          <a class="landing-episode-art-link" href="${escapeHtml(episodePath(episode))}">
+            ${renderEpisodeImage(episode, "landing-episode-art")}
+          </a>
+          <div class="landing-episode-content">
+            <p class="section-kicker">${index === 0 ? "Latest episode" : escapeHtml(episode.publishedAt)}</p>
+            <h2 id="${escapeHtml(episodeAnchor(episode))}-title">
+              <a href="${escapeHtml(episodePath(episode))}">${escapeHtml(episode.title)}</a>
+            </h2>
+            <p class="episode-summary">${escapeHtml(episode.summary)}</p>
+            <div class="episode-links">
+              <a href="${escapeHtml(episodePath(episode))}">Episode details</a>
+              <a href="#${escapeHtml(episodeAnchor(episode))}" aria-label="Copyable link to ${escapeHtml(episode.title)}">Direct link</a>
+            </div>
+            <div class="player-wrap">
+              ${renderSpotifyPlayer(episode)}
+            </div>
+          </div>
+        </article>`
+    )
+    .join("");
+
 const homepageCasesHref = (selectedCategory, page) => {
   const params = [];
 
@@ -2139,7 +2307,6 @@ const renderFooter = ({ disclaimer = "" } = {}) => `
       <a href="/#cases">All episodes</a>
       <a href="/about-us">About Us</a>
       <a href="/contact-us">Contact Us</a>
-      <a href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
       <a href="/privacy-policy">Privacy Policy</a>
       <a href="/editorial-policy">Editorial Policy</a>
       <a href="/sitemap.xml">Sitemap</a>
@@ -2172,7 +2339,6 @@ const renderSiteHeader = ({ home = false, query = "" } = {}) => `
       <a href="${home ? "#cases" : "/#cases"}">All episodes</a>
       <a href="/about-us">About Us</a>
       <a href="/contact-us">Contact Us</a>
-      <a href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
       <a href="/privacy-policy">Privacy Policy</a>
       <a href="/editorial-policy">Editorial Policy</a>
       <a href="/sitemap.xml">Sitemap</a>
@@ -2205,27 +2371,6 @@ const renderSpotifyPlayer = (episode) => episode.audioUrl ? `
       Open this episode in Spotify
     </a>
   </div>`;
-
-const renderAdsterraNativeAd = (placement = "episode") => {
-  const adMarkup = `<script async="async" data-cfasync="false" src="https://pl28638835.effectivecpmnetwork.com/8fee276f31bbe673bacbd151f123599f/invoke.js"></script>
-<div id="container-8fee276f31bbe673bacbd151f123599f"></div>`;
-
-  return `
-    <aside class="native-ad native-ad-${escapeHtml(placement)}" aria-label="Advertisement">
-      <iframe
-        title="Advertisement"
-        loading="lazy"
-        scrolling="no"
-        onload="const frame = this; const resizeAd = () => { const documentElement = frame.contentDocument && frame.contentDocument.documentElement; const body = frame.contentDocument && frame.contentDocument.body; if (!documentElement || !body) return; frame.style.height = Math.max(documentElement.scrollHeight, body.scrollHeight) + 'px'; }; resizeAd(); new ResizeObserver(resizeAd).observe(frame.contentDocument.documentElement);"
-        srcdoc="${escapeHtml(adMarkup)}"
-        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin"
-        referrerpolicy="no-referrer-when-downgrade"
-      ></iframe>
-    </aside>`;
-};
-
-const renderAdsterraBannerAd = (placement = "page") =>
-  `<!-- Adsterra banner ad disabled (${escapeHtml(placement)}). -->`;
 
 const renderPlaybackTracking = (episodes, countryCode) => {
   const audioPlayers = episodes
@@ -3152,23 +3297,18 @@ const renderInlineMarkdown = (value) => {
     .replace(/\*([^*]+)\*/g, "<em>$1</em>");
 };
 
-const renderMarkdownBlocks = (value, options = {}) => {
+const renderMarkdownBlocks = (value) => {
   const lines = String(value ?? "").replace(/\r/g, "").split("\n");
   const blocks = [];
   let paragraph = [];
   let listItems = [];
-  let paragraphCount = 0;
 
   const flushParagraph = () => {
     if (!paragraph.length) {
       return;
     }
 
-    paragraphCount += 1;
     blocks.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
-    if (options.insertAdAfterParagraph && paragraphCount === options.insertAdAfterParagraph) {
-      blocks.push(renderAdsterraNativeAd(options.adPlacement ?? "article-inline"));
-    }
     paragraph = [];
   };
 
@@ -3222,13 +3362,6 @@ const renderMarkdownBlocks = (value, options = {}) => {
   flushParagraph();
   flushList();
 
-  if (
-    options.insertAdAfterParagraph &&
-    paragraphCount < options.insertAdAfterParagraph
-  ) {
-    blocks.push(renderAdsterraNativeAd(options.adPlacement ?? "article-inline"));
-  }
-
   return blocks.join("");
 };
 
@@ -3247,10 +3380,7 @@ const renderEpisodeArticle = (episode) => {
       ${article.updatedAt ? `<p class="article-updated">Last updated ${escapeHtml(article.updatedAt)}</p>` : ""}
       ${article.excerpt ? `<p class="article-excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
       <div class="article-body">
-        ${renderMarkdownBlocks(article.body, {
-          insertAdAfterParagraph: 3,
-          adPlacement: "article-inline"
-        })}
+        ${renderMarkdownBlocks(article.body)}
       </div>
       <a class="back-to-top" href="#episode-title">Back to top</a>
     </section>`;
@@ -3438,11 +3568,7 @@ const renderTranscript = (episode) => {
   const visibleParagraphs = episode.transcriptContent.paragraphs.slice(0, 3);
   const remainingParagraphs = episode.transcriptContent.paragraphs.slice(3);
   const transcriptPreview = visibleParagraphs
-    .map((paragraph, index) => {
-      const adIndex = Math.min(1, visibleParagraphs.length - 1);
-      const ad = index === adIndex ? renderAdsterraNativeAd("transcript-inline") : "";
-      return `<p>${escapeHtml(paragraph)}</p>${ad}`;
-    })
+    .map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`)
     .join("");
 
   return `
@@ -3517,7 +3643,6 @@ const renderHead = ({
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer-when-downgrade" />
-    <meta name="cb1e08e3957bbffb41bece25fd13463e6be4fded" content="cb1e08e3957bbffb41bece25fd13463e6be4fded" />
     <title>${escapeHtml(title)}</title>
     <meta name="description" content="${escapeHtml(description)}">
     <meta property="og:title" content="${escapeHtml(title)}">
@@ -3526,7 +3651,6 @@ const renderHead = ({
     ${extraHead}
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(facebookPixelId)}
-    <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
     <style>${styles}</style>
   </head>`;
 
@@ -3821,6 +3945,58 @@ const styles = `
     grid-template-columns: minmax(0, 0.68fr) minmax(320px, 1fr);
     gap: 36px;
     align-items: start;
+  }
+
+  .episode-player-list {
+    display: grid;
+    gap: 28px;
+    margin-top: 30px;
+  }
+
+  .landing-episode-player {
+    display: grid;
+    grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+    gap: 30px;
+    padding: 28px;
+    scroll-margin-top: 24px;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    background: #fffaf2;
+  }
+
+  .landing-episode-player:target {
+    border-color: var(--rust);
+    box-shadow: 0 0 0 4px rgba(157, 63, 54, 0.14), 0 18px 48px rgba(20, 15, 12, 0.14);
+  }
+
+  .landing-episode-art-link {
+    align-self: start;
+  }
+
+  .landing-episode-art {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1;
+    border: 1px solid #d8cab7;
+    border-radius: 8px;
+    object-fit: cover;
+  }
+
+  .landing-episode-content {
+    min-width: 0;
+  }
+
+  .landing-episode-content h2 {
+    font-size: clamp(1.75rem, 3.5vw, 2.8rem);
+  }
+
+  .episode-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 18px;
+    margin: 16px 0;
+    color: var(--rust);
+    font-weight: 800;
   }
 
   .featured-art {
@@ -4268,56 +4444,6 @@ const styles = `
     margin-top: 18px;
     color: var(--rust);
     font-weight: 900;
-  }
-
-  .native-ad {
-    display: block;
-    width: 100%;
-    margin: 28px 0;
-    overflow: hidden;
-    border: 1px solid #d8cab7;
-    border-radius: 8px;
-    background: #fffaf2;
-  }
-
-  .native-ad iframe {
-    display: block;
-    width: 100%;
-    height: 380px;
-    overflow: hidden;
-    border: 0;
-    background: transparent;
-  }
-
-  .native-ad-episode-top,
-  .native-ad-home {
-    width: min(calc(100% - 40px), 1180px);
-    margin: 28px auto;
-  }
-
-  .article-body .native-ad,
-  .transcript-preview .native-ad {
-    margin: 30px 0;
-  }
-
-  .article-body .native-ad iframe,
-  .transcript-preview .native-ad iframe {
-    height: 440px;
-  }
-
-  .banner-ad {
-    display: flex;
-    width: min(100% - 40px, 468px);
-    min-height: 60px;
-    align-items: center;
-    justify-content: center;
-    margin: 22px auto;
-    overflow: hidden;
-  }
-
-  .banner-ad iframe {
-    max-width: 100%;
-    border: 0;
   }
 
   .attachment-grid {
@@ -5045,6 +5171,7 @@ const styles = `
     }
 
     .episode-layout,
+    .landing-episode-player,
     .episode-hero,
     .case-grid,
     .category-grid,
@@ -5053,14 +5180,12 @@ const styles = `
       grid-template-columns: 1fr;
     }
 
-    .spotify-video-overview {
-      grid-template-columns: 1fr;
+    .landing-episode-art {
+      width: min(100%, 260px);
     }
 
-    .native-ad iframe,
-    .article-body .native-ad iframe,
-    .transcript-preview .native-ad iframe {
-      height: 500px;
+    .spotify-video-overview {
+      grid-template-columns: 1fr;
     }
 
     .episode-jump-nav {
@@ -5200,7 +5325,8 @@ const renderPage = (
   categories = buildEpisodeCategories(episodes),
   selectedCategory = null,
   requestedPage = 1,
-  analytics = {}
+  analytics = {},
+  showAllEpisodePlayers = false
 ) => {
   const activeCategory = categories.find((category) => category.slug === selectedCategory);
   const visibleEpisodes = activeCategory?.episodes ?? episodes;
@@ -5210,10 +5336,15 @@ const renderPage = (
   const paginatedEpisodes = visibleEpisodes.slice(pageStart, pageStart + EPISODES_PER_PAGE);
   const firstVisibleEpisode = visibleEpisodes.length ? pageStart + 1 : 0;
   const lastVisibleEpisode = Math.min(pageStart + paginatedEpisodes.length, visibleEpisodes.length);
+  const landingFeaturedEpisode = showAllEpisodePlayers
+    ? visibleEpisodes[0] ?? featuredEpisode
+    : featuredEpisode;
   const pageTitle = activeCategory
     ? `${activeCategory.label} Episodes | ${podcast.name}`
     : podcast.name;
-  const title = currentPage > 1 ? `${pageTitle} | Page ${currentPage}` : pageTitle;
+  const title = currentPage > 1 && !showAllEpisodePlayers
+    ? `${pageTitle} | Page ${currentPage}`
+    : pageTitle;
 
   return `<!doctype html>
 <html lang="en">
@@ -5233,15 +5364,18 @@ const renderPage = (
           <h1 id="page-title">${escapeHtml(podcast.name)}</h1>
           <p class="lede">${escapeHtml(podcast.tagline)}</p>
           <div class="hero-actions">
-            <a class="button" href="#listen">Listen now</a>
-            <a class="button secondary" href="${escapeHtml(episodePath(featuredEpisode))}">Episode details</a>
-            <a class="button secondary" href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
+            <a class="button" href="${showAllEpisodePlayers
+              ? `#${escapeHtml(episodeAnchor(landingFeaturedEpisode))}`
+              : "#listen"
+            }">Listen now</a>
+            <a class="button secondary" href="${escapeHtml(episodePath(landingFeaturedEpisode))}">Episode details</a>
           </div>
         </div>
       </section>
     </div>
 
     <main>
+      ${showAllEpisodePlayers ? "" : `
       <section class="section episode-layout" id="listen">
         <div>
           <a href="${escapeHtml(episodePath(featuredEpisode))}">
@@ -5260,9 +5394,7 @@ const renderPage = (
             ${renderSpotifyPlayer(featuredEpisode)}
           </div>
         </div>
-      </section>
-
-      ${renderAdsterraNativeAd("home")}
+      </section>`}
 
       ${renderCategoryBrowser(categories, activeCategory?.slug ?? null, episodes.length)}
 
@@ -5275,9 +5407,10 @@ const renderPage = (
                 ? escapeHtml(activeCategory.label)
                 : "Built around timelines, records, and what can be verified."
             }</h2>
-            <p class="pagination-summary">Showing ${escapeHtml(firstVisibleEpisode)}-${escapeHtml(
-              lastVisibleEpisode
-            )} of ${escapeHtml(visibleEpisodes.length)} episodes</p>
+            <p class="pagination-summary">${showAllEpisodePlayers
+              ? `Showing all ${escapeHtml(visibleEpisodes.length)} episodes`
+              : `Showing ${escapeHtml(firstVisibleEpisode)}-${escapeHtml(lastVisibleEpisode)} of ${escapeHtml(visibleEpisodes.length)} episodes`
+            }</p>
           </div>
           ${
             activeCategory
@@ -5285,17 +5418,21 @@ const renderPage = (
               : ""
           }
         </div>
-        <div class="case-grid">
-          ${renderCases(paginatedEpisodes)}
-        </div>
-        ${renderPagination(currentPage, totalPages, activeCategory?.slug ?? null)}
+        ${showAllEpisodePlayers
+          ? `<div class="episode-player-list">${renderLandingEpisodePlayers(visibleEpisodes)}</div>`
+          : `<div class="case-grid">${renderCases(paginatedEpisodes)}</div>
+             ${renderPagination(currentPage, totalPages, activeCategory?.slug ?? null)}`
+        }
       </section>
 
       ${renderFooter()}
     </main>
 
     ${renderPageViewNotification()}
-    ${renderPlaybackTracking([featuredEpisode], analytics.countryCode)}
+    ${renderPlaybackTracking(
+      showAllEpisodePlayers ? visibleEpisodes : [featuredEpisode],
+      analytics.countryCode
+    )}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
@@ -5340,7 +5477,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
           ${renderEpisodeImage(episode, "episode-meta-image")}
           <p class="section-kicker">${escapeHtml(episode.publishedAt ?? "Episode")}</p>
           <a class="button" href="${escapeHtml(episode.href)}">Listen on Spotify</a>
-          <a class="button secondary-dark" href="${DIRECT_SUPPORT_URL}" target="_blank" rel="sponsored noopener">Support the show</a>
           ${
             episode.transcriptContent
               ? '<a class="button transcript-button" href="#transcript">Read episode transcript</a>'
@@ -5352,8 +5488,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
         </aside>
       </section>
     </div>
-
-    ${renderAdsterraNativeAd("episode-top")}
 
     <main>
       ${renderEpisodeJumpNav(episode, relatedEpisodes)}
@@ -6433,15 +6567,11 @@ export default {
     }
 
     if (url.pathname === SPOTIFY_LANDING_PAGE_ENDPOINT) {
-      return handleSpotifyLandingPage(request);
+      return handlePublishedEpisodesLandingPage(request, analytics);
     }
 
     if (request.method === "OPTIONS" && isApiRequest) {
       return new Response(null, { status: 204, headers: API_HEADERS });
-    }
-
-    if (url.pathname === "/ads.txt") {
-      return Response.redirect(ADS_TXT_REDIRECT_URL, 301);
     }
 
     if (url.pathname.startsWith("/assets/") || url.pathname === "/hero.png") {

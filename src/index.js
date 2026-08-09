@@ -1262,13 +1262,36 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
       .map(
         (episode) => `
           <article class="episode" id="${escapeHtml(episodeAnchor(episode))}">
+            <img
+              class="episode-thumbnail"
+              src="${escapeHtml(episode.image)}"
+              alt="${escapeHtml(`${episode.title} episode artwork`)}"
+              loading="lazy"
+            >
             <p class="published">${escapeHtml(episode.publishedAt)}</p>
             <h2>${escapeHtml(episode.title)}</h2>
             <p class="intro">${escapeHtml(episode.summary)}</p>
+            <div
+              class="episode-spotify-player"
+              id="spotify-player-${escapeHtml(episode.spotifyEpisodeId)}"
+              data-episode-id="${escapeHtml(episode.spotifyEpisodeId)}"
+              data-episode-title="${escapeHtml(episode.title)}"
+              aria-label="${escapeHtml(`${episode.title} Spotify player`)}"
+            ></div>
+            <noscript>
+              <iframe
+                class="episode-spotify-player-fallback"
+                src="https://open.spotify.com/embed/episode/${escapeHtml(episode.spotifyEpisodeId)}"
+                title="${escapeHtml(`${episode.title} Spotify player`)}"
+                loading="lazy"
+                allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+              ></iframe>
+            </noscript>
             <a
               class="spotify-link"
               data-destination="spotify"
               data-episode-id="${escapeHtml(episode.spotifyEpisodeId)}"
+              data-episode-title="${escapeHtml(episode.title)}"
               href="${escapeHtml(episode.spotifyUrl)}"
             >Listen on Spotify</a>
             <a class="direct-link" href="#${escapeHtml(episodeAnchor(episode))}">Direct link to this episode</a>
@@ -1296,9 +1319,11 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
       .episode { padding: 36px 0; scroll-margin-top: 20px; border-top: 1px solid #404040; }
       .episode:first-of-type { border-top: 0; }
       .episode:target { margin-inline: -18px; padding-inline: 18px; border-radius: 18px; background: #1b1b1b; outline: 2px solid #1ed760; }
+      .episode-thumbnail { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 0 auto 24px; border-radius: 12px; object-fit: cover; }
       .published { margin: 0 0 8px; color: #1ed760; font-size: .78rem; font-weight: 800; text-transform: uppercase; }
       h2 { margin: 0 0 12px; font-size: clamp(1.4rem, 6vw, 2rem); }
       .intro { margin: 0 0 28px; }
+      .episode-spotify-player, .episode-spotify-player-fallback { display: block; width: 100%; height: 152px; margin: 0 0 20px; overflow: hidden; border: 0; border-radius: 12px; }
       a { text-decoration: none; }
       .spotify-link { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; background: #1ed760; color: #000; font-size: 1.125rem; font-weight: 800; }
       .direct-link { display: inline-block; margin-top: 14px; color: #b3b3b3; font-size: .875rem; font-weight: 700; text-decoration: underline; }
@@ -1314,7 +1339,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
     <script>
       (function () {
         const trackedDestinations = new Set();
-        const track = (destination, episodeId) => {
+        const track = (destination, episodeId, episodeTitle) => {
           const key = destination + ":" + episodeId;
           if (trackedDestinations.has(key)) return;
           trackedDestinations.add(key);
@@ -1325,6 +1350,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
             country_code: "${escapeHtml(countryCode)}",
             destination: destination,
             episode_id: episodeId,
+            episode_title: episodeTitle,
             page_path: window.location.pathname
           };
 
@@ -1341,10 +1367,31 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
           }
         };
         document.querySelectorAll("[data-destination]").forEach((link) => {
-          link.addEventListener("click", () => track(link.dataset.destination, link.dataset.episodeId));
+          link.addEventListener("click", () => track(
+            link.dataset.destination,
+            link.dataset.episodeId,
+            link.dataset.episodeTitle
+          ));
         });
+
+        window.onSpotifyIframeApiReady = (IFrameAPI) => {
+          document.querySelectorAll(".episode-spotify-player").forEach((element) => {
+            const episodeId = element.dataset.episodeId;
+            const episodeTitle = element.dataset.episodeTitle;
+            IFrameAPI.createController(
+              element,
+              { uri: "spotify:episode:" + episodeId, width: "100%", height: 152 },
+              (controller) => {
+                controller.addListener("playback_started", () => {
+                  track("player", episodeId, episodeTitle);
+                });
+              }
+            );
+          });
+        };
       })();
     </script>
+    <script src="https://open.spotify.com/embed/iframe-api/v1" async></script>
     ${renderPageViewNotification()}
     ${renderTimeOnSiteTracking(countryCode)}
     ${renderScrollDepthTracking(countryCode)}

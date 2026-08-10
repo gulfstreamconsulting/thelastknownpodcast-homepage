@@ -30,18 +30,70 @@ npx wrangler secret put DISCORD_WEBHOOK_URL
 
 Episode detail pages send the Discord notification in the background with `ctx.waitUntil`, so page rendering does not wait for Discord.
 
-The Worker also exposes a Spotify landing page:
+Use the short Spotify endpoint to redirect listeners to the show page:
+
+```text
+GET /spotify
+```
+
+The Worker exposes a Spotify landing-page directory and a separate landing page for every
+published episode:
 
 ```text
 GET /landing-page
+GET /landing-page/:episode-slug
 ```
 
-The page offers a large `spotify:episode:` link to open Spotify and an embedded Spotify player. Loading the page does not fire a webhook. Tapping the Spotify link or starting playback in the embedded player sends a background click request to `/landing-page/click` and queues an IFTTT event with `ctx.waitUntil`.
+The directory lists the published episodes and links to their individual landing pages. Each
+episode page offers a large `spotify:episode:` link to open that episode in Spotify and an
+embedded player for that episode. Loading a page does not fire a webhook. Tapping the Spotify
+link or starting playback sends a background click request to `/landing-page/click` with the
+Spotify episode ID and queues an IFTTT event with `ctx.waitUntil`.
 
-The IFTTT request sends the selected destination as `value1`, the landing-page referrer as `value2`, and the Spotify episode URL as `value3`. Store the complete private Maker Webhooks URL as a local value in `.dev.vars` or as a production Worker secret:
+The IFTTT request sends the selected destination as `value1`, the landing-page referrer as
+`value2`, and the Spotify episode URL as `value3`. Spotify button taps use `IFTTT_WEBHOOK_URL`;
+embedded-player playback uses the separate `IFTTT_SPOTIFY_WEB_PLAYER_WEBHOOK_URL`. Store both
+complete private Maker Webhooks URLs as local values in `.dev.vars` or as production Worker
+secrets:
 
 ```bash
 npx wrangler secret put IFTTT_WEBHOOK_URL
+npx wrangler secret put IFTTT_SPOTIFY_WEB_PLAYER_WEBHOOK_URL
+```
+
+Individual episode landing pages record a view as soon as the page renders so clicks and player
+starts use the same page-view denominator. Each append-only visit record stores the episode,
+Cloudflare country code, sanitized referrer (query strings and fragments are removed), and timestamp in the configured
+`EPISODE_CONTENT` R2 bucket. The `/landing-page` directory itself is not counted, and IP
+addresses are not stored. When an individual episode landing-page URL includes
+`?source=facebook_ad`, its stored referrer is `facebook_ad` regardless of the browser referrer.
+
+The same episode landing pages also record the first embedded Spotify web-player start and the
+first Spotify episode-button click during each page load. The dashboard reports both event
+totals per episode and these conversion metrics:
+
+- Web-player start rate: Spotify web-player starts divided by episode landing-page views.
+- Spotify click-through rate: Spotify episode clicks divided by episode landing-page views.
+
+The dashboard plots both rates by day for the latest 30 days. The graph follows the selected
+episode and country filters and groups dates using the `America/New_York` timezone. Dashboard
+totals, episode rows, traffic-source breakdowns, and recent activity use the same filters.
+
+Spotify `playback_update` events also maintain a cumulative embedded-player session snapshot.
+Snapshots are saved every 30 seconds while listening and when playback pauses, resumes, reaches
+25%, 50%, 75%, or 90%, completes, becomes hidden, or leaves the page. The dashboard consolidates
+the latest snapshot for each session and reports estimated active listening time, average active
+minutes, highest progress, milestone and completion rates, pause/resume totals, and the last known
+position. Active time counts only while the page is visible and Spotify reports playback as
+active and not buffering. Progress is cursor-based, so seeking forward can raise the highest
+progress and milestone values.
+
+View totals and episode, country, referrer, and recent-visit breakdowns in the password-protected
+dashboard. Recent visit and conversion-event timestamps display in the dashboard viewer's local
+timezone:
+
+```text
+GET /admin/landing-stats
 ```
 
 ## App API

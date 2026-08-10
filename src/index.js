@@ -1170,30 +1170,14 @@ const handleSpotifyLandingPage = (request) => {
       .intro { margin: 0 0 28px; }
       a { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; font-size: 1.125rem; font-weight: 800; text-decoration: none; }
       .app { background: #1ed760; color: #000; }
-      .divider { display: flex; align-items: center; gap: 14px; margin: 26px 0 18px; color: #b3b3b3; font-weight: 700; }
-      .divider::before, .divider::after { content: ""; height: 1px; flex: 1; background: #404040; }
-      #spotify-player { min-height: 152px; overflow: hidden; border-radius: 12px; }
-      iframe { display: block; border: 0; border-radius: 12px; }
       a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
     </style>
   </head>
   <body>
     <main>
       <h1>Listen on Spotify</h1>
-      <p class="intro">Open this episode in Spotify or play it without leaving this page.</p>
+      <p class="intro">Open this episode in Spotify.</p>
       <a class="app" data-destination="app" href="${escapeHtml(SPOTIFY_EPISODE_DEEP_LINK)}">Listen on Spotify</a>
-      <div class="divider"><span>or Play right here</span></div>
-      <div id="spotify-player" aria-label="Spotify episode player"></div>
-      <noscript>
-        <iframe
-          src="https://open.spotify.com/embed/episode/4bEoyIS2hWGkl75Xj1oWZa?utm_source=generator"
-          width="100%"
-          height="152"
-          allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-          loading="lazy"
-          title="Spotify episode player"
-        ></iframe>
-      </noscript>
     </main>
     <script>
       (function () {
@@ -1213,19 +1197,8 @@ const handleSpotifyLandingPage = (request) => {
           track("app");
         });
 
-        window.onSpotifyIframeApiReady = (IFrameAPI) => {
-          const element = document.getElementById("spotify-player");
-          IFrameAPI.createController(
-            element,
-            { uri: "${escapeHtml(SPOTIFY_EPISODE_DEEP_LINK)}", width: "100%", height: 152 },
-            (controller) => {
-              controller.addListener("playback_started", () => track("player"));
-            }
-          );
-        };
       })();
     </script>
-    <script src="https://open.spotify.com/embed/iframe-api/v1" async></script>
   </body>
 </html>`,
     {
@@ -1239,7 +1212,7 @@ const handleSpotifyLandingPage = (request) => {
   );
 };
 
-const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
+const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episodeSlug = "") => {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed", {
       status: 405,
@@ -1258,7 +1231,20 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
       return new Response("No episodes found", { status: 502 });
     }
 
-    const episodeSections = episodes
+    const selectedEpisode = episodeSlug
+      ? episodes.find((episode) => episode.slug === episodeSlug)
+      : null;
+
+    if (episodeSlug && !selectedEpisode) {
+      return new Response("Episode not found", {
+        status: 404,
+        headers: { "cache-control": "no-store" }
+      });
+    }
+
+    const visibleEpisodes = selectedEpisode ? [selectedEpisode] : episodes;
+
+    const episodeSections = visibleEpisodes
       .map(
         (episode) => `
           <article class="episode" id="${escapeHtml(episodeAnchor(episode))}">
@@ -1271,22 +1257,6 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
             <p class="published">${escapeHtml(episode.publishedAt)}</p>
             <h2>${escapeHtml(episode.title)}</h2>
             <p class="intro">${escapeHtml(episode.summary)}</p>
-            <div
-              class="episode-spotify-player"
-              id="spotify-player-${escapeHtml(episode.spotifyEpisodeId)}"
-              data-episode-id="${escapeHtml(episode.spotifyEpisodeId)}"
-              data-episode-title="${escapeHtml(episode.title)}"
-              aria-label="${escapeHtml(`${episode.title} Spotify player`)}"
-            ></div>
-            <noscript>
-              <iframe
-                class="episode-spotify-player-fallback"
-                src="https://open.spotify.com/embed/episode/${escapeHtml(episode.spotifyEpisodeId)}"
-                title="${escapeHtml(`${episode.title} Spotify player`)}"
-                loading="lazy"
-                allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-              ></iframe>
-            </noscript>
             <a
               class="spotify-link"
               data-destination="spotify"
@@ -1294,6 +1264,9 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
               data-episode-title="${escapeHtml(episode.title)}"
               href="${escapeHtml(episode.spotifyUrl)}"
             >Listen on Spotify</a>
+            ${selectedEpisode
+              ? ""
+              : `<a class="episode-link" href="${escapeHtml(episodePath(episode))}">Open episode</a>`}
             <a class="direct-link" href="#${escapeHtml(episodeAnchor(episode))}">Direct link to this episode</a>
           </article>`
       )
@@ -1304,7 +1277,9 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex, nofollow">
-    <title>Listen to ${escapeHtml(podcast.name)} on Spotify</title>
+    <title>${selectedEpisode
+      ? `${escapeHtml(selectedEpisode.title)} | ${escapeHtml(podcast.name)}`
+      : `Listen to ${escapeHtml(podcast.name)} on Spotify`}</title>
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(analytics.facebookPixelId)}
     <style>
@@ -1323,17 +1298,19 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
       .published { margin: 0 0 8px; color: #1ed760; font-size: .78rem; font-weight: 800; text-transform: uppercase; }
       h2 { margin: 0 0 12px; font-size: clamp(1.4rem, 6vw, 2rem); }
       .intro { margin: 0 0 28px; }
-      .episode-spotify-player, .episode-spotify-player-fallback { display: block; width: 100%; height: 152px; margin: 0 0 20px; overflow: hidden; border: 0; border-radius: 12px; }
       a { text-decoration: none; }
       .spotify-link { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; background: #1ed760; color: #000; font-size: 1.125rem; font-weight: 800; }
+      .episode-link { display: block; width: 100%; margin-top: 12px; padding: 16px 24px; border: 2px solid #fff; border-radius: 999px; color: #fff; font-size: 1rem; font-weight: 800; }
       .direct-link { display: inline-block; margin-top: 14px; color: #b3b3b3; font-size: .875rem; font-weight: 700; text-decoration: underline; }
       a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
     </style>
   </head>
   <body>
     <main>
-      <h1>Listen on Spotify</h1>
-      <p class="page-intro">Choose an episode to listen on Spotify.</p>
+      <h1>${selectedEpisode ? escapeHtml(selectedEpisode.title) : "Listen on Spotify"}</h1>
+      <p class="page-intro">${selectedEpisode
+        ? "Open this episode in Spotify."
+        : "Choose an episode to listen on Spotify."}</p>
       ${episodeSections}
     </main>
     <script>
@@ -1374,24 +1351,8 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}) => {
           ));
         });
 
-        window.onSpotifyIframeApiReady = (IFrameAPI) => {
-          document.querySelectorAll(".episode-spotify-player").forEach((element) => {
-            const episodeId = element.dataset.episodeId;
-            const episodeTitle = element.dataset.episodeTitle;
-            IFrameAPI.createController(
-              element,
-              { uri: "spotify:episode:" + episodeId, width: "100%", height: 152 },
-              (controller) => {
-                controller.addListener("playback_started", () => {
-                  track("player", episodeId, episodeTitle);
-                });
-              }
-            );
-          });
-        };
       })();
     </script>
-    <script src="https://open.spotify.com/embed/iframe-api/v1" async></script>
     ${renderPageViewNotification()}
     ${renderTimeOnSiteTracking(countryCode)}
     ${renderScrollDepthTracking(countryCode)}
@@ -2220,10 +2181,8 @@ const renderLandingEpisodePlayers = (episodes) =>
             <p class="episode-summary">${escapeHtml(episode.summary)}</p>
             <div class="episode-links">
               <a href="${escapeHtml(episodePath(episode))}">Episode details</a>
+              <a href="${escapeHtml(episode.spotifyUrl)}">Listen on Spotify</a>
               <a href="#${escapeHtml(episodeAnchor(episode))}" aria-label="Copyable link to ${escapeHtml(episode.title)}">Direct link</a>
-            </div>
-            <div class="player-wrap">
-              ${renderSpotifyPlayer(episode)}
             </div>
           </div>
         </article>`
@@ -2392,32 +2351,6 @@ const renderSiteHeader = ({ home = false, query = "" } = {}) => `
     </nav>
     ${renderSearchForm(query)}
   </header>`;
-
-const renderSpotifyPlayer = (episode) => episode.audioUrl ? `
-  <div class="spotify-player">
-    <audio
-      id="spotify-player-${escapeHtml(episode.id)}"
-      controls
-      preload="metadata"
-      src="${escapeHtml(episode.audioUrl)}"
-    >
-      Your browser does not support audio playback.
-    </audio>
-    <a href="${escapeHtml(episode.spotifyUrl)}" target="_blank" rel="noopener">
-      Open this episode in Spotify
-    </a>
-  </div>` : `
-  <div class="spotify-player">
-    <iframe
-      src="https://open.spotify.com/embed/episode/${escapeHtml(episode.spotifyEpisodeId)}"
-      title="${escapeHtml(`${episode.title} Spotify player`)}"
-      loading="lazy"
-      allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-    ></iframe>
-    <a href="${escapeHtml(episode.spotifyUrl)}" target="_blank" rel="noopener">
-      Open this episode in Spotify
-    </a>
-  </div>`;
 
 const renderPlaybackTracking = (episodes, countryCode) => {
   const audioPlayers = episodes
@@ -4869,35 +4802,6 @@ const styles = `
     font-size: 1.05rem;
   }
 
-  .player-wrap {
-    padding: 18px;
-    border: 1px solid #ddd2c4;
-    border-radius: 8px;
-    background: #fffaf2;
-    box-shadow: 0 18px 48px rgba(20, 15, 12, 0.14);
-  }
-
-  .spotify-player {
-    display: grid;
-    gap: 10px;
-  }
-
-  .spotify-player audio {
-    width: 100%;
-  }
-
-  .spotify-player iframe {
-    width: 100%;
-    height: 152px;
-    border: 0;
-    border-radius: 12px;
-  }
-
-  .spotify-player a {
-    color: var(--rust);
-    font-weight: 800;
-  }
-
   .case-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -5437,9 +5341,6 @@ const renderPage = (
             </a>
           </h2>
           <p class="episode-summary">${escapeHtml(featuredEpisode.summary)}</p>
-          <div class="player-wrap">
-            ${renderSpotifyPlayer(featuredEpisode)}
-          </div>
         </div>
       </section>`}
 
@@ -5476,10 +5377,6 @@ const renderPage = (
     </main>
 
     ${renderPageViewNotification()}
-    ${renderPlaybackTracking(
-      showAllEpisodePlayers ? visibleEpisodes : [featuredEpisode],
-      analytics.countryCode
-    )}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
   </body>
@@ -5520,7 +5417,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
           <p class="episode-published">Published ${escapeHtml(episode.publishedAt ?? "Episode")}</p>
           <p class="lede">${escapeHtml(episode.detail ?? episode.summary)}</p>
         </div>
-        <aside class="episode-play-panel" aria-label="Episode player">
+        <aside class="episode-play-panel" aria-label="Listen to this episode">
           ${renderEpisodeImage(episode, "episode-meta-image")}
           <p class="section-kicker">${escapeHtml(episode.publishedAt ?? "Episode")}</p>
           <a class="button" href="${escapeHtml(episode.href)}">Listen on Spotify</a>
@@ -5529,9 +5426,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
               ? '<a class="button transcript-button" href="#transcript">Read episode transcript</a>'
               : ""
           }
-          <div class="player-wrap">
-            ${renderSpotifyPlayer(episode)}
-          </div>
         </aside>
       </section>
     </div>
@@ -5552,7 +5446,6 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
     </main>
 
     ${renderPageViewNotification()}
-    ${renderPlaybackTracking([episode], analytics.countryCode)}
     ${renderEpisodeJumpNavTracking(episode, analytics.countryCode)}
     ${renderTimeOnSiteTracking(analytics.countryCode)}
     ${renderScrollDepthTracking(analytics.countryCode)}
@@ -6604,6 +6497,13 @@ export default {
       facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
     };
 
+    if (
+      (url.pathname === "/spotify" || url.pathname === "/spotify/") &&
+      ["GET", "HEAD"].includes(request.method)
+    ) {
+      return Response.redirect(podcast.spotify.showUrl, 302);
+    }
+
     if (url.pathname === SPOTIFY_LANDING_CLICK_ENDPOINT) {
       try {
         return handleSpotifyLandingClick(request, env, ctx);
@@ -6615,6 +6515,23 @@ export default {
 
     if (url.pathname === SPOTIFY_LANDING_PAGE_ENDPOINT) {
       return handlePublishedEpisodesLandingPage(request, analytics);
+    }
+
+    const episodeLandingMatch = url.pathname.match(/^\/landing-page\/([^/]+)\/?$/);
+
+    if (episodeLandingMatch) {
+      let episodeLandingSlug;
+
+      try {
+        episodeLandingSlug = decodeURIComponent(episodeLandingMatch[1]);
+      } catch (_error) {
+        return new Response("Invalid episode", {
+          status: 400,
+          headers: { "cache-control": "no-store" }
+        });
+      }
+
+      return handlePublishedEpisodesLandingPage(request, analytics, episodeLandingSlug);
     }
 
     if (request.method === "OPTIONS" && isApiRequest) {

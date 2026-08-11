@@ -26,12 +26,15 @@ const LANDING_PAGE_VISIT_PREFIX = "analytics/landing-page-visits/";
 const LANDING_PAGE_EVENT_PREFIX = "analytics/landing-page-events/";
 const LANDING_PAGE_PLAYBACK_PREFIX = "analytics/landing-page-playback/";
 const EPISODES_PER_PAGE = 9;
-const SPOTIFY_SHOW_REDIRECT_ENDPOINT = "/spotify";
+const SPOTIFY_SHOW_REDIRECT_ENDPOINTS = new Set([
+  "/redirect",
+  "/redirect/",
+  "/spotify",
+  "/spotify/"
+]);
 const SPOTIFY_LANDING_PAGE_ENDPOINT = "/landing-page";
 const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
 const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/playback`;
-const SPOTIFY_EPISODE_URL =
-  "https://open.spotify.com/episode/4bEoyIS2hWGkl75Xj1oWZa?si=16NvQlJ9RDau-62VTUzqlw";
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const BOT_USER_AGENT_PATTERN =
   /\b(bot|crawl|crawler|spider|slurp|preview|facebookexternalhit|discordbot|twitterbot|linkedinbot|slackbot|telegrambot|whatsapp|embedly|pinterest|google-inspectiontool|gptbot|chatgpt-user|ccbot|claudebot|perplexitybot|bytespider|yandex|duckduckbot|baiduspider|semrushbot|ahrefsbot|mj12bot|dotbot|petalbot|headlesschrome|lighthouse|pagespeed|pingdom|gtmetrix|uptimerobot|curl|wget|python-requests|go-http-client|java|axios|undici)\b/i;
@@ -154,73 +157,98 @@ const legacyEpisodeId = (title) => {
   return match?.[1] ?? null;
 };
 
-const fetchSpotifyShowEpisodes = async () => {
+const spotifyEpisodeIdsFromCreatorsPage = (html) => {
+  const idsByTitle = new Map();
+  const pattern =
+    /"title":"((?:\\.|[^"\\])*)","spotifyUrl":"https:\\u002F\\u002Fopen\.spotify\.com\\u002Fepisode\\u002F([A-Za-z0-9]+)"/g;
+
+  for (const match of String(html).matchAll(pattern)) {
+    try {
+      const title = JSON.parse(`"${match[1]}"`);
+      idsByTitle.set(normalizeSearchText(title), match[2]);
+    } catch {
+      // Ignore malformed embedded metadata and retain the RSS item URL as a fallback.
+    }
+  }
+
+  return idsByTitle;
+};
+
+const rssEpisodeFallbackId = (itemXml, title) => {
+  const enclosureUrl = xmlAttribute(itemXml, "enclosure", "url");
+  const playId = enclosureUrl.match(/\/podcast\/play\/(\d+)/)?.[1];
+
+  if (playId) {
+    return playId;
+  }
+
+  return xmlElement(itemXml, "guid").replace(/[^A-Za-z0-9]/g, "") || slugify(title);
+};
+
+const fetchPodcastRssEpisodes = async () => {
   const cacheSeconds = Math.max(30, podcast.spotify.cacheSeconds ?? 60);
-  const showUrl = new URL(podcast.spotify.showUrl);
-  showUrl.searchParams.set("site-cache", String(Math.floor(Date.now() / (cacheSeconds * 1000))));
-  const response = await fetch(showUrl, {
+  const cacheKey = String(Math.floor(Date.now() / (cacheSeconds * 1000)));
+  const rssUrl = new URL(podcast.spotify.rssUrl);
+  const creatorsUrl = new URL(podcast.spotify.creatorsUrl);
+  rssUrl.searchParams.set("site-cache", cacheKey);
+  creatorsUrl.searchParams.set("site-cache", cacheKey);
+  const requestOptions = {
     headers: {
-      accept: "text/html",
+      accept: "application/rss+xml,application/xml,text/xml,text/html",
       "user-agent": "The Last Known Podcast Website"
     },
     cf: {
       cacheTtl: cacheSeconds,
       cacheEverything: true
     }
-  });
+  };
+  const [rssResponse, creatorsResponse] = await Promise.all([
+    fetch(rssUrl, requestOptions),
+    fetch(creatorsUrl, requestOptions).catch(() => null)
+  ]);
 
-  if (!response.ok) {
-    throw new Error(`Spotify show page returned ${response.status}`);
+  if (!rssResponse.ok) {
+    throw new Error(`Podcast RSS feed returned ${rssResponse.status}`);
   }
 
-  const html = await response.text();
-  const encodedState = html.match(
-    /<script id="initialState" type="text\/plain">([^<]+)<\/script>/
-  )?.[1];
+  const [rssXml, creatorsHtml] = await Promise.all([
+    rssResponse.text(),
+    creatorsResponse?.ok ? creatorsResponse.text() : Promise.resolve("")
+  ]);
+  const spotifyIdsByTitle = spotifyEpisodeIdsFromCreatorsPage(creatorsHtml);
+  const channelImage = xmlAttribute(rssXml, "itunes:image", "href") || podcast.heroImage;
+  const itemMatches = rssXml.matchAll(/<item>([\s\S]*?)<\/item>/gi);
 
-  if (!encodedState) {
-    throw new Error("Spotify show page did not include episode data");
-  }
+  return [...itemMatches]
+    .map((match) => {
+      const itemXml = match[1];
+      const title = xmlElement(itemXml, "title").trim();
 
-  try {
-    const stateBytes = Uint8Array.from(atob(encodedState), (character) =>
-      character.charCodeAt(0)
-    );
-    const state = JSON.parse(new TextDecoder().decode(stateBytes));
-    const episodeNodes = new Map();
-    const visit = (value) => {
-      if (!value || typeof value !== "object") return;
-
-      if (
-        typeof value.id === "string" &&
-        typeof value.name === "string" &&
-        String(value.uri ?? "").startsWith("spotify:episode:")
-      ) {
-        episodeNodes.set(value.id, value);
+      if (!title) {
+        return null;
       }
 
-      for (const child of Object.values(value)) {
-        visit(child);
-      }
-    };
-    visit(state);
+      const descriptionHtml = xmlElement(itemXml, "description");
+      const description = stripHtml(descriptionHtml).trim();
+      const detail = description || `${title} from ${podcast.name}.`;
+      const publishedAt = xmlElement(itemXml, "pubDate");
+      const rssItemUrl = xmlElement(itemXml, "link");
+      const audioUrl = xmlAttribute(itemXml, "enclosure", "url");
+      const audioType = xmlAttribute(itemXml, "enclosure", "type");
+      const transcriptUrl = xmlAttribute(itemXml, "podcast:transcript", "url");
+      const transcriptType = xmlAttribute(itemXml, "podcast:transcript", "type");
+      const spotifyEpisodeId = spotifyIdsByTitle.get(normalizeSearchText(title)) || "";
+      const spotifyUrl = spotifyEpisodeId
+        ? `https://open.spotify.com/episode/${spotifyEpisodeId}`
+        : rssItemUrl;
+      const fallbackId = rssEpisodeFallbackId(itemXml, title);
 
-    return [...episodeNodes.values()]
-      .map((episode) => {
-        const description = stripHtml(episode.description ?? "").trim();
-        const detail = description || `${episode.name} from ${podcast.name}.`;
-        const publishedAt = episode.releaseDate?.isoString ?? "";
-        const artwork = Array.isArray(episode.coverArt?.sources)
-          ? episode.coverArt.sources.at(-1)?.url
-          : null;
-        const spotifyUrl = `https://open.spotify.com/episode/${episode.id}`;
-
-        return {
-          id: legacyEpisodeId(episode.name) || episode.id,
-          spotifyEpisodeId: episode.id,
-          slug: slugify(episode.name),
+      return {
+          id: legacyEpisodeId(title) || spotifyEpisodeId || fallbackId,
+          spotifyEpisodeId,
+          slug: slugify(title),
           status: "Episode",
-          title: episode.name,
+          title,
           summary: truncateText(detail),
           detail,
           publishedAt: formatPublishedDate(publishedAt),
@@ -228,28 +256,28 @@ const fetchSpotifyShowEpisodes = async () => {
           href: spotifyUrl,
           spotifyUrl,
           spotifyEpisodeUrl: spotifyUrl,
-          audioUrl: "",
-          audioType: "",
-          transcript: null,
-          image: artwork || podcast.heroImage,
-          mediaTypes: Array.isArray(episode.mediaTypes) ? episode.mediaTypes : [],
+          audioUrl,
+          audioType,
+          transcript: transcriptUrl
+            ? { url: transcriptUrl, type: transcriptType || "text/plain" }
+            : null,
+          image: xmlAttribute(itemXml, "itunes:image", "href") || channelImage,
+          mediaTypes: audioUrl ? ["AUDIO"] : [],
           body: description
             .split(/\n+/)
             .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
             .filter(Boolean)
         };
-      })
-      .sort((left, right) => String(right.publishedDate).localeCompare(String(left.publishedDate)));
-  } catch (error) {
-    throw new Error(`Unable to read Spotify episode data: ${error.message}`);
-  }
+    })
+    .filter(Boolean)
+    .sort((left, right) => String(right.publishedDate).localeCompare(String(left.publishedDate)));
 };
 
 const loadEpisodes = async () => {
   const limit = podcast.spotify.episodeLimit ?? 50;
   const videoOverviewTitleSuffixes = podcast.spotify.videoOverviewTitleSuffixes ?? [];
   const videoOverviewTitlePrefixes = podcast.spotify.videoOverviewTitlePrefixes ?? [];
-  const episodes = await fetchSpotifyShowEpisodes();
+  const episodes = await fetchPodcastRssEpisodes();
   const matchedSuffix = (title) =>
     videoOverviewTitleSuffixes.find((suffix) =>
       title.toLowerCase().endsWith(String(suffix).toLowerCase())
@@ -943,29 +971,6 @@ const fallbackText = (value, fallback = "Unknown") => {
   return text.length > 0 ? text : fallback;
 };
 
-const limitField = (value, maxLength = 1000) => {
-  const text = fallbackText(value);
-  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
-};
-
-const detectDevice = (userAgent = "") => {
-  const ua = userAgent.toLowerCase();
-
-  if (BOT_USER_AGENT_PATTERN.test(userAgent)) {
-    return "Bot / crawler";
-  }
-
-  if (/ipad|tablet/.test(ua)) {
-    return "Tablet";
-  }
-
-  if (/mobi|iphone|android/.test(ua)) {
-    return "Mobile";
-  }
-
-  return "Desktop";
-};
-
 const isLikelyBotRequest = (request, expectedMethod = "GET") => {
   if (request.method !== expectedMethod) {
     return true;
@@ -989,27 +994,6 @@ const isLikelyBotRequest = (request, expectedMethod = "GET") => {
   }
 
   return !accept.includes("text/html") && !accept.includes("*/*");
-};
-
-const getClientInfo = (request) => {
-  const headers = request.headers;
-  const cf = request.cf ?? {};
-  const userAgent = headers.get("user-agent") ?? "";
-
-  return {
-    device: detectDevice(userAgent),
-    country: cf.country ?? headers.get("cf-ipcountry"),
-    region: cf.region,
-    city: cf.city,
-    timezone: cf.timezone,
-    colo: cf.colo,
-    asn: cf.asn,
-    organization: cf.asOrganization,
-    ip: headers.get("cf-connecting-ip") ?? headers.get("x-forwarded-for"),
-    referrer: headers.get("referer"),
-    language: headers.get("accept-language"),
-    userAgent
-  };
 };
 
 const getCountryCode = (request) => {
@@ -1223,62 +1207,6 @@ const handleSpotifyLandingPlayback = async (request, env, ctx) => {
   });
 };
 
-const notifyPageView = (env, request, pageUrl, episode = null) => {
-  if (!env.DISCORD_WEBHOOK_URL) {
-    return Promise.resolve();
-  }
-
-  if (isLikelyBotRequest(request, "POST")) {
-    return Promise.resolve();
-  }
-
-  const url = new URL(pageUrl);
-  const client = getClientInfo(request);
-  const pageLabel = episode?.title ?? (url.pathname === "/" ? "Home page" : url.pathname);
-  const payload = {
-    username: podcast.name,
-    content: episode ? `Episode detail page viewed: ${episode.title}` : `Page viewed: ${pageLabel}`,
-    allowed_mentions: { parse: [] },
-    embeds: [
-      {
-        title: pageLabel,
-        url: url.href,
-        ...(episode?.summary ? { description: episode.summary } : {}),
-        ...(episode?.image ? { thumbnail: { url: episode.image } } : {}),
-        fields: [
-          ...(episode
-            ? [
-                { name: "Published", value: fallbackText(episode.publishedAt), inline: true },
-                { name: "Episode ID", value: fallbackText(episode.id), inline: true }
-              ]
-            : [{ name: "Page", value: limitField(url.pathname + url.search, 900), inline: false }]),
-          { name: "Device", value: client.device, inline: true },
-          { name: "Country", value: fallbackText(client.country), inline: true },
-          { name: "Region", value: fallbackText(client.region), inline: true },
-          { name: "City", value: fallbackText(client.city), inline: true },
-          { name: "Timezone", value: fallbackText(client.timezone), inline: true },
-          { name: "Cloudflare Colo", value: fallbackText(client.colo), inline: true },
-          { name: "Network", value: limitField(client.organization), inline: true },
-          { name: "ASN", value: fallbackText(client.asn), inline: true },
-          { name: "IP", value: fallbackText(client.ip), inline: true },
-          { name: "Language", value: limitField(client.language), inline: false },
-          { name: "Referrer", value: limitField(client.referrer, 900), inline: false },
-          { name: "Landing URL", value: limitField(url.href, 900), inline: false },
-          { name: "User Agent", value: limitField(client.userAgent), inline: false }
-        ]
-      }
-    ]
-  };
-
-  return fetch(env.DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  }).catch((error) => {
-    console.error("Discord webhook notification failed", error);
-  });
-};
-
 const handleSpotifyLandingClick = (request, env, ctx) => {
   if (request.method !== "POST") {
     return new Response("Method not allowed", {
@@ -1334,53 +1262,38 @@ const handleSpotifyLandingClick = (request, env, ctx) => {
     );
   }
 
-  const webhookBinding =
-    destination === "player"
-      ? "IFTTT_SPOTIFY_WEB_PLAYER_WEBHOOK_URL"
-      : "IFTTT_WEBHOOK_URL";
-  const webhookUrl = env[webhookBinding];
-
-  if (webhookUrl) {
-    const destinationLabels = {
-      spotify: "Spotify episode link",
-      app: "Spotify app",
-      browser: "web browser",
-      player: "embedded Spotify player"
-    };
-    const destinationLabel = destinationLabels[destination];
-
-    ctx.waitUntil(
-      fetch(webhookUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          value1: destinationLabel,
-          value2: String(request.headers.get("referer") ?? "").slice(0, 1000),
-          value3: episodeId
-            ? `https://open.spotify.com/episode/${episodeId}`
-            : SPOTIFY_EPISODE_URL
-        })
-      })
-        .then((iftttResponse) => {
-          if (!iftttResponse.ok) {
-            console.error("IFTTT webhook returned an error", iftttResponse.status);
-          }
-        })
-        .catch((error) => {
-          console.error("IFTTT webhook request failed", error);
-        })
-    );
-  } else {
-    console.error(`${webhookBinding} is not configured`);
-  }
-
   return new Response(null, {
     status: 204,
     headers: { "cache-control": "no-store" }
   });
 };
 
-const handleSpotifyLandingPage = (request, episode, analytics = {}) => {
+const notifySpotifyEpisodeRedirect = async (env, request, episode) => {
+  const webhookUrl = env.IFTTT_SPOTIFY_EPISODE_REDIRECT_WEBHOOK_URL;
+
+  if (!webhookUrl) {
+    return;
+  }
+
+  const episodeId = episode.spotifyEpisodeId || episode.id;
+  const spotifyEpisodeUrl =
+    episode.spotifyEpisodeUrl || `https://open.spotify.com/episode/${episodeId}`;
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      value1: String(episode.title).slice(0, 1000),
+      value2: String(request.url).slice(0, 1000),
+      value3: spotifyEpisodeUrl.slice(0, 1000)
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`IFTTT redirect webhook returned ${response.status}`);
+  }
+};
+
+const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}) => {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed", {
       status: 405,
@@ -1391,8 +1304,13 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}) => {
     });
   }
 
-  const episodeId = episode.spotifyEpisodeId;
-  const spotifyDeepLink = `spotify:episode:${episodeId}`;
+  const episodeId = episode.spotifyEpisodeId || episode.id;
+  const spotifyEpisodeUrl =
+    episode.spotifyEpisodeUrl || `https://open.spotify.com/episode/${episodeId}`;
+  const spotifyDeepLink = episode.spotifyEpisodeId
+    ? `spotify:episode:${episode.spotifyEpisodeId}`
+    : spotifyEpisodeUrl;
+  const autoRedirect = options.autoRedirect === true;
   const countryCode = analytics.countryCode || "XX";
   const body = `<!doctype html>
 <html lang="en">
@@ -1415,10 +1333,6 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}) => {
       .published { margin: 0 0 8px; color: #1ed760; font-size: .78rem; font-weight: 800; text-transform: uppercase; }
       a { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; font-size: 1.125rem; font-weight: 800; text-decoration: none; }
       .app { background: #1ed760; color: #000; }
-      .divider { display: flex; align-items: center; gap: 14px; margin: 26px 0 18px; color: #b3b3b3; font-weight: 700; }
-      .divider::before, .divider::after { content: ""; height: 1px; flex: 1; background: #404040; }
-      #spotify-player { min-height: 152px; overflow: hidden; border-radius: 12px; }
-      iframe { display: block; border: 0; border-radius: 12px; }
       a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
     </style>
   </head>
@@ -1429,121 +1343,18 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}) => {
       )}">
       <p class="published">${escapeHtml(episode.publishedAt)}</p>
       <h1>${escapeHtml(episode.title)}</h1>
-      <p class="intro">Open this episode in Spotify or play it without leaving this page.</p>
-      <a class="app" data-destination="app" href="${escapeHtml(spotifyDeepLink)}">Listen on Spotify</a>
-      <div class="divider"><span>or Play right here</span></div>
-      <div id="spotify-player" aria-label="Spotify episode player"></div>
-      <noscript>
-        <iframe
-          src="https://open.spotify.com/embed/episode/${escapeHtml(episodeId)}?utm_source=generator"
-          width="100%"
-          height="152"
-          allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-          loading="lazy"
-          title="Spotify episode player"
-        ></iframe>
-      </noscript>
+      <p class="intro">${
+        autoRedirect
+          ? "Opening this episode in Spotify&hellip;"
+          : "Open this episode in Spotify."
+      }</p>
+      <a class="app" data-destination="app" href="${escapeHtml(
+        autoRedirect ? spotifyEpisodeUrl : spotifyDeepLink
+      )}">${autoRedirect ? "Continue to Spotify" : "Listen on Spotify"}</a>
     </main>
     <script>
       (function () {
         const trackedDestinations = new Set();
-        const playbackEndpoint = "${escapeHtml(SPOTIFY_LANDING_PLAYBACK_ENDPOINT)}";
-        const playbackSession = {
-          id: window.crypto && typeof window.crypto.randomUUID === "function"
-            ? window.crypto.randomUUID()
-            : Date.now().toString(36) + "-" + Math.random().toString(36).slice(2),
-          started: false,
-          hasObservedPlaying: false,
-          activeMs: 0,
-          highestPercent: 0,
-          pauseCount: 0,
-          resumeCount: 0,
-          lastPositionMs: 0,
-          durationMs: 0,
-          milestones: new Set(),
-          completed: false,
-          state: null,
-          lastClock: Date.now(),
-          lastSnapshotAt: 0
-        };
-        const accrueActiveTime = () => {
-          const now = Date.now();
-          const elapsed = Math.max(0, Math.min(5000, now - playbackSession.lastClock));
-
-          if (
-            playbackSession.started &&
-            playbackSession.state &&
-            !playbackSession.state.isPaused &&
-            !playbackSession.state.isBuffering &&
-            document.visibilityState === "visible"
-          ) {
-            playbackSession.activeMs += elapsed;
-          }
-
-          playbackSession.lastClock = now;
-        };
-        const playbackPayload = (snapshotReason) => ({
-          episodeId: "${escapeHtml(episodeId)}",
-          episodeSlug: "${escapeHtml(episode.slug)}",
-          sessionId: playbackSession.id,
-          snapshotReason: snapshotReason,
-          highestPercent: playbackSession.highestPercent,
-          activeSeconds: playbackSession.activeMs / 1000,
-          pauseCount: playbackSession.pauseCount,
-          resumeCount: playbackSession.resumeCount,
-          lastPositionMs: playbackSession.lastPositionMs,
-          durationMs: playbackSession.durationMs,
-          milestone25: playbackSession.milestones.has(25),
-          milestone50: playbackSession.milestones.has(50),
-          milestone75: playbackSession.milestones.has(75),
-          milestone90: playbackSession.milestones.has(90),
-          completed: playbackSession.completed,
-          isPaused: playbackSession.state ? playbackSession.state.isPaused : true,
-          isBuffering: playbackSession.state ? playbackSession.state.isBuffering : false
-        });
-        const emitPlaybackAnalytics = (action, extraParameters) => {
-          const eventName = "thelastknownpodcast_spotify_playback_" + action +
-            "_${escapeHtml(countryCode)}";
-          const parameters = Object.assign({
-            country_code: "${escapeHtml(countryCode)}",
-            episode_id: "${escapeHtml(episodeId)}",
-            episode_title: ${safeJson(episode.title)},
-            page_path: window.location.pathname
-          }, extraParameters || {});
-
-          if (typeof window.gtag === "function") {
-            window.gtag("event", eventName, parameters);
-          }
-
-          if (typeof window.fbq === "function") {
-            window.fbq("trackCustom", eventName, parameters);
-          }
-        };
-        const sendPlaybackSnapshot = (snapshotReason, preferBeacon) => {
-          if (!playbackSession.started) return;
-
-          accrueActiveTime();
-          const now = Date.now();
-
-          if (snapshotReason === "periodic" && now - playbackSession.lastSnapshotAt < 30000) {
-            return;
-          }
-
-          playbackSession.lastSnapshotAt = now;
-          const body = JSON.stringify(playbackPayload(snapshotReason));
-
-          if (preferBeacon && navigator.sendBeacon && navigator.sendBeacon(playbackEndpoint, body)) {
-            return;
-          }
-
-          fetch(playbackEndpoint, {
-            method: "POST",
-            credentials: "same-origin",
-            keepalive: true,
-            headers: { "content-type": "application/json" },
-            body: body
-          }).catch(() => {});
-        };
         const track = (destination) => {
           if (trackedDestinations.has(destination)) return;
           trackedDestinations.add(destination);
@@ -1575,113 +1386,19 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}) => {
         document.querySelector("[data-destination='app']").addEventListener("click", () => {
           track("app");
         });
-
-        window.setInterval(() => {
-          accrueActiveTime();
-          sendPlaybackSnapshot("periodic", false);
-        }, 1000);
-
-        document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState === "hidden") {
-            sendPlaybackSnapshot("visibility_hidden", true);
-          } else {
-            playbackSession.lastClock = Date.now();
-          }
-        });
-
-        window.addEventListener("pagehide", () => {
-          sendPlaybackSnapshot("pagehide", true);
-        });
-
-        window.onSpotifyIframeApiReady = (IFrameAPI) => {
-          const element = document.getElementById("spotify-player");
-          IFrameAPI.createController(
-            element,
-            { uri: "${escapeHtml(spotifyDeepLink)}", width: "100%", height: 152 },
-            (controller) => {
-              controller.addListener("playback_started", () => {
-                playbackSession.started = true;
-                playbackSession.lastClock = Date.now();
-                track("player");
-              });
-              controller.addListener("playback_update", (event) => {
-                const data = event && event.data ? event.data : {};
-                const previousState = playbackSession.state;
-                const nextState = {
-                  isPaused: Boolean(data.isPaused),
-                  isBuffering: Boolean(data.isBuffering)
-                };
-                let snapshotReason = "";
-
-                accrueActiveTime();
-                playbackSession.lastPositionMs = Math.max(0, Number(data.position) || 0);
-                playbackSession.durationMs = Math.max(0, Number(data.duration) || 0);
-                playbackSession.state = nextState;
-
-                if (
-                  previousState &&
-                  !previousState.isPaused &&
-                  nextState.isPaused &&
-                  playbackSession.hasObservedPlaying
-                ) {
-                  playbackSession.pauseCount += 1;
-                  snapshotReason = "pause";
-                  emitPlaybackAnalytics("pause", {
-                    position_seconds: Math.round(playbackSession.lastPositionMs / 1000)
-                  });
-                } else if (
-                  previousState &&
-                  previousState.isPaused &&
-                  !nextState.isPaused &&
-                  playbackSession.hasObservedPlaying
-                ) {
-                  playbackSession.resumeCount += 1;
-                  snapshotReason = "resume";
-                  emitPlaybackAnalytics("resume", {
-                    position_seconds: Math.round(playbackSession.lastPositionMs / 1000)
-                  });
-                }
-
-                if (!nextState.isPaused) playbackSession.hasObservedPlaying = true;
-
-                if (playbackSession.durationMs > 0) {
-                  const percent = Math.min(
-                    100,
-                    Math.max(0, (playbackSession.lastPositionMs / playbackSession.durationMs) * 100)
-                  );
-                  playbackSession.highestPercent = Math.max(
-                    playbackSession.highestPercent,
-                    percent
-                  );
-                  const reachedMilestones = [25, 50, 75, 90].filter(
-                    (milestone) =>
-                      percent >= milestone && !playbackSession.milestones.has(milestone)
-                  );
-
-                  reachedMilestones.forEach((milestone) => {
-                    playbackSession.milestones.add(milestone);
-                    emitPlaybackAnalytics("milestone_" + milestone, {
-                      progress_percent: milestone
-                    });
-                  });
-
-                  if (reachedMilestones.length) snapshotReason = "milestone";
-
-                  if (percent >= 99 && !playbackSession.completed) {
-                    playbackSession.completed = true;
-                    snapshotReason = "completed";
-                    emitPlaybackAnalytics("completed", { progress_percent: percent });
-                  }
-                }
-
-                if (snapshotReason) sendPlaybackSnapshot(snapshotReason, false);
-              });
-            }
-          );
-        };
       })();
     </script>
-    <script src="https://open.spotify.com/embed/iframe-api/v1" async></script>
+    ${
+      autoRedirect
+        ? `<script>
+      window.addEventListener("load", function () {
+        window.setTimeout(function () {
+          window.location.replace(${safeJson(spotifyEpisodeUrl)});
+        }, 2000);
+      }, { once: true });
+    </script>`
+        : ""
+    }
     ${renderPageViewNotification(0)}
   </body>
 </html>`;
@@ -1696,7 +1413,14 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}) => {
   });
 };
 
-const handleSpotifyEpisodeLandingPage = async (request, episodeSlug, analytics = {}) => {
+const handleSpotifyEpisodeLandingPage = async (
+  request,
+  episodeSlug,
+  analytics = {},
+  env,
+  ctx,
+  options = {}
+) => {
   try {
     const episodes = await loadEpisodeCatalog();
     const episode = episodes.find((item) => item.slug === episodeSlug);
@@ -1708,7 +1432,19 @@ const handleSpotifyEpisodeLandingPage = async (request, episodeSlug, analytics =
       });
     }
 
-    return handleSpotifyLandingPage(request, episode, analytics);
+    if (
+      options.autoRedirect === true &&
+      request.method === "GET" &&
+      !isLikelyBotRequest(request, "GET")
+    ) {
+      ctx.waitUntil(
+        notifySpotifyEpisodeRedirect(env, request, episode).catch((error) => {
+          console.error("Spotify episode redirect webhook failed", error);
+        })
+      );
+    }
+
+    return handleSpotifyLandingPage(request, episode, analytics, options);
   } catch (error) {
     return new Response(`Unable to load Spotify episodes: ${error.message}`, {
       status: 502,
@@ -1840,7 +1576,7 @@ const spotifyLandingPagePath = (episode) =>
 const episodeAnchor = (episode) => `episode-${episode.slug}`;
 
 const spotifyLandingPageSlugFromPath = (pathname) => {
-  const match = pathname.match(/^\/landing-page\/([^/]+)\/?$/);
+  const match = pathname.match(/^\/landing-page\/([^/]+)(?:\/spotify)?\/?$/);
 
   if (!match || match[1] === "click") {
     return null;
@@ -5712,8 +5448,6 @@ const renderPage = (
     </main>
 
     ${renderPageViewNotification()}
-    ${renderTimeOnSiteTracking(analytics.countryCode)}
-    ${renderScrollDepthTracking(analytics.countryCode)}
     ${renderPlaybackTracking(
       showAllEpisodePlayers ? visibleEpisodes : [featuredEpisode],
       analytics.countryCode
@@ -7772,7 +7506,9 @@ export default {
     const url = new URL(request.url);
     const cacheControl = `public, max-age=${podcast.spotify.cacheSeconds}`;
     const apiEpisodeMatch = url.pathname.match(/^\/api\/episodes\/([^/]+)\/?$/);
-    const spotifyLandingPageMatch = url.pathname.match(/^\/landing-page\/([^/]+)\/?$/);
+    const spotifyLandingPageMatch = url.pathname.match(
+      /^\/landing-page\/([^/]+)(\/spotify)?\/?$/
+    );
     const isApiRequest =
       url.pathname === "/api/podcast" ||
       url.pathname === "/api/podcast/" ||
@@ -7784,10 +7520,7 @@ export default {
       facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
     };
 
-    if (
-      url.pathname === SPOTIFY_SHOW_REDIRECT_ENDPOINT ||
-      url.pathname === `${SPOTIFY_SHOW_REDIRECT_ENDPOINT}/`
-    ) {
+    if (SPOTIFY_SHOW_REDIRECT_ENDPOINTS.has(url.pathname)) {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return new Response("Method not allowed", {
           status: 405,
@@ -7835,7 +7568,9 @@ export default {
         return new Response("Invalid episode", { status: 400 });
       }
 
-      return handleSpotifyEpisodeLandingPage(request, episodeSlug, analytics);
+      return handleSpotifyEpisodeLandingPage(request, episodeSlug, analytics, env, ctx, {
+        autoRedirect: Boolean(spotifyLandingPageMatch[2])
+      });
     }
 
     if (request.method === "OPTIONS" && isApiRequest) {
@@ -7871,11 +7606,7 @@ export default {
           return new Response("Invalid page origin", { status: 400 });
         }
 
-        const episodeSlug = episodeSlugFromPath(pageUrl.pathname);
         const landingEpisodeSlug = spotifyLandingPageSlugFromPath(pageUrl.pathname);
-        const pageData = episodeSlug
-          ? await loadEpisodePageData(request, ctx, episodeSlug)
-          : null;
 
         if (landingEpisodeSlug) {
           const episodes = await loadEpisodeCatalog();
@@ -7897,7 +7628,6 @@ export default {
           }
         }
 
-        ctx.waitUntil(notifyPageView(env, request, pageUrl, pageData?.episode));
         return new Response(null, { status: 204 });
       }
 

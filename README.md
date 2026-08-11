@@ -1,6 +1,6 @@
 # The Last Known Podcast
 
-A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the public Spotify show catalog.
+A Cloudflare Worker homepage for a true crime podcast, built with Wrangler and powered by the podcast RSS feed.
 
 The dynamic `/sitemap.xml` includes the homepage, static pages, archive pagination, generated category archive pages, and every current Spotify episode page. New episodes are added automatically.
 
@@ -16,25 +16,17 @@ Update `src/podcast.config.js` to change the show copy, Spotify show URL, platfo
 
 Spotify episodes whose titles use a configured `spotify.videoOverviewTitleSuffixes` or `spotify.videoOverviewTitlePrefixes` value are treated as companion videos. They are omitted from the main episode catalog and matched to the audio episode with the same base title. Public video links use the matching Spotify episode rather than an R2-uploaded video.
 
-The Spotify show request uses a short time-bucketed cache key so newly published episodes normally appear on the website within about one minute of becoming available in the public catalog. Audio and video links use public `open.spotify.com/episode/...` URLs and can open in Spotify rather than Spotify for Creators.
+The RSS request uses a short time-bucketed cache key so newly published episodes normally appear on the website within about one minute of becoming available in the feed. One cached Spotify for Creators metadata request maps RSS items to public `open.spotify.com/episode/...` URLs.
 
 Placeholder links use `"#"` for platforms that are not configured yet. Replace those with the real podcast URLs when they are available.
-
-## Discord Webhook
-
-Local development reads `DISCORD_WEBHOOK_URL` from `.dev.vars`. For production, set it as a Cloudflare Worker secret:
-
-```bash
-npx wrangler secret put DISCORD_WEBHOOK_URL
-```
-
-Episode detail pages send the Discord notification in the background with `ctx.waitUntil`, so page rendering does not wait for Discord.
 
 Use the short Spotify endpoint to redirect listeners to the show page:
 
 ```text
-GET /spotify
+GET /redirect
 ```
+
+`GET /spotify` remains available as an alias.
 
 The Worker exposes a Spotify landing-page directory and a separate landing page for every
 published episode:
@@ -42,27 +34,24 @@ published episode:
 ```text
 GET /landing-page
 GET /landing-page/:episode-slug
+GET /landing-page/:episode-slug/spotify
 ```
 
 The directory lists the published episodes and links to their individual landing pages. Each
-episode page offers a large `spotify:episode:` link to open that episode in Spotify and an
-embedded player for that episode. Loading a page does not fire a webhook. Tapping the Spotify
-link or starting playback sends a background click request to `/landing-page/click` with the
-Spotify episode ID and queues an IFTTT event with `ctx.waitUntil`.
+episode page offers a large `spotify:episode:` link to open that episode in Spotify. The
+episode-specific `/spotify` route displays the landing page for two seconds so analytics pixels
+can fire, then redirects to that episode on Spotify. Tapping the Spotify link sends an internal
+analytics request to `/landing-page/click` with the Spotify episode ID.
 
-The IFTTT request sends the selected destination as `value1`, the landing-page referrer as
-`value2`, and the Spotify episode URL as `value3`. Spotify button taps use `IFTTT_WEBHOOK_URL`;
-embedded-player playback uses the separate `IFTTT_SPOTIFY_WEB_PLAYER_WEBHOOK_URL`. Store both
-complete private Maker Webhooks URLs as local values in `.dev.vars` or as production Worker
-secrets:
+Real browser GET requests to an episode-specific `/spotify` route also send a background IFTTT
+notification. Configure its private Maker Webhooks URL as a Worker secret:
 
 ```bash
-npx wrangler secret put IFTTT_WEBHOOK_URL
-npx wrangler secret put IFTTT_SPOTIFY_WEB_PLAYER_WEBHOOK_URL
+npx wrangler secret put IFTTT_SPOTIFY_EPISODE_REDIRECT_WEBHOOK_URL
 ```
 
-Individual episode landing pages record a view as soon as the page renders so clicks and player
-starts use the same page-view denominator. Each append-only visit record stores the episode,
+Individual episode landing pages record a view as soon as the page renders so Spotify clicks use
+the same page-view denominator. Each append-only visit record stores the episode,
 Cloudflare country code, sanitized referrer (query strings and fragments are removed), and timestamp in the configured
 `EPISODE_CONTENT` R2 bucket. The `/landing-page` directory itself is not counted, and IP
 addresses are not stored. When an individual episode landing-page URL includes

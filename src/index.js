@@ -35,6 +35,7 @@ const SPOTIFY_SHOW_REDIRECT_ENDPOINTS = new Set([
 const SPOTIFY_LANDING_PAGE_ENDPOINT = "/landing-page";
 const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
 const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/playback`;
+const ACAST_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/acast-play`;
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const BOT_USER_AGENT_PATTERN =
   /\b(bot|crawl|crawler|spider|slurp|preview|facebookexternalhit|discordbot|twitterbot|linkedinbot|slackbot|telegrambot|whatsapp|embedly|pinterest|google-inspectiontool|gptbot|chatgpt-user|ccbot|claudebot|perplexitybot|bytespider|yandex|duckduckbot|baiduspider|semrushbot|ahrefsbot|mj12bot|dotbot|petalbot|headlesschrome|lighthouse|pagespeed|pingdom|gtmetrix|uptimerobot|curl|wget|python-requests|go-http-client|java|axios|undici)\b/i;
@@ -1293,6 +1294,78 @@ const notifySpotifyEpisodeRedirect = async (env, request, episode) => {
   }
 };
 
+const notifyAcastPlayerPlay = async (env, request, episodeId) => {
+  const webhookUrl = env.IFTTT_ACAST_PLAYER_PLAY_WEBHOOK_URL;
+
+  if (!webhookUrl) {
+    return;
+  }
+
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      value1: "acast_player_play",
+      value2: String(episodeId || "unknown").slice(0, 1000),
+      value3: String(request.headers.get("referer") || request.url).slice(0, 1000)
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`IFTTT Acast play webhook returned ${response.status}`);
+  }
+};
+
+const handleAcastPlayerPlay = async (request, env, ctx) => {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST", "cache-control": "no-store" }
+    });
+  }
+
+  const requestUrl = new URL(request.url);
+  let requestReferrer;
+
+  try {
+    requestReferrer = new URL(request.headers.get("referer") || "");
+  } catch {
+    return new Response("Invalid landing page", {
+      status: 400,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  if (
+    requestReferrer.origin !== requestUrl.origin ||
+    requestReferrer.pathname !== SPOTIFY_LANDING_PAGE_ENDPOINT
+  ) {
+    return new Response("Invalid landing page", {
+      status: 400,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  let input = {};
+  try {
+    input = await request.json();
+  } catch {
+    // The episode ID is optional; still notify IFTTT for a verified player event.
+  }
+
+  const episodeId = String(input?.episodeId || "unknown").slice(0, 200);
+  ctx.waitUntil(
+    notifyAcastPlayerPlay(env, request, episodeId).catch((error) => {
+      console.error("Acast player play webhook failed", error);
+    })
+  );
+
+  return new Response(null, {
+    status: 204,
+    headers: { "cache-control": "no-store" }
+  });
+};
+
 const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}) => {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed", {
@@ -1513,7 +1586,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
     <meta name="robots" content="noindex, nofollow">
     <title>${selectedEpisode
       ? `${escapeHtml(selectedEpisode.title)} | ${escapeHtml(podcast.name)}`
-      : `Listen to ${escapeHtml(podcast.name)} on Spotify`}</title>
+      : `Listen to ${escapeHtml(podcast.name)}`}</title>
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(analytics.facebookPixelId)}
     <style>
@@ -1524,7 +1597,8 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       main { width: min(100%, 520px); margin: 0 auto; text-align: center; }
       h1 { margin: 0 0 12px; font-size: clamp(1.75rem, 8vw, 2.5rem); }
       .page-intro, .intro { color: #b3b3b3; line-height: 1.5; }
-      .page-intro { margin: 0 0 36px; }
+      .page-intro { margin: 0 0 28px; }
+      .acast-player { display: block; width: 100%; height: 280px; margin: 0 0 36px; border: 0; }
       .episode { padding: 36px 0; border-top: 1px solid #404040; }
       .episode:first-of-type { border-top: 0; }
       .episode-thumbnail { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 0 auto 24px; border-radius: 12px; object-fit: cover; }
@@ -1538,10 +1612,165 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
   </head>
   <body>
     <main>
-      <h1>Listen on Spotify</h1>
-      <p class="page-intro">Choose an episode to open its dedicated listening page.</p>
+      <h1>Listen to ${escapeHtml(podcast.name)}</h1>
+      <p class="page-intro">Play the show below or choose an episode to open its dedicated listening page.</p>
+      ${
+        selectedEpisode
+          ? ""
+          : `<iframe
+        id="acast-player"
+        class="acast-player"
+        src="https://embed.acast.com/6a9095ec3c34c5ade988d729?feed=true"
+        frameborder="0"
+        width="100%"
+        height="280"
+        allow="autoplay"
+        title="${escapeHtml(podcast.name)} Acast player"
+      ></iframe>`
+      }
       ${episodeSections}
     </main>
+    ${
+      selectedEpisode
+        ? ""
+        : `<script>
+      (function () {
+        const player = document.getElementById("acast-player");
+        const milestones = [25, 50, 75];
+        const reachedByEpisode = new Map();
+        let currentEpisode = "unknown";
+        let duration = 0;
+        let isPlaying = false;
+        let progressTimer = null;
+
+        const sendPlayerMessage = (eventName) => {
+          if (!player || !player.contentWindow) return;
+          player.contentWindow.postMessage(JSON.stringify({ eventName: eventName, data: {} }), "https://embed.acast.com");
+        };
+
+        const playerEventParameters = (action, percent) => {
+          const parameters = {
+            player: "acast",
+            player_action: action,
+            episode_id: currentEpisode,
+            country_code: "${escapeHtml(countryCode)}",
+            page_path: window.location.pathname
+          };
+
+          if (typeof percent === "number") parameters.percent_listened = percent;
+          return parameters;
+        };
+
+        const trackPlayerEvent = (action, percent) => {
+          const baseEventName = typeof percent === "number"
+            ? "acast_player_" + percent + "_percent"
+            : "acast_player_" + action;
+          const eventName = baseEventName + "_${escapeHtml(countryCode)}";
+          const parameters = playerEventParameters(action, percent);
+
+          if (typeof window.gtag === "function") {
+            window.gtag("event", eventName, parameters);
+          }
+
+          if (typeof window.fbq === "function") {
+            window.fbq("trackCustom", eventName, parameters);
+          }
+
+          if (action === "play") {
+            fetch("${escapeHtml(ACAST_PLAYER_PLAY_ENDPOINT)}", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ episodeId: currentEpisode }),
+              keepalive: true
+            }).catch(() => {});
+          }
+        };
+
+        const updateEpisode = (data) => {
+          const episode = data && (data.episode || data.acast || data.channel);
+          if (!episode || episode === currentEpisode) return;
+          currentEpisode = String(episode);
+          duration = 0;
+        };
+
+        const checkMilestones = (progress) => {
+          if (!(duration > 0) || !(progress >= 0)) return;
+          const percentComplete = (progress / duration) * 100;
+          const reached = reachedByEpisode.get(currentEpisode) || new Set();
+
+          milestones.forEach((milestone) => {
+            if (percentComplete >= milestone && !reached.has(milestone)) {
+              reached.add(milestone);
+              trackPlayerEvent("progress", milestone);
+            }
+          });
+
+          reachedByEpisode.set(currentEpisode, reached);
+        };
+
+        const startProgressChecks = () => {
+          if (progressTimer) return;
+          sendPlayerMessage("postmessage:get:current");
+          sendPlayerMessage("postmessage:get:duration");
+          sendPlayerMessage("postmessage:get:progress");
+          progressTimer = window.setInterval(() => {
+            sendPlayerMessage("postmessage:get:progress");
+          }, 1000);
+        };
+
+        const stopProgressChecks = () => {
+          if (!progressTimer) return;
+          window.clearInterval(progressTimer);
+          progressTimer = null;
+        };
+
+        window.addEventListener("message", (event) => {
+          if (
+            event.origin !== "https://embed.acast.com" ||
+            !player ||
+            event.source !== player.contentWindow
+          ) return;
+
+          let message = event.data;
+          if (typeof message === "string") {
+            try {
+              message = JSON.parse(message);
+            } catch {
+              return;
+            }
+          }
+
+          if (!message || typeof message !== "object") return;
+          const rawData = message.data;
+          const data = rawData && typeof rawData === "object" ? rawData : {};
+          updateEpisode(data);
+
+          if (message.eventName === "postmessage:on:play") {
+            if (!isPlaying) trackPlayerEvent("play");
+            isPlaying = true;
+            startProgressChecks();
+          } else if (message.eventName === "postmessage:on:pause") {
+            if (isPlaying) trackPlayerEvent("pause");
+            isPlaying = false;
+            sendPlayerMessage("postmessage:get:progress");
+            stopProgressChecks();
+          } else if (message.eventName === "postmessage:get:duration") {
+            const value = Number(
+              data.duration ?? message.duration ?? (typeof rawData === "object" ? NaN : rawData)
+            );
+            if (Number.isFinite(value) && value > 0) duration = value;
+          } else if (message.eventName === "postmessage:get:progress") {
+            const value = Number(
+              data.progress ?? message.progress ?? (typeof rawData === "object" ? NaN : rawData)
+            );
+            if (Number.isFinite(value)) checkMilestones(value);
+          }
+        });
+
+        window.addEventListener("pagehide", stopProgressChecks, { once: true });
+      })();
+    </script>`
+    }
     ${renderPageViewNotification()}
   </body>
 </html>`;
@@ -7551,6 +7780,15 @@ export default {
         return handleSpotifyLandingClick(request, env, ctx);
       } catch (error) {
         console.error("Spotify landing-page click failed", error);
+        return new Response(null, { status: 204 });
+      }
+    }
+
+    if (url.pathname === ACAST_PLAYER_PLAY_ENDPOINT) {
+      try {
+        return await handleAcastPlayerPlay(request, env, ctx);
+      } catch (error) {
+        console.error("Acast player play tracking failed", error);
         return new Response(null, { status: 204 });
       }
     }

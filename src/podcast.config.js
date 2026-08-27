@@ -10,7 +10,7 @@ export const podcast = {
   spotify: {
     showId: "033WJ1cMKIgiOKSOHMw5WW",
     showUrl: "https://open.spotify.com/show/033WJ1cMKIgiOKSOHMw5WW",
-    rssUrl: "https://anchor.fm/s/115607ab4/podcast/rss",
+    rssUrl: "https://feeds.acast.com/public/shows/6a9095ec3c34c5ade988d729",
     creatorsUrl: "https://creators.spotify.com/pod/profile/train-station-records1",
     episodeLimit: 50,
     videoOverviewTitleSuffixes: [" - Video Overview"],

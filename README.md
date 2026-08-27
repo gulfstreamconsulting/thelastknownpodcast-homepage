@@ -50,6 +50,13 @@ notification. Configure its private Maker Webhooks URL as a Worker secret:
 npx wrangler secret put IFTTT_SPOTIFY_EPISODE_REDIRECT_WEBHOOK_URL
 ```
 
+The Acast player on `/landing-page` also sends an IFTTT notification when playback starts.
+Configure its private Maker Webhooks URL separately:
+
+```bash
+npx wrangler secret put IFTTT_ACAST_PLAYER_PLAY_WEBHOOK_URL
+```
+
 Individual episode landing pages record a view as soon as the page renders so Spotify clicks use
 the same page-view denominator. Each append-only visit record stores the episode,
 Cloudflare country code, sanitized referrer (query strings and fragments are removed), and timestamp in the configured

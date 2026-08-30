@@ -1606,7 +1606,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       : isColdAudience
         ? selectColdAudienceEpisodes(episodes)
         : episodes;
-    const facebookViewContentParameters = isColdAudience
+    const viewContentParameters = isColdAudience
       ? safeJson({
           content_name: `${podcast.name} Cold Audience Episodes`,
           content_category: "Podcast Episodes",
@@ -1721,35 +1721,39 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
         const players = Array.from(document.querySelectorAll("[data-acast-player]"));
         const milestones = [25, 50, 75];
         const statesByWindow = new Map();
-        const facebookViewContentParameters = ${
-          facebookViewContentParameters && analytics.facebookPixelId
-            ? facebookViewContentParameters
-            : "null"
-        };
-        let hasTrackedFacebookViewContent = false;
+        const viewContentParameters = ${viewContentParameters || "null"};
+        let hasTrackedViewContent = false;
 
-        const trackFacebookViewContent = (engagementSource) => {
+        const trackViewContent = (engagementSource) => {
           if (
-            hasTrackedFacebookViewContent ||
-            !facebookViewContentParameters ||
-            typeof window.fbq !== "function"
+            hasTrackedViewContent ||
+            !viewContentParameters ||
+            (typeof window.gtag !== "function" && typeof window.fbq !== "function")
           ) return;
 
-          hasTrackedFacebookViewContent = true;
+          hasTrackedViewContent = true;
           window.removeEventListener("scroll", handleEngagedScroll);
-          window.fbq("track", "ViewContent", {
-            ...facebookViewContentParameters,
+          const parameters = {
+            ...viewContentParameters,
             engagement_source: engagementSource
-          });
+          };
+
+          if (typeof window.gtag === "function") {
+            window.gtag("event", "ViewContent", parameters);
+          }
+
+          if (typeof window.fbq === "function") {
+            window.fbq("track", "ViewContent", parameters);
+          }
         };
 
         const handleEngagedScroll = () => {
           if (window.scrollY >= 100) {
-            trackFacebookViewContent("scroll");
+            trackViewContent("scroll");
           }
         };
 
-        if (facebookViewContentParameters) {
+        if (viewContentParameters) {
           window.addEventListener("scroll", handleEngagedScroll, { passive: true });
         }
 
@@ -1858,7 +1862,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           const data = rawData && typeof rawData === "object" ? rawData : {};
 
           if (message.eventName === "postmessage:on:play") {
-            trackFacebookViewContent("acast_play");
+            trackViewContent("acast_play");
             if (!state.isPlaying) trackPlayerEvent(state, "play");
             state.isPlaying = true;
             startProgressChecks(state);

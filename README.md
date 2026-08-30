@@ -104,10 +104,11 @@ Google Analytics uses the configured measurement ID in `src/podcast.config.js`. 
 npx wrangler secret put FACEBOOK_PIXEL_ID
 ```
 
-The cold-audience landing page emits Meta's standard `ViewContent` event once after meaningful
-engagement: either the first Acast play or a deliberate scroll of at least 100 pixels. It does not
-fire on page load. The event includes the engagement source, page variant, featured episode, and
-episode count as parameters. Acast play, pause, and progress events remain separate custom events.
+The cold-audience landing page emits a `ViewContent` event to both Google Analytics and Meta once
+after meaningful engagement: either the first Acast play or a deliberate scroll of at least 100
+pixels. It does not fire on page load. The event includes the engagement source, page variant,
+featured episode, and episode count as parameters. Acast play, pause, and progress events remain
+separate custom events.
 
 ## Episode Content
 

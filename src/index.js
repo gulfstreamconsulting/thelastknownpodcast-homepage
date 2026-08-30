@@ -1632,15 +1632,23 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
                 )}`
               : "";
           const episodeAction = acastEmbedUrl
-            ? `<iframe
-                  class="acast-player"
-                  data-acast-player
-                  data-episode-id="${escapeHtml(episode.acastEpisodeId)}"
-                  src="${escapeHtml(acastEmbedUrl)}"
-                  loading="lazy"
-                  allow="autoplay"
-                  title="${escapeHtml(`${episode.title} Acast player`)}"
-                ></iframe>`
+            ? `<div class="episode-player">
+                <button
+                  class="episode-play-cta"
+                  type="button"
+                  data-acast-play
+                  aria-label="${escapeHtml(`Play ${episode.title}`)}"
+                ><span aria-hidden="true">▶</span> Play Episode</button>
+                <iframe
+                    class="acast-player"
+                    data-acast-player
+                    data-episode-id="${escapeHtml(episode.acastEpisodeId)}"
+                    src="${escapeHtml(acastEmbedUrl)}"
+                    loading="lazy"
+                    allow="autoplay"
+                    title="${escapeHtml(`${episode.title} Acast player`)}"
+                  ></iframe>
+              </div>`
             : `<a class="episode-link" href="${escapeHtml(episodeHref)}">${
                 isColdAudience ? "Listen on Spotify" : "Open episode"
               }</a>`;
@@ -1683,6 +1691,12 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       .page-intro, .intro { color: #b3b3b3; line-height: 1.5; }
       .page-intro { margin: 0 0 28px; }
       .acast-player { display: block; width: 100%; height: 190px; margin: 0; border: 0; }
+      .episode-player { width: 100%; }
+      .episode-play-cta { display: flex; align-items: center; justify-content: center; gap: 12px; width: 100%; min-height: 64px; margin: 0 0 14px; padding: 18px 24px; border: 0; border-radius: 999px; background: #1ed760; color: #000; font: inherit; font-size: 1.2rem; font-weight: 900; cursor: pointer; box-shadow: 0 8px 24px rgba(30, 215, 96, .22); }
+      .episode-play-cta:hover { background: #3be477; transform: translateY(-1px); }
+      .episode-play-cta:active { transform: translateY(0); }
+      .episode-play-cta[aria-pressed="true"] { background: #fff; }
+      .episode-play-cta:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
       .episode { padding: 36px 0; border-top: 1px solid #404040; }
       .episode:first-of-type { border-top: 0; }
       .episode-thumbnail { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 0 auto 24px; border-radius: 12px; object-fit: cover; }
@@ -1696,7 +1710,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       .cold-audience .page-intro { margin-bottom: 12px; }
       .cold-audience .episode:first-of-type { padding-top: 12px; }
       .cold-audience .episode:first-of-type .episode-thumbnail { display: none; }
-      .cold-audience .episode:first-of-type .acast-player { margin-bottom: 18px; }
+      .cold-audience .episode:first-of-type .episode-player { margin-bottom: 18px; }
       .cold-audience .episode:first-of-type .intro { margin-bottom: 0; }
       @media (max-width: 480px) {
         body.cold-audience { padding-right: 16px; padding-left: 16px; }
@@ -1759,13 +1773,31 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
 
         players.forEach((player) => {
           if (!player.contentWindow) return;
-          statesByWindow.set(player.contentWindow, {
+          const state = {
             player: player,
+            playButton: player.closest(".episode")?.querySelector("[data-acast-play]") || null,
             episodeId: player.dataset.episodeId || "unknown",
             duration: 0,
             isPlaying: false,
+            pendingPlay: false,
             progressTimer: null,
             reached: new Set()
+          };
+          statesByWindow.set(player.contentWindow, state);
+
+          const requestPlayback = () => {
+            statesByWindow.forEach((otherState) => {
+              if (otherState !== state && otherState.isPlaying) {
+                sendPlayerMessage(otherState, "postmessage:do:pause");
+              }
+            });
+            state.pendingPlay = true;
+            sendPlayerMessage(state, "postmessage:do:play");
+          };
+
+          state.playButton?.addEventListener("click", requestPlayback);
+          player.addEventListener("load", () => {
+            if (state.pendingPlay && !state.isPlaying) requestPlayback();
           });
         });
 
@@ -1865,10 +1897,20 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             trackViewContent("acast_play");
             if (!state.isPlaying) trackPlayerEvent(state, "play");
             state.isPlaying = true;
+            state.pendingPlay = false;
+            if (state.playButton) {
+              state.playButton.setAttribute("aria-pressed", "true");
+              state.playButton.innerHTML = '<span aria-hidden="true">▶</span> Playing';
+            }
             startProgressChecks(state);
           } else if (message.eventName === "postmessage:on:pause") {
             if (state.isPlaying) trackPlayerEvent(state, "pause");
             state.isPlaying = false;
+            state.pendingPlay = false;
+            if (state.playButton) {
+              state.playButton.setAttribute("aria-pressed", "false");
+              state.playButton.innerHTML = '<span aria-hidden="true">▶</span> Play Episode';
+            }
             sendPlayerMessage(state, "postmessage:get:progress");
             stopProgressChecks(state);
           } else if (message.eventName === "postmessage:get:duration") {

@@ -38,8 +38,8 @@ GET /landing-page/:episode-slug
 GET /landing-page/:episode-slug/spotify
 ```
 
-The directory lists the published episodes with an episode-specific Acast player on each card,
-including the eight-card cold-audience view.
+The directory lists the published episodes with an episode-specific Acast player and prominent
+play button on each card, including the eight-card cold-audience view.
 The episode-specific `/spotify` route displays the landing page for two seconds so analytics
 pixels can fire, then redirects to that episode on Spotify. Tapping a Spotify link sends an
 internal analytics request to `/landing-page/click` with the Spotify episode ID.

@@ -33,15 +33,21 @@ published episode:
 
 ```text
 GET /landing-page
+GET /landing-page?audience=cold
 GET /landing-page/:episode-slug
 GET /landing-page/:episode-slug/spotify
 ```
 
-The directory lists the published episodes and links to their individual landing pages. Each
-episode page offers a large `spotify:episode:` link to open that episode in Spotify. The
-episode-specific `/spotify` route displays the landing page for two seconds so analytics pixels
-can fire, then redirects to that episode on Spotify. Tapping the Spotify link sends an internal
-analytics request to `/landing-page/click` with the Spotify episode ID.
+The directory lists the published episodes with an episode-specific Acast player on each card,
+including the eight-card cold-audience view.
+The episode-specific `/spotify` route displays the landing page for two seconds so analytics
+pixels can fire, then redirects to that episode on Spotify. Tapping a Spotify link sends an
+internal analytics request to `/landing-page/click` with the Spotify episode ID.
+
+The `?audience=cold` option limits the directory to eight curated, high-interest starter episodes.
+The priority order is configured with `spotify.coldAudienceEpisodeTitles` in
+`src/podcast.config.js`; if a configured title is unavailable, the newest published episode fills
+the open slot.
 
 Real browser GET requests to an episode-specific `/spotify` route also send a background IFTTT
 notification. Configure its private Maker Webhooks URL as a Worker secret:
@@ -50,7 +56,7 @@ notification. Configure its private Maker Webhooks URL as a Worker secret:
 npx wrangler secret put IFTTT_SPOTIFY_EPISODE_REDIRECT_WEBHOOK_URL
 ```
 
-The Acast player on `/landing-page` also sends an IFTTT notification when playback starts.
+Each Acast episode player on `/landing-page` also sends an IFTTT notification when playback starts.
 Configure its private Maker Webhooks URL separately:
 
 ```bash
@@ -65,32 +71,13 @@ addresses are not stored. When an individual episode landing-page URL includes
 `?source=facebook_ad`, its stored referrer is `facebook_ad` regardless of the browser referrer.
 
 The same episode landing pages also record the first embedded Spotify web-player start and the
-first Spotify episode-button click during each page load. The dashboard reports both event
-totals per episode and these conversion metrics:
-
-- Web-player start rate: Spotify web-player starts divided by episode landing-page views.
-- Spotify click-through rate: Spotify episode clicks divided by episode landing-page views.
-
-The dashboard plots both rates by day for the latest 30 days. The graph follows the selected
-episode and country filters and groups dates using the `America/New_York` timezone. Dashboard
-totals, episode rows, traffic-source breakdowns, and recent activity use the same filters.
+first Spotify episode-button click during each page load.
 
 Spotify `playback_update` events also maintain a cumulative embedded-player session snapshot.
 Snapshots are saved every 30 seconds while listening and when playback pauses, resumes, reaches
-25%, 50%, 75%, or 90%, completes, becomes hidden, or leaves the page. The dashboard consolidates
-the latest snapshot for each session and reports estimated active listening time, average active
-minutes, highest progress, milestone and completion rates, pause/resume totals, and the last known
-position. Active time counts only while the page is visible and Spotify reports playback as
-active and not buffering. Progress is cursor-based, so seeking forward can raise the highest
-progress and milestone values.
-
-View totals and episode, country, referrer, and recent-visit breakdowns in the password-protected
-dashboard. Recent visit and conversion-event timestamps display in the dashboard viewer's local
-timezone:
-
-```text
-GET /admin/landing-stats
-```
+25%, 50%, 75%, or 90%, completes, becomes hidden, or leaves the page. Active time counts only
+while the page is visible and Spotify reports playback as active and not buffering. Progress is
+cursor-based, so seeking forward can raise the highest progress and milestone values.
 
 ## App API
 
@@ -117,6 +104,11 @@ Google Analytics uses the configured measurement ID in `src/podcast.config.js`. 
 npx wrangler secret put FACEBOOK_PIXEL_ID
 ```
 
+The cold-audience landing page emits Meta's standard `ViewContent` event once after meaningful
+engagement: either the first Acast play or a deliberate scroll of at least 100 pixels. It does not
+fire on page load. The event includes the engagement source, page variant, featured episode, and
+episode count as parameters. Acast play, pause, and progress events remain separate custom events.
+
 ## Episode Content
 
 The password-protected `/admin/content` page lets you manage companion articles, maps, and supporting files. Images, PDFs, and other supporting files are stored in Cloudflare R2. Public video overview links are discovered from matching Spotify episodes and do not use legacy R2 or YouTube video assets.
@@ -141,6 +133,40 @@ ADMIN_PASSWORD=choose-a-long-password
 ```
 
 Uploads are limited to 25 MB. Attachment files and their metadata manifests are both stored in the `EPISODE_CONTENT` R2 binding.
+
+## Spreaker Dashboard
+
+The password-protected `/admin/spreaker` dashboard displays private Spreaker statistics for show
+`6837695`, including all-time totals, daily plays and downloads, listeners, episode performance,
+sources, devices, and countries. Podcast statistics compare all-time totals with a rolling 30-day
+column that remains independent of the custom date filter. The default chart range is 30 days
+and can be changed in the page.
+
+Spreaker's documented OAuth API does not expose Ad Exchange revenue. Export the Ad Exchange CSV
+from the Spreaker CMS and upload it in the dashboard to add actual impressions, revenue, effective
+CPM, daily monetization, and any included podcast/category/country breakdown. The normalized report
+is stored privately in the `EPISODE_CONTENT` R2 bucket and a new import replaces the prior report.
+The organization impressions export is supported directly, including its `impressions_sold`,
+`revenue_amount`, and download/on-demand/live breakdown columns.
+
+Set the Spreaker OAuth client secret without committing it:
+
+```bash
+npx wrangler secret put SPREAKER_CLIENT_SECRET
+```
+
+The OAuth client ID is configured as `SPREAKER_CLIENT_ID` in `wrangler.jsonc`. In the Spreaker
+developer application, register this production callback URL exactly:
+
+```text
+https://www.thelastknownpodcast.com/admin/spreaker/oauth/callback
+```
+
+For local development, add `SPREAKER_CLIENT_ID` and `SPREAKER_CLIENT_SECRET` to `.dev.vars`, then
+register the callback URL printed on the dashboard's connection screen. Visit `/admin/spreaker`,
+choose **Connect Spreaker**, and authorize the account that owns the show. OAuth access and refresh
+tokens are stored server-side in the configured `EPISODE_CONTENT` R2 bucket and are never sent to
+the browser.
 
 ### Legacy YouTube-to-R2 migration
 

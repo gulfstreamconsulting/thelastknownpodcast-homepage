@@ -4,7 +4,8 @@
 	"main": "src/index.js",
 	"compatibility_date": "2026-06-03",
 	"vars": {
-		"ADMIN_USERNAME": "admin"
+		"ADMIN_USERNAME": "admin",
+		"SPREAKER_CLIENT_ID": "43320"
 	},
 	"assets": {
 		"directory": "./public",

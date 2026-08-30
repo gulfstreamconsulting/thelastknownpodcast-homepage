@@ -1,4 +1,10 @@
 import { podcast } from "./podcast.config.js";
+import {
+  handleSpreakerCallback,
+  handleSpreakerConnect,
+  handleSpreakerDashboard,
+  handleSpreakerMonetizationUpload
+} from "./spreaker-dashboard.js";
 
 const escapeHtml = (value) =>
   String(value)
@@ -36,6 +42,7 @@ const SPOTIFY_LANDING_PAGE_ENDPOINT = "/landing-page";
 const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
 const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/playback`;
 const ACAST_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/acast-play`;
+const COLD_AUDIENCE_EPISODE_LIMIT = 8;
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const BOT_USER_AGENT_PATTERN =
   /\b(bot|crawl|crawler|spider|slurp|preview|facebookexternalhit|discordbot|twitterbot|linkedinbot|slackbot|telegrambot|whatsapp|embedly|pinterest|google-inspectiontool|gptbot|chatgpt-user|ccbot|claudebot|perplexitybot|bytespider|yandex|duckduckbot|baiduspider|semrushbot|ahrefsbot|mj12bot|dotbot|petalbot|headlesschrome|lighthouse|pagespeed|pingdom|gtmetrix|uptimerobot|curl|wget|python-requests|go-http-client|java|axios|undici)\b/i;
@@ -238,6 +245,8 @@ const fetchPodcastRssEpisodes = async () => {
       const audioType = xmlAttribute(itemXml, "enclosure", "type");
       const transcriptUrl = xmlAttribute(itemXml, "podcast:transcript", "url");
       const transcriptType = xmlAttribute(itemXml, "podcast:transcript", "type");
+      const acastEpisodeId = xmlElement(itemXml, "acast:episodeId").trim();
+      const acastShowId = xmlElement(itemXml, "acast:showId").trim();
       const spotifyEpisodeId = spotifyIdsByTitle.get(normalizeSearchText(title)) || "";
       const spotifyUrl = spotifyEpisodeId
         ? `https://open.spotify.com/episode/${spotifyEpisodeId}`
@@ -247,6 +256,8 @@ const fetchPodcastRssEpisodes = async () => {
       return {
           id: legacyEpisodeId(title) || spotifyEpisodeId || fallbackId,
           spotifyEpisodeId,
+          acastEpisodeId,
+          acastShowId,
           slug: slugify(title),
           status: "Episode",
           title,
@@ -1380,9 +1391,7 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
   const episodeId = episode.spotifyEpisodeId || episode.id;
   const spotifyEpisodeUrl =
     episode.spotifyEpisodeUrl || `https://open.spotify.com/episode/${episodeId}`;
-  const spotifyDeepLink = episode.spotifyEpisodeId
-    ? `spotify:episode:${episode.spotifyEpisodeId}`
-    : spotifyEpisodeUrl;
+  const trackedSpotifyUrl = `${spotifyLandingPagePath(episode)}/spotify`;
   const autoRedirect = options.autoRedirect === true;
   const countryCode = analytics.countryCode || "XX";
   const body = `<!doctype html>
@@ -1422,7 +1431,7 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
           : "Open this episode in Spotify."
       }</p>
       <a class="app" data-destination="app" href="${escapeHtml(
-        autoRedirect ? spotifyEpisodeUrl : spotifyDeepLink
+        autoRedirect ? spotifyEpisodeUrl : trackedSpotifyUrl
       )}">${autoRedirect ? "Continue to Spotify" : "Listen on Spotify"}</a>
     </main>
     <script>
@@ -1526,6 +1535,38 @@ const handleSpotifyEpisodeLandingPage = async (
   }
 };
 
+const selectColdAudienceEpisodes = (episodes) => {
+  const selectedEpisodes = [];
+  const selectedEpisodeIds = new Set();
+  const episodesByTitle = new Map(
+    episodes.map((episode) => [normalizeSearchText(episode.title), episode])
+  );
+
+  for (const title of podcast.spotify.coldAudienceEpisodeTitles ?? []) {
+    const episode = episodesByTitle.get(normalizeSearchText(title));
+
+    if (!episode || selectedEpisodeIds.has(episode.id)) {
+      continue;
+    }
+
+    selectedEpisodes.push(episode);
+    selectedEpisodeIds.add(episode.id);
+  }
+
+  for (const episode of episodes) {
+    if (selectedEpisodes.length >= COLD_AUDIENCE_EPISODE_LIMIT) {
+      break;
+    }
+
+    if (!selectedEpisodeIds.has(episode.id)) {
+      selectedEpisodes.push(episode);
+      selectedEpisodeIds.add(episode.id);
+    }
+  }
+
+  return selectedEpisodes.slice(0, COLD_AUDIENCE_EPISODE_LIMIT);
+};
+
 const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episodeSlug = "") => {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed", {
@@ -1539,6 +1580,10 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
 
   try {
     const episodes = await loadEpisodeCatalog();
+    const pageUrl = new URL(request.url);
+    const isColdAudience = pageUrl.searchParams.get("audience")?.toLowerCase() === "cold";
+    const attributionSource =
+      pageUrl.searchParams.get("source") === "facebook_ad" ? "facebook_ad" : "";
     const countryCode = analytics.countryCode || "XX";
 
     if (!episodes.length) {
@@ -1556,11 +1601,51 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       });
     }
 
-    const visibleEpisodes = selectedEpisode ? [selectedEpisode] : episodes;
+    const visibleEpisodes = selectedEpisode
+      ? [selectedEpisode]
+      : isColdAudience
+        ? selectColdAudienceEpisodes(episodes)
+        : episodes;
+    const facebookViewContentParameters = isColdAudience
+      ? safeJson({
+          content_name: `${podcast.name} Cold Audience Episodes`,
+          content_category: "Podcast Episodes",
+          page_variant: "cold_audience",
+          featured_episode: visibleEpisodes[0]?.title || "",
+          episode_count: visibleEpisodes.length
+        })
+      : "";
 
     const episodeSections = visibleEpisodes
       .map(
-        (episode) => `
+        (episode, episodeIndex) => {
+          const isFeaturedColdEpisode = isColdAudience && episodeIndex === 0;
+          const episodeHref = isColdAudience
+            ? `${spotifyLandingPagePath(episode)}/spotify${
+                attributionSource ? `?source=${encodeURIComponent(attributionSource)}` : ""
+              }`
+            : spotifyLandingPagePath(episode);
+          const acastEmbedUrl =
+            episode.acastShowId && episode.acastEpisodeId
+              ? `https://embed.acast.com/${encodeURIComponent(episode.acastShowId)}/${encodeURIComponent(
+                  episode.acastEpisodeId
+                )}`
+              : "";
+          const episodeAction = acastEmbedUrl
+            ? `<iframe
+                  class="acast-player"
+                  data-acast-player
+                  data-episode-id="${escapeHtml(episode.acastEpisodeId)}"
+                  src="${escapeHtml(acastEmbedUrl)}"
+                  loading="lazy"
+                  allow="autoplay"
+                  title="${escapeHtml(`${episode.title} Acast player`)}"
+                ></iframe>`
+            : `<a class="episode-link" href="${escapeHtml(episodeHref)}">${
+                isColdAudience ? "Listen on Spotify" : "Open episode"
+              }</a>`;
+
+          return `
           <article class="episode">
             <img
               class="episode-thumbnail"
@@ -1570,12 +1655,11 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             >
             <p class="published">${escapeHtml(episode.publishedAt)}</p>
             <h2>${escapeHtml(episode.title)}</h2>
+            ${isFeaturedColdEpisode ? episodeAction : ""}
             <p class="intro">${escapeHtml(episode.summary)}</p>
-            <a
-              class="episode-link"
-              href="${escapeHtml(spotifyLandingPagePath(episode))}"
-            >Open episode</a>
-          </article>`
+            ${isFeaturedColdEpisode ? "" : episodeAction}
+          </article>`;
+        }
       )
       .join("");
     const body = `<!doctype html>
@@ -1598,7 +1682,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       h1 { margin: 0 0 12px; font-size: clamp(1.75rem, 8vw, 2.5rem); }
       .page-intro, .intro { color: #b3b3b3; line-height: 1.5; }
       .page-intro { margin: 0 0 28px; }
-      .acast-player { display: block; width: 100%; height: 280px; margin: 0 0 36px; border: 0; }
+      .acast-player { display: block; width: 100%; height: 190px; margin: 0; border: 0; }
       .episode { padding: 36px 0; border-top: 1px solid #404040; }
       .episode:first-of-type { border-top: 0; }
       .episode-thumbnail { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 0 auto 24px; border-radius: 12px; object-fit: cover; }
@@ -1608,51 +1692,92 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       a { text-decoration: none; }
       .episode-link { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; background: #1ed760; color: #000; font-size: 1.125rem; font-weight: 800; }
       a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+      body.cold-audience { padding-top: 20px; }
+      .cold-audience .page-intro { margin-bottom: 12px; }
+      .cold-audience .episode:first-of-type { padding-top: 12px; }
+      .cold-audience .episode:first-of-type .episode-thumbnail { display: none; }
+      .cold-audience .episode:first-of-type .acast-player { margin-bottom: 18px; }
+      .cold-audience .episode:first-of-type .intro { margin-bottom: 0; }
+      @media (max-width: 480px) {
+        body.cold-audience { padding-right: 16px; padding-left: 16px; }
+        .cold-audience h1 { font-size: 1.65rem; }
+      }
     </style>
   </head>
-  <body>
+  <body${isColdAudience ? ' class="cold-audience"' : ""}>
     <main>
-      <h1>Listen to ${escapeHtml(podcast.name)}</h1>
-      <p class="page-intro">Play the show below or choose an episode to open its dedicated listening page.</p>
-      ${
-        selectedEpisode
-          ? ""
-          : `<iframe
-        id="acast-player"
-        class="acast-player"
-        src="https://embed.acast.com/6a9095ec3c34c5ade988d729?feed=true"
-        frameborder="0"
-        width="100%"
-        height="280"
-        allow="autoplay"
-        title="${escapeHtml(podcast.name)} Acast player"
-      ></iframe>`
-      }
+      <h1>${
+        isColdAudience ? escapeHtml(podcast.name) : `Listen to ${escapeHtml(podcast.name)}`
+      }</h1>
+      <p class="page-intro">${
+        isColdAudience
+          ? "8 gripping true crime episodes to start with."
+          : "Choose an episode and press play."
+      }</p>
       ${episodeSections}
     </main>
-    ${
-      selectedEpisode
-        ? ""
-        : `<script>
+    <script>
       (function () {
-        const player = document.getElementById("acast-player");
+        const players = Array.from(document.querySelectorAll("[data-acast-player]"));
         const milestones = [25, 50, 75];
-        const reachedByEpisode = new Map();
-        let currentEpisode = "unknown";
-        let duration = 0;
-        let isPlaying = false;
-        let progressTimer = null;
+        const statesByWindow = new Map();
+        const facebookViewContentParameters = ${
+          facebookViewContentParameters && analytics.facebookPixelId
+            ? facebookViewContentParameters
+            : "null"
+        };
+        let hasTrackedFacebookViewContent = false;
 
-        const sendPlayerMessage = (eventName) => {
-          if (!player || !player.contentWindow) return;
-          player.contentWindow.postMessage(JSON.stringify({ eventName: eventName, data: {} }), "https://embed.acast.com");
+        const trackFacebookViewContent = (engagementSource) => {
+          if (
+            hasTrackedFacebookViewContent ||
+            !facebookViewContentParameters ||
+            typeof window.fbq !== "function"
+          ) return;
+
+          hasTrackedFacebookViewContent = true;
+          window.removeEventListener("scroll", handleEngagedScroll);
+          window.fbq("track", "ViewContent", {
+            ...facebookViewContentParameters,
+            engagement_source: engagementSource
+          });
         };
 
-        const playerEventParameters = (action, percent) => {
+        const handleEngagedScroll = () => {
+          if (window.scrollY >= 100) {
+            trackFacebookViewContent("scroll");
+          }
+        };
+
+        if (facebookViewContentParameters) {
+          window.addEventListener("scroll", handleEngagedScroll, { passive: true });
+        }
+
+        players.forEach((player) => {
+          if (!player.contentWindow) return;
+          statesByWindow.set(player.contentWindow, {
+            player: player,
+            episodeId: player.dataset.episodeId || "unknown",
+            duration: 0,
+            isPlaying: false,
+            progressTimer: null,
+            reached: new Set()
+          });
+        });
+
+        const sendPlayerMessage = (state, eventName) => {
+          if (!state.player.contentWindow) return;
+          state.player.contentWindow.postMessage(
+            JSON.stringify({ eventName: eventName, data: {} }),
+            "https://embed.acast.com"
+          );
+        };
+
+        const playerEventParameters = (state, action, percent) => {
           const parameters = {
             player: "acast",
             player_action: action,
-            episode_id: currentEpisode,
+            episode_id: state.episodeId,
             country_code: "${escapeHtml(countryCode)}",
             page_path: window.location.pathname
           };
@@ -1661,12 +1786,12 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           return parameters;
         };
 
-        const trackPlayerEvent = (action, percent) => {
+        const trackPlayerEvent = (state, action, percent) => {
           const baseEventName = typeof percent === "number"
             ? "acast_player_" + percent + "_percent"
             : "acast_player_" + action;
           const eventName = baseEventName + "_${escapeHtml(countryCode)}";
-          const parameters = playerEventParameters(action, percent);
+          const parameters = playerEventParameters(state, action, percent);
 
           if (typeof window.gtag === "function") {
             window.gtag("event", eventName, parameters);
@@ -1680,56 +1805,44 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             fetch("${escapeHtml(ACAST_PLAYER_PLAY_ENDPOINT)}", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ episodeId: currentEpisode }),
+              body: JSON.stringify({ episodeId: state.episodeId }),
               keepalive: true
             }).catch(() => {});
           }
         };
 
-        const updateEpisode = (data) => {
-          const episode = data && (data.episode || data.acast || data.channel);
-          if (!episode || episode === currentEpisode) return;
-          currentEpisode = String(episode);
-          duration = 0;
-        };
-
-        const checkMilestones = (progress) => {
-          if (!(duration > 0) || !(progress >= 0)) return;
-          const percentComplete = (progress / duration) * 100;
-          const reached = reachedByEpisode.get(currentEpisode) || new Set();
+        const checkMilestones = (state, progress) => {
+          if (!(state.duration > 0) || !(progress >= 0)) return;
+          const percentComplete = (progress / state.duration) * 100;
 
           milestones.forEach((milestone) => {
-            if (percentComplete >= milestone && !reached.has(milestone)) {
-              reached.add(milestone);
-              trackPlayerEvent("progress", milestone);
+            if (percentComplete >= milestone && !state.reached.has(milestone)) {
+              state.reached.add(milestone);
+              trackPlayerEvent(state, "progress", milestone);
             }
           });
-
-          reachedByEpisode.set(currentEpisode, reached);
         };
 
-        const startProgressChecks = () => {
-          if (progressTimer) return;
-          sendPlayerMessage("postmessage:get:current");
-          sendPlayerMessage("postmessage:get:duration");
-          sendPlayerMessage("postmessage:get:progress");
-          progressTimer = window.setInterval(() => {
-            sendPlayerMessage("postmessage:get:progress");
+        const startProgressChecks = (state) => {
+          if (state.progressTimer) return;
+          sendPlayerMessage(state, "postmessage:get:current");
+          sendPlayerMessage(state, "postmessage:get:duration");
+          sendPlayerMessage(state, "postmessage:get:progress");
+          state.progressTimer = window.setInterval(() => {
+            sendPlayerMessage(state, "postmessage:get:progress");
           }, 1000);
         };
 
-        const stopProgressChecks = () => {
-          if (!progressTimer) return;
-          window.clearInterval(progressTimer);
-          progressTimer = null;
+        const stopProgressChecks = (state) => {
+          if (!state.progressTimer) return;
+          window.clearInterval(state.progressTimer);
+          state.progressTimer = null;
         };
 
         window.addEventListener("message", (event) => {
-          if (
-            event.origin !== "https://embed.acast.com" ||
-            !player ||
-            event.source !== player.contentWindow
-          ) return;
+          if (event.origin !== "https://embed.acast.com") return;
+          const state = statesByWindow.get(event.source);
+          if (!state) return;
 
           let message = event.data;
           if (typeof message === "string") {
@@ -1743,34 +1856,40 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           if (!message || typeof message !== "object") return;
           const rawData = message.data;
           const data = rawData && typeof rawData === "object" ? rawData : {};
-          updateEpisode(data);
 
           if (message.eventName === "postmessage:on:play") {
-            if (!isPlaying) trackPlayerEvent("play");
-            isPlaying = true;
-            startProgressChecks();
+            trackFacebookViewContent("acast_play");
+            if (!state.isPlaying) trackPlayerEvent(state, "play");
+            state.isPlaying = true;
+            startProgressChecks(state);
           } else if (message.eventName === "postmessage:on:pause") {
-            if (isPlaying) trackPlayerEvent("pause");
-            isPlaying = false;
-            sendPlayerMessage("postmessage:get:progress");
-            stopProgressChecks();
+            if (state.isPlaying) trackPlayerEvent(state, "pause");
+            state.isPlaying = false;
+            sendPlayerMessage(state, "postmessage:get:progress");
+            stopProgressChecks(state);
           } else if (message.eventName === "postmessage:get:duration") {
             const value = Number(
               data.duration ?? message.duration ?? (typeof rawData === "object" ? NaN : rawData)
             );
-            if (Number.isFinite(value) && value > 0) duration = value;
+            if (Number.isFinite(value) && value > 0) state.duration = value;
           } else if (message.eventName === "postmessage:get:progress") {
             const value = Number(
               data.progress ?? message.progress ?? (typeof rawData === "object" ? NaN : rawData)
             );
-            if (Number.isFinite(value)) checkMilestones(value);
+            if (Number.isFinite(value)) checkMilestones(state, value);
           }
         });
 
-        window.addEventListener("pagehide", stopProgressChecks, { once: true });
+        window.addEventListener(
+          "pagehide",
+          () => {
+            window.removeEventListener("scroll", handleEngagedScroll);
+            statesByWindow.forEach((state) => stopProgressChecks(state));
+          },
+          { once: true }
+        );
       })();
-    </script>`
-    }
+    </script>
     ${renderPageViewNotification()}
   </body>
 </html>`;
@@ -2262,7 +2381,7 @@ const STATIC_PAGES = [
       "We do not sell personal information that you send directly to us. We may share information when needed to operate the site, comply with law, protect rights and safety, or work with service providers that support hosting, analytics, email, advertising, and podcast distribution.",
       "To ask a privacy question or request that we delete a message you sent us, contact us at the email address listed on this site."
     ],
-    updated: "Last updated: June 25, 2026"
+    updated: "Last updated: August 26, 2026"
   },
   {
     slug: "editorial-policy",
@@ -5807,956 +5926,6 @@ const renderSearchPage = (query, results, analytics = {}) => {
 </html>`;
 };
 
-const loadLandingPageVisits = async (env, maxRecords = 100000) => {
-  const visits = [];
-  let cursor;
-  let limited = false;
-
-  do {
-    const page = await env.EPISODE_CONTENT.list({
-      prefix: LANDING_PAGE_VISIT_PREFIX,
-      cursor,
-      limit: Math.min(1000, maxRecords - visits.length),
-      include: ["customMetadata"]
-    });
-
-    for (const object of page.objects) {
-      const metadata = object.customMetadata;
-
-      if (!metadata?.episodeSlug || !metadata?.visitedAt) {
-        continue;
-      }
-
-      visits.push({
-        episodeId: String(metadata.episodeId ?? ""),
-        episodeSlug: String(metadata.episodeSlug),
-        episodeTitle: String(metadata.episodeTitle ?? metadata.episodeSlug),
-        country: String(metadata.country ?? "XX"),
-        referrer: String(metadata.referrer ?? ""),
-        visitedAt: String(metadata.visitedAt)
-      });
-    }
-
-    cursor = page.truncated ? page.cursor : undefined;
-    limited = Boolean(cursor && visits.length >= maxRecords);
-  } while (cursor && visits.length < maxRecords);
-
-  visits.sort((left, right) => right.visitedAt.localeCompare(left.visitedAt));
-  return { visits, limited };
-};
-
-const loadLandingPageEvents = async (env, maxRecords = 100000) => {
-  const events = [];
-  let cursor;
-  let limited = false;
-
-  do {
-    const page = await env.EPISODE_CONTENT.list({
-      prefix: LANDING_PAGE_EVENT_PREFIX,
-      cursor,
-      limit: Math.min(1000, maxRecords - events.length),
-      include: ["customMetadata"]
-    });
-
-    for (const object of page.objects) {
-      const metadata = object.customMetadata;
-
-      if (!metadata?.episodeSlug || !metadata?.eventType || !metadata?.occurredAt) {
-        continue;
-      }
-
-      events.push({
-        episodeId: String(metadata.episodeId ?? ""),
-        episodeSlug: String(metadata.episodeSlug),
-        eventType: String(metadata.eventType),
-        country: String(metadata.country ?? "XX"),
-        occurredAt: String(metadata.occurredAt)
-      });
-    }
-
-    cursor = page.truncated ? page.cursor : undefined;
-    limited = Boolean(cursor && events.length >= maxRecords);
-  } while (cursor && events.length < maxRecords);
-
-  events.sort((left, right) => right.occurredAt.localeCompare(left.occurredAt));
-  return { events, limited };
-};
-
-const loadLandingPlaybackSessions = async (env, maxRecords = 100000) => {
-  const latestBySession = new Map();
-  let cursor;
-  let loadedRecords = 0;
-  let limited = false;
-
-  do {
-    const page = await env.EPISODE_CONTENT.list({
-      prefix: LANDING_PAGE_PLAYBACK_PREFIX,
-      cursor,
-      limit: Math.min(1000, maxRecords - loadedRecords),
-      include: ["customMetadata"]
-    });
-
-    for (const object of page.objects) {
-      loadedRecords += 1;
-      const metadata = object.customMetadata;
-
-      if (!metadata?.sessionId || !metadata?.episodeSlug || !metadata?.occurredAt) {
-        continue;
-      }
-
-      const snapshot = {
-        episodeId: String(metadata.episodeId ?? ""),
-        episodeSlug: String(metadata.episodeSlug),
-        sessionId: String(metadata.sessionId),
-        snapshotReason: String(metadata.snapshotReason ?? "periodic"),
-        country: String(metadata.country ?? "XX"),
-        highestPercent: Number(metadata.highestPercent ?? 0),
-        activeSeconds: Number(metadata.activeSeconds ?? 0),
-        pauseCount: Number(metadata.pauseCount ?? 0),
-        resumeCount: Number(metadata.resumeCount ?? 0),
-        lastPositionMs: Number(metadata.lastPositionMs ?? 0),
-        durationMs: Number(metadata.durationMs ?? 0),
-        milestone25: metadata.milestone25 === "1",
-        milestone50: metadata.milestone50 === "1",
-        milestone75: metadata.milestone75 === "1",
-        milestone90: metadata.milestone90 === "1",
-        completed: metadata.completed === "1",
-        isPaused: metadata.isPaused === "1",
-        isBuffering: metadata.isBuffering === "1",
-        occurredAt: String(metadata.occurredAt)
-      };
-      const previous = latestBySession.get(snapshot.sessionId);
-
-      if (!previous || snapshot.occurredAt > previous.occurredAt) {
-        latestBySession.set(snapshot.sessionId, snapshot);
-      }
-    }
-
-    cursor = page.truncated ? page.cursor : undefined;
-    limited = Boolean(cursor && loadedRecords >= maxRecords);
-  } while (cursor && loadedRecords < maxRecords);
-
-  const sessions = [...latestBySession.values()].sort((left, right) =>
-    right.occurredAt.localeCompare(left.occurredAt)
-  );
-  return { sessions, limited };
-};
-
-const incrementLandingStat = (counts, key) => {
-  counts.set(key, (counts.get(key) ?? 0) + 1);
-};
-
-const sortedLandingStats = (counts) =>
-  [...counts.entries()].sort(
-    ([leftLabel, leftCount], [rightLabel, rightCount]) =>
-      rightCount - leftCount || leftLabel.localeCompare(rightLabel)
-  );
-
-const buildLandingCtrTrend = (visits, events, dayCount = 30) => {
-  const timeZone = "America/New_York";
-  const dayFormatter = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  });
-  const dayKey = (value) => {
-    const parts = Object.fromEntries(
-      dayFormatter
-        .formatToParts(new Date(value))
-        .filter((part) => part.type !== "literal")
-        .map((part) => [part.type, part.value])
-    );
-    return `${parts.year}-${parts.month}-${parts.day}`;
-  };
-  const today = new Date(`${dayKey(new Date())}T12:00:00Z`);
-  const days = [];
-  const daysByKey = new Map();
-
-  for (let offset = dayCount - 1; offset >= 0; offset -= 1) {
-    const date = new Date(today);
-    date.setUTCDate(today.getUTCDate() - offset);
-    const key = date.toISOString().slice(0, 10);
-    const day = {
-      key,
-      label: date.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" }),
-      views: 0,
-      playerStarts: 0,
-      spotifyClicks: 0
-    };
-    days.push(day);
-    daysByKey.set(key, day);
-  }
-
-  for (const visit of visits) {
-    const day = daysByKey.get(dayKey(visit.visitedAt));
-    if (day) day.views += 1;
-  }
-
-  for (const event of events) {
-    const day = daysByKey.get(dayKey(event.occurredAt));
-    if (!day) continue;
-
-    if (event.eventType === "spotify_web_player_start") {
-      day.playerStarts += 1;
-    } else if (event.eventType === "spotify_episode_click") {
-      day.spotifyClicks += 1;
-    }
-  }
-
-  return {
-    timeZone,
-    days: days.map((day) => ({
-      ...day,
-      playerCtr: day.views > 0 ? (day.playerStarts / day.views) * 100 : null,
-      spotifyCtr: day.views > 0 ? (day.spotifyClicks / day.views) * 100 : null
-    }))
-  };
-};
-
-const renderLandingCtrChart = (trend) => {
-  const width = 900;
-  const height = 330;
-  const padding = { top: 24, right: 24, bottom: 54, left: 58 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const observedRates = trend.days.flatMap((day) =>
-    [day.playerCtr, day.spotifyCtr].filter((value) => value !== null)
-  );
-  const yMax = Math.max(100, Math.ceil(Math.max(0, ...observedRates) / 25) * 25);
-  const x = (index) =>
-    padding.left + (trend.days.length > 1 ? (index / (trend.days.length - 1)) * plotWidth : 0);
-  const y = (value) => padding.top + ((yMax - value) / yMax) * plotHeight;
-  const pathFor = (field) => {
-    let path = "";
-    let drawing = false;
-
-    trend.days.forEach((day, index) => {
-      const value = day[field];
-
-      if (value === null) {
-        drawing = false;
-        return;
-      }
-
-      path += `${drawing ? " L" : " M"}${x(index).toFixed(1)} ${y(value).toFixed(1)}`;
-      drawing = true;
-    });
-
-    return path.trim();
-  };
-  const pointFor = (day, index, field, className, label) => {
-    const value = day[field];
-    return value === null
-      ? ""
-      : `<circle class="${className}" cx="${x(index).toFixed(1)}" cy="${y(value).toFixed(
-          1
-        )}" r="4"><title>${escapeHtml(`${day.label}: ${label} ${value.toFixed(1)}%`)}</title></circle>`;
-  };
-  const gridTicks = Array.from({ length: 5 }, (_, index) => (yMax / 4) * index).reverse();
-  const grid = gridTicks
-    .map((tick) => {
-      const yPosition = y(tick).toFixed(1);
-      return `<g><line class="stats-chart-grid" x1="${padding.left}" y1="${yPosition}" x2="${
-        width - padding.right
-      }" y2="${yPosition}"></line><text class="stats-chart-axis-label" x="${
-        padding.left - 10
-      }" y="${Number(yPosition) + 4}" text-anchor="end">${escapeHtml(
-        `${tick.toFixed(0)}%`
-      )}</text></g>`;
-    })
-    .join("");
-  const labelIndexes = [...new Set([0, 7, 14, 21, trend.days.length - 1])].filter(
-    (index) => index >= 0 && index < trend.days.length
-  );
-  const xLabels = labelIndexes
-    .map(
-      (index) => `<text class="stats-chart-axis-label" x="${x(index).toFixed(1)}" y="${
-        height - 18
-      }" text-anchor="middle">${escapeHtml(trend.days[index].label)}</text>`
-    )
-    .join("");
-  const dailyRows = trend.days
-    .map(
-      (day) => `<tr>
-        <td>${escapeHtml(day.label)}</td>
-        <td>${escapeHtml(day.views)}</td>
-        <td>${escapeHtml(day.playerStarts)}</td>
-        <td>${escapeHtml(day.playerCtr === null ? "—" : `${day.playerCtr.toFixed(1)}%`)}</td>
-        <td>${escapeHtml(day.spotifyClicks)}</td>
-        <td>${escapeHtml(day.spotifyCtr === null ? "—" : `${day.spotifyCtr.toFixed(1)}%`)}</td>
-      </tr>`
-    )
-    .join("");
-
-  return `<div class="stats-chart-legend" aria-hidden="true">
-      <span><i class="stats-chart-swatch player"></i>Web-player start rate</span>
-      <span><i class="stats-chart-swatch spotify"></i>Spotify-click CTR</span>
-    </div>
-    <div class="stats-chart-wrap">
-      <svg class="stats-chart" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="ctr-chart-title ctr-chart-description">
-        <title id="ctr-chart-title">Daily landing-page conversion rates</title>
-        <desc id="ctr-chart-description">Web-player start rate and Spotify-click click-through rate for the last 30 days, grouped in ${escapeHtml(
-          trend.timeZone
-        )}.</desc>
-        ${grid}
-        ${xLabels}
-        <path class="stats-chart-line player" d="${pathFor("playerCtr")}"></path>
-        <path class="stats-chart-line spotify" d="${pathFor("spotifyCtr")}"></path>
-        ${trend.days
-          .map(
-            (day, index) =>
-              pointFor(day, index, "playerCtr", "stats-chart-point player", "web-player start rate") +
-              pointFor(day, index, "spotifyCtr", "stats-chart-point spotify", "Spotify-click CTR")
-          )
-          .join("")}
-      </svg>
-    </div>
-    <details class="stats-chart-data">
-      <summary>View daily chart data</summary>
-      <div class="stats-table-wrap"><table class="stats-table">
-        <thead><tr><th>Day</th><th>Views</th><th>Player starts</th><th>Player-start CTR</th><th>Spotify clicks</th><th>Spotify-click CTR</th></tr></thead>
-        <tbody>${dailyRows}</tbody>
-      </table></div>
-    </details>`;
-};
-
-const renderLandingStatsDashboard = ({
-  visits,
-  events,
-  playbackSessions,
-  episodes,
-  selectedEpisodeSlug = "",
-  selectedCountry = "",
-  limited = false
-}) => {
-  const formatter = new Intl.NumberFormat("en-US");
-  const countryDisplayNames = new Intl.DisplayNames(["en"], { type: "region" });
-  const countryLabel = (country) => {
-    if (country === "XX") return "Unknown";
-
-    try {
-      return `${countryDisplayNames.of(country) || country} (${country})`;
-    } catch {
-      return country;
-    }
-  };
-  const availableCountries = [...new Set([
-    ...visits.map((visit) => visit.country || "XX"),
-    ...events.map((event) => event.country || "XX"),
-    ...playbackSessions.map((session) => session.country || "XX")
-  ])].sort((left, right) => countryLabel(left).localeCompare(countryLabel(right)));
-  const countryVisits = selectedCountry
-    ? visits.filter((visit) => visit.country === selectedCountry)
-    : visits;
-  const countryEvents = selectedCountry
-    ? events.filter((event) => event.country === selectedCountry)
-    : events;
-  const countryPlaybackSessions = selectedCountry
-    ? playbackSessions.filter((session) => session.country === selectedCountry)
-    : playbackSessions;
-  const filteredVisits = selectedEpisodeSlug
-    ? countryVisits.filter((visit) => visit.episodeSlug === selectedEpisodeSlug)
-    : countryVisits;
-  const filteredEvents = selectedEpisodeSlug
-    ? countryEvents.filter((event) => event.episodeSlug === selectedEpisodeSlug)
-    : countryEvents;
-  const filteredPlaybackSessions = selectedEpisodeSlug
-    ? countryPlaybackSessions.filter((session) => session.episodeSlug === selectedEpisodeSlug)
-    : countryPlaybackSessions;
-  const visitTitles = new Map(
-    visits.map((visit) => [visit.episodeSlug, visit.episodeTitle])
-  );
-  const episodeStats = new Map(
-    episodes.map((episode) => [
-      episode.slug,
-      {
-        slug: episode.slug,
-        title: episode.title,
-        views: 0,
-        playerStarts: 0,
-        spotifyClicks: 0,
-        playbackSessions: 0,
-        activeSeconds: 0,
-        progressTotal: 0,
-        milestone25: 0,
-        milestone50: 0,
-        milestone75: 0,
-        milestone90: 0,
-        completed: 0,
-        pauseCount: 0,
-        resumeCount: 0,
-        countries: new Map(),
-        referrers: new Map()
-      }
-    ])
-  );
-
-  for (const visit of countryVisits) {
-    const stats = episodeStats.get(visit.episodeSlug) ?? {
-      slug: visit.episodeSlug,
-      title: visit.episodeTitle,
-      views: 0,
-      playerStarts: 0,
-      spotifyClicks: 0,
-      playbackSessions: 0,
-      activeSeconds: 0,
-      progressTotal: 0,
-      milestone25: 0,
-      milestone50: 0,
-      milestone75: 0,
-      milestone90: 0,
-      completed: 0,
-      pauseCount: 0,
-      resumeCount: 0,
-      countries: new Map(),
-      referrers: new Map()
-    };
-    stats.views += 1;
-    incrementLandingStat(stats.countries, visit.country || "XX");
-    incrementLandingStat(stats.referrers, visit.referrer || "Direct / unknown");
-    episodeStats.set(visit.episodeSlug, stats);
-  }
-
-  for (const event of countryEvents) {
-    const stats = episodeStats.get(event.episodeSlug) ?? {
-      slug: event.episodeSlug,
-      title: visitTitles.get(event.episodeSlug) ?? event.episodeSlug,
-      views: 0,
-      playerStarts: 0,
-      spotifyClicks: 0,
-      playbackSessions: 0,
-      activeSeconds: 0,
-      progressTotal: 0,
-      milestone25: 0,
-      milestone50: 0,
-      milestone75: 0,
-      milestone90: 0,
-      completed: 0,
-      pauseCount: 0,
-      resumeCount: 0,
-      countries: new Map(),
-      referrers: new Map()
-    };
-
-    if (event.eventType === "spotify_web_player_start") {
-      stats.playerStarts += 1;
-    } else if (event.eventType === "spotify_episode_click") {
-      stats.spotifyClicks += 1;
-    }
-
-    episodeStats.set(event.episodeSlug, stats);
-  }
-
-  for (const session of countryPlaybackSessions) {
-    const stats = episodeStats.get(session.episodeSlug) ?? {
-      slug: session.episodeSlug,
-      title: visitTitles.get(session.episodeSlug) ?? session.episodeSlug,
-      views: 0,
-      playerStarts: 0,
-      spotifyClicks: 0,
-      playbackSessions: 0,
-      activeSeconds: 0,
-      progressTotal: 0,
-      milestone25: 0,
-      milestone50: 0,
-      milestone75: 0,
-      milestone90: 0,
-      completed: 0,
-      pauseCount: 0,
-      resumeCount: 0,
-      countries: new Map(),
-      referrers: new Map()
-    };
-    stats.playbackSessions += 1;
-    stats.activeSeconds += session.activeSeconds;
-    stats.progressTotal += session.highestPercent;
-    stats.milestone25 += session.milestone25 ? 1 : 0;
-    stats.milestone50 += session.milestone50 ? 1 : 0;
-    stats.milestone75 += session.milestone75 ? 1 : 0;
-    stats.milestone90 += session.milestone90 ? 1 : 0;
-    stats.completed += session.completed ? 1 : 0;
-    stats.pauseCount += session.pauseCount;
-    stats.resumeCount += session.resumeCount;
-    episodeStats.set(session.episodeSlug, stats);
-  }
-
-  const countryCounts = new Map();
-  const referrerCounts = new Map();
-  const filteredPlayerStarts = filteredEvents.filter(
-    (event) => event.eventType === "spotify_web_player_start"
-  ).length;
-  const filteredSpotifyClicks = filteredEvents.filter(
-    (event) => event.eventType === "spotify_episode_click"
-  ).length;
-  const filteredActiveSeconds = filteredPlaybackSessions.reduce(
-    (total, session) => total + session.activeSeconds,
-    0
-  );
-  const filteredAverageProgress = filteredPlaybackSessions.length
-    ? filteredPlaybackSessions.reduce(
-        (total, session) => total + session.highestPercent,
-        0
-      ) / filteredPlaybackSessions.length
-    : 0;
-  const filteredPauseCount = filteredPlaybackSessions.reduce(
-    (total, session) => total + session.pauseCount,
-    0
-  );
-  const filteredResumeCount = filteredPlaybackSessions.reduce(
-    (total, session) => total + session.resumeCount,
-    0
-  );
-  const playbackMilestones = [
-    ["25% reached", "milestone25"],
-    ["50% reached", "milestone50"],
-    ["75% reached", "milestone75"],
-    ["90% reached", "milestone90"],
-    ["Completed", "completed"]
-  ].map(([label, field]) => {
-    const count = filteredPlaybackSessions.filter((session) => session[field]).length;
-    return {
-      label,
-      count,
-      rate: filteredPlaybackSessions.length
-        ? (count / filteredPlaybackSessions.length) * 100
-        : null
-    };
-  });
-  const formatConversionRate = (conversions, views) =>
-    views > 0 ? `${((conversions / views) * 100).toFixed(1)}%` : "—";
-  const formatMinutes = (seconds) => `${(seconds / 60).toFixed(1)} min`;
-  const formatPlaybackPosition = (milliseconds) => {
-    const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-    return hours > 0
-      ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
-      : `${minutes}:${String(seconds).padStart(2, "0")}`;
-  };
-  const renderLocalTimestamp = (value) => {
-    const date = new Date(value);
-
-    if (Number.isNaN(date.getTime())) {
-      return escapeHtml(value);
-    }
-
-    const isoTimestamp = date.toISOString();
-    const utcFallback = `${isoTimestamp.replace("T", " ").replace(/\.\d{3}Z$/, "")} UTC`;
-    return `<time datetime="${escapeHtml(isoTimestamp)}" data-local-time>${escapeHtml(
-      utcFallback
-    )}</time>`;
-  };
-
-  for (const visit of filteredVisits) {
-    incrementLandingStat(countryCounts, visit.country || "XX");
-    incrementLandingStat(referrerCounts, visit.referrer || "Direct / unknown");
-  }
-
-  const episodeRows = [...episodeStats.values()]
-    .filter((stats) => !selectedEpisodeSlug || stats.slug === selectedEpisodeSlug)
-    .sort((left, right) => right.views - left.views || left.title.localeCompare(right.title))
-    .map((stats) => {
-      const topCountry = sortedLandingStats(stats.countries)[0];
-      const topReferrer = sortedLandingStats(stats.referrers)[0];
-      const filterParams = new URLSearchParams({ episode: stats.slug });
-      if (selectedCountry) filterParams.set("country", selectedCountry);
-      const filterUrl = `/admin/landing-stats?${filterParams.toString()}`;
-
-      return `<tr>
-        <td><a href="${escapeHtml(filterUrl)}">${escapeHtml(stats.title)}</a></td>
-        <td>${escapeHtml(formatter.format(stats.views))}</td>
-        <td>${escapeHtml(formatter.format(stats.playerStarts))}</td>
-        <td>${escapeHtml(formatConversionRate(stats.playerStarts, stats.views))}</td>
-        <td>${escapeHtml(formatter.format(stats.spotifyClicks))}</td>
-        <td>${escapeHtml(formatConversionRate(stats.spotifyClicks, stats.views))}</td>
-        <td>${escapeHtml(topCountry ? `${topCountry[0]} (${formatter.format(topCountry[1])})` : "—")}</td>
-        <td class="stats-referrer">${escapeHtml(
-          topReferrer ? `${topReferrer[0]} (${formatter.format(topReferrer[1])})` : "—"
-        )}</td>
-      </tr>`;
-    })
-    .join("");
-  const playbackRows = [...episodeStats.values()]
-    .filter((stats) => !selectedEpisodeSlug || stats.slug === selectedEpisodeSlug)
-    .filter((stats) => stats.playbackSessions > 0 || stats.playerStarts > 0)
-    .sort(
-      (left, right) =>
-        right.playbackSessions - left.playbackSessions || left.title.localeCompare(right.title)
-    )
-    .map((stats) => {
-      const averageMinutes = stats.playbackSessions
-        ? stats.activeSeconds / stats.playbackSessions / 60
-        : 0;
-      const averageProgress = stats.playbackSessions
-        ? stats.progressTotal / stats.playbackSessions
-        : 0;
-
-      return `<tr>
-        <td>${escapeHtml(stats.title)}</td>
-        <td>${escapeHtml(formatter.format(stats.playbackSessions))}</td>
-        <td>${escapeHtml(formatMinutes(stats.activeSeconds))}</td>
-        <td>${escapeHtml(`${averageMinutes.toFixed(1)} min`)}</td>
-        <td>${escapeHtml(`${averageProgress.toFixed(1)}%`)}</td>
-        <td>${escapeHtml(formatConversionRate(stats.milestone25, stats.playbackSessions))}</td>
-        <td>${escapeHtml(formatConversionRate(stats.milestone50, stats.playbackSessions))}</td>
-        <td>${escapeHtml(formatConversionRate(stats.milestone75, stats.playbackSessions))}</td>
-        <td>${escapeHtml(formatConversionRate(stats.milestone90, stats.playbackSessions))}</td>
-        <td>${escapeHtml(formatConversionRate(stats.completed, stats.playbackSessions))}</td>
-        <td>${escapeHtml(formatter.format(stats.pauseCount))}</td>
-        <td>${escapeHtml(formatter.format(stats.resumeCount))}</td>
-      </tr>`;
-    })
-    .join("");
-  const milestoneRows = playbackMilestones
-    .map(
-      (milestone) => `<tr>
-        <td>${escapeHtml(milestone.label)}</td>
-        <td>${escapeHtml(formatter.format(milestone.count))}</td>
-        <td>${escapeHtml(milestone.rate === null ? "—" : `${milestone.rate.toFixed(1)}%`)}</td>
-      </tr>`
-    )
-    .join("");
-  const countRows = (entries, emptyMessage) =>
-    entries.length
-      ? entries
-          .map(
-            ([label, count]) => `<tr>
-              <td class="stats-referrer">${escapeHtml(label === "XX" ? "Unknown" : label)}</td>
-              <td>${escapeHtml(formatter.format(count))}</td>
-            </tr>`
-          )
-          .join("")
-      : `<tr><td colspan="2">${escapeHtml(emptyMessage)}</td></tr>`;
-  const recentRows = filteredVisits
-    .slice(0, 100)
-    .map(
-      (visit) => `<tr>
-        <td>${renderLocalTimestamp(visit.visitedAt)}</td>
-        <td>${escapeHtml(visit.episodeTitle)}</td>
-        <td>${escapeHtml(visit.country === "XX" ? "Unknown" : visit.country)}</td>
-        <td class="stats-referrer">${escapeHtml(visit.referrer || "Direct / unknown")}</td>
-      </tr>`
-    )
-    .join("");
-  const recentEventRows = filteredEvents
-    .slice(0, 100)
-    .map((event) => {
-      const stats = episodeStats.get(event.episodeSlug);
-      const eventLabel =
-        event.eventType === "spotify_web_player_start"
-          ? "Spotify web player started"
-          : "Spotify episode clicked";
-
-      return `<tr>
-        <td>${renderLocalTimestamp(event.occurredAt)}</td>
-        <td>${escapeHtml(stats?.title ?? event.episodeSlug)}</td>
-        <td>${escapeHtml(eventLabel)}</td>
-        <td>${escapeHtml(event.country === "XX" ? "Unknown" : event.country)}</td>
-      </tr>`;
-    })
-    .join("");
-  const recentPlaybackRows = filteredPlaybackSessions
-    .slice(0, 100)
-    .map((session) => {
-      const stats = episodeStats.get(session.episodeSlug);
-      const position = `${formatPlaybackPosition(session.lastPositionMs)} / ${
-        session.durationMs > 0 ? formatPlaybackPosition(session.durationMs) : "—"
-      }`;
-
-      return `<tr>
-        <td>${renderLocalTimestamp(session.occurredAt)}</td>
-        <td>${escapeHtml(stats?.title ?? session.episodeSlug)}</td>
-        <td>${escapeHtml(formatMinutes(session.activeSeconds))}</td>
-        <td>${escapeHtml(`${session.highestPercent.toFixed(1)}%`)}</td>
-        <td>${escapeHtml(position)}</td>
-        <td>${escapeHtml(`${session.pauseCount} / ${session.resumeCount}`)}</td>
-        <td>${escapeHtml(session.completed ? "Yes" : "No")}</td>
-      </tr>`;
-    })
-    .join("");
-  const selectedEpisode = episodeStats.get(selectedEpisodeSlug);
-  const ctrTrend = buildLandingCtrTrend(filteredVisits, filteredEvents);
-  const selectedFilterLabels = [
-    selectedEpisode?.title,
-    selectedCountry ? countryLabel(selectedCountry) : ""
-  ].filter(Boolean);
-  const selectedFilterSuffix = selectedFilterLabels.length
-    ? ` — ${selectedFilterLabels.map(escapeHtml).join(" · ")}`
-    : "";
-
-  return `<!doctype html>
-<html lang="en">
-  ${renderHead({
-    title: `Landing-page statistics | ${podcast.name}`,
-    description: "View episode landing-page visits by episode, country, and referrer."
-  })}
-  <body>
-    <style>
-      .stats-nav { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }
-      .stats-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin: 24px 0; }
-      .stats-card { padding: 20px; border: 1px solid #d8cab7; border-radius: 14px; background: #fffaf2; }
-      .stats-card strong { display: block; margin-top: 8px; font-size: 2rem; }
-      .stats-table-wrap { overflow-x: auto; }
-      .stats-table { width: 100%; border-collapse: collapse; text-align: left; }
-      .stats-table th, .stats-table td { padding: 12px; border-bottom: 1px solid #d8cab7; vertical-align: top; }
-      .stats-table th { white-space: nowrap; }
-      .stats-referrer { max-width: 420px; overflow-wrap: anywhere; }
-      .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; }
-      .stats-filter { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 20px 0; }
-      .stats-filter label { flex: 1 1 280px; }
-      .stats-chart-legend { display: flex; flex-wrap: wrap; gap: 20px; margin: 18px 0; }
-      .stats-chart-legend span { display: inline-flex; align-items: center; gap: 8px; font-weight: 800; }
-      .stats-chart-swatch { display: inline-block; width: 28px; height: 4px; border-radius: 999px; }
-      .stats-chart-swatch.player { background: #168f49; }
-      .stats-chart-swatch.spotify { background: #a33b20; }
-      .stats-chart-wrap { overflow-x: auto; }
-      .stats-chart { display: block; width: 100%; min-width: 680px; height: auto; }
-      .stats-chart-grid { stroke: #d8cab7; stroke-width: 1; }
-      .stats-chart-axis-label { fill: #63584d; font-size: 13px; }
-      .stats-chart-line { fill: none; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
-      .stats-chart-line.player { stroke: #168f49; }
-      .stats-chart-line.spotify { stroke: #a33b20; }
-      .stats-chart-point { stroke: #fffaf2; stroke-width: 2; }
-      .stats-chart-point.player { fill: #168f49; }
-      .stats-chart-point.spotify { fill: #a33b20; }
-      .stats-chart-data { margin-top: 18px; }
-      .stats-chart-data summary { cursor: pointer; font-weight: 800; }
-    </style>
-    <main class="admin-shell">
-      <section class="admin-panel">
-        <nav class="stats-nav" aria-label="Admin navigation">
-          <a class="back-link" href="/">Back to site</a>
-          <a class="back-link" href="/admin/content">Episode content</a>
-        </nav>
-        <p class="section-kicker">Administration</p>
-        <h1>Episode landing-page statistics</h1>
-        <p>Counts only verified visits to individual <code>/landing-page/:episode-slug</code> pages. IP addresses are not stored.</p>
-        <form class="stats-filter" method="get" action="/admin/landing-stats">
-          <label>
-            Filter by episode
-            <select name="episode">
-              <option value="">All episodes</option>
-              ${[...episodeStats.values()]
-                .sort((left, right) => left.title.localeCompare(right.title))
-                .map(
-                  (stats) => `<option value="${escapeHtml(stats.slug)}"${
-                    stats.slug === selectedEpisodeSlug ? " selected" : ""
-                  }>${escapeHtml(stats.title)}</option>`
-                )
-                .join("")}
-            </select>
-          </label>
-          <label>
-            Filter by country
-            <select name="country">
-              <option value="">All countries</option>
-              ${availableCountries
-                .map(
-                  (country) => `<option value="${escapeHtml(country)}"${
-                    country === selectedCountry ? " selected" : ""
-                  }>${escapeHtml(countryLabel(country))}</option>`
-                )
-                .join("")}
-            </select>
-          </label>
-          <button class="button" type="submit">Apply filter</button>
-          ${
-            selectedEpisodeSlug || selectedCountry
-              ? '<a class="button secondary-dark" href="/admin/landing-stats">Clear</a>'
-              : ""
-          }
-        </form>
-        <div class="stats-summary">
-          <div class="stats-card"><span>${selectedEpisode ? "Selected episode views" : "Total views"}</span><strong>${escapeHtml(
-            formatter.format(filteredVisits.length)
-          )}</strong></div>
-          <div class="stats-card"><span>Web player starts</span><strong>${escapeHtml(
-            formatter.format(filteredPlayerStarts)
-          )}</strong></div>
-          <div class="stats-card"><span>View → player start</span><strong>${escapeHtml(
-            formatConversionRate(filteredPlayerStarts, filteredVisits.length)
-          )}</strong></div>
-          <div class="stats-card"><span>Spotify episode clicks</span><strong>${escapeHtml(
-            formatter.format(filteredSpotifyClicks)
-          )}</strong></div>
-          <div class="stats-card"><span>View → Spotify click</span><strong>${escapeHtml(
-            formatConversionRate(filteredSpotifyClicks, filteredVisits.length)
-          )}</strong></div>
-          <div class="stats-card"><span>Countries</span><strong>${escapeHtml(
-            formatter.format(countryCounts.size)
-          )}</strong></div>
-          <div class="stats-card"><span>Referrers</span><strong>${escapeHtml(
-            formatter.format(referrerCounts.size)
-          )}</strong></div>
-        </div>
-        ${
-          limited
-            ? '<p class="admin-notice">The dashboard reached its 100,000-record display limit. Older records are not included in these totals.</p>'
-            : ""
-        }
-      </section>
-      <section class="admin-panel">
-        <p class="section-kicker">Daily trend</p>
-        <h2>Landing-page conversion rates${selectedFilterSuffix}</h2>
-        <p>Last 30 days, grouped by ${escapeHtml(ctrTrend.timeZone)} calendar day.</p>
-        ${renderLandingCtrChart(ctrTrend)}
-      </section>
-      <section class="admin-panel">
-        <p class="section-kicker">Playback engagement</p>
-        <h2>Listening behavior${selectedFilterSuffix}</h2>
-        <p>Active listening time is estimated while the embedded player reports playback as active, unbuffered, and visible.</p>
-        <div class="stats-summary">
-          <div class="stats-card"><span>Playback sessions</span><strong>${escapeHtml(
-            formatter.format(filteredPlaybackSessions.length)
-          )}</strong></div>
-          <div class="stats-card"><span>Estimated active time</span><strong>${escapeHtml(
-            formatMinutes(filteredActiveSeconds)
-          )}</strong></div>
-          <div class="stats-card"><span>Average active time</span><strong>${escapeHtml(
-            filteredPlaybackSessions.length
-              ? formatMinutes(filteredActiveSeconds / filteredPlaybackSessions.length)
-              : "—"
-          )}</strong></div>
-          <div class="stats-card"><span>Average highest progress</span><strong>${escapeHtml(
-            filteredPlaybackSessions.length ? `${filteredAverageProgress.toFixed(1)}%` : "—"
-          )}</strong></div>
-          <div class="stats-card"><span>Completion rate</span><strong>${escapeHtml(
-            playbackMilestones.at(-1)?.rate === null
-              ? "—"
-              : `${playbackMilestones.at(-1).rate.toFixed(1)}%`
-          )}</strong></div>
-          <div class="stats-card"><span>Pauses / resumes</span><strong>${escapeHtml(
-            `${formatter.format(filteredPauseCount)} / ${formatter.format(filteredResumeCount)}`
-          )}</strong></div>
-        </div>
-        <h3>Progress milestones</h3>
-        <div class="stats-table-wrap"><table class="stats-table">
-          <thead><tr><th>Milestone</th><th>Sessions</th><th>Session rate</th></tr></thead>
-          <tbody>${milestoneRows}</tbody>
-        </table></div>
-      </section>
-      <section class="admin-panel">
-        <p class="section-kicker">By episode</p>
-        <h2>Playback engagement${selectedFilterSuffix}</h2>
-        <div class="stats-table-wrap"><table class="stats-table">
-          <thead><tr><th>Episode</th><th>Sessions</th><th>Active time</th><th>Avg active time</th><th>Avg max progress</th><th>25%</th><th>50%</th><th>75%</th><th>90%</th><th>Completed</th><th>Pauses</th><th>Resumes</th></tr></thead>
-          <tbody>${
-            playbackRows || '<tr><td colspan="12">No embedded-player session data yet.</td></tr>'
-          }</tbody>
-        </table></div>
-      </section>
-      <section class="admin-panel">
-        <p class="section-kicker">By episode</p>
-        <h2>Episode conversion performance${selectedFilterSuffix}</h2>
-        <div class="stats-table-wrap"><table class="stats-table">
-          <thead><tr><th>Episode</th><th>Views</th><th>Player starts</th><th>Player-start CTR</th><th>Spotify clicks</th><th>Spotify-click CTR</th><th>Top country</th><th>Top referrer</th></tr></thead>
-          <tbody>${episodeRows || '<tr><td colspan="8">No episodes found.</td></tr>'}</tbody>
-        </table></div>
-      </section>
-      <div class="stats-grid">
-        <section class="admin-panel">
-          <p class="section-kicker">Geography</p><h2>Countries${selectedFilterSuffix}</h2>
-          <div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>Country</th><th>Views</th></tr></thead>
-          <tbody>${countRows(sortedLandingStats(countryCounts), "No country data yet.")}</tbody></table></div>
-        </section>
-        <section class="admin-panel">
-          <p class="section-kicker">Traffic sources</p><h2>Referrers${selectedFilterSuffix}</h2>
-          <div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>Referrer</th><th>Views</th></tr></thead>
-          <tbody>${countRows(sortedLandingStats(referrerCounts), "No referrer data yet.")}</tbody></table></div>
-        </section>
-      </div>
-      <section class="admin-panel">
-        <p class="section-kicker">Playback sessions</p><h2>Recent listening sessions${selectedFilterSuffix}</h2>
-        <div class="stats-table-wrap"><table class="stats-table">
-          <thead><tr><th>Last update</th><th>Episode</th><th>Active time</th><th>Highest progress</th><th>Last position</th><th>Pauses / resumes</th><th>Completed</th></tr></thead>
-          <tbody>${
-            recentPlaybackRows || '<tr><td colspan="7">No embedded-player sessions recorded yet.</td></tr>'
-          }</tbody>
-        </table></div>
-      </section>
-      <section class="admin-panel">
-        <p class="section-kicker">Conversions</p><h2>Recent landing-page events</h2>
-        <div class="stats-table-wrap"><table class="stats-table">
-          <thead><tr><th>Time</th><th>Episode</th><th>Event</th><th>Country</th></tr></thead>
-          <tbody>${recentEventRows || '<tr><td colspan="4">No landing-page events recorded yet.</td></tr>'}</tbody>
-        </table></div>
-      </section>
-      <section class="admin-panel">
-        <p class="section-kicker">Latest activity</p><h2>Recent visits</h2>
-        <div class="stats-table-wrap"><table class="stats-table">
-          <thead><tr><th>Time</th><th>Episode</th><th>Country</th><th>Referrer</th></tr></thead>
-          <tbody>${recentRows || '<tr><td colspan="4">No landing-page visits recorded yet.</td></tr>'}</tbody>
-        </table></div>
-      </section>
-    </main>
-    <script>
-      (function () {
-        var formatter = new Intl.DateTimeFormat(undefined, {
-          year: 'numeric',
-          month: 'short',
-          day: 'numeric',
-          hour: 'numeric',
-          minute: '2-digit',
-          second: '2-digit',
-          timeZoneName: 'short'
-        });
-
-        document.querySelectorAll('[data-local-time]').forEach(function (element) {
-          var date = new Date(element.getAttribute('datetime'));
-          if (!Number.isNaN(date.getTime())) element.textContent = formatter.format(date);
-        });
-      })();
-    </script>
-  </body>
-</html>`;
-};
-
-const handleLandingStatsDashboard = async (request, env, url) => {
-  if (!isAdmin(request, env)) {
-    return adminUnauthorized(
-      env.ADMIN_USERNAME && env.ADMIN_PASSWORD
-        ? "Authentication required"
-        : "Set the ADMIN_USERNAME Worker variable and ADMIN_PASSWORD Worker secret before using this dashboard."
-    );
-  }
-
-  if (!env.EPISODE_CONTENT) {
-    return new Response("Analytics storage is not configured", { status: 503 });
-  }
-
-  const [visitData, eventData, playbackData, episodes] = await Promise.all([
-    loadLandingPageVisits(env),
-    loadLandingPageEvents(env),
-    loadLandingPlaybackSessions(env),
-    loadEpisodeCatalog().catch((error) => {
-      console.error("Unable to load episodes for landing-page dashboard", error);
-      return [];
-    })
-  ]);
-  const selectedEpisodeSlug = String(url.searchParams.get("episode") ?? "").trim();
-  const requestedCountry = String(url.searchParams.get("country") ?? "").trim().toUpperCase();
-  const selectedCountry = /^[A-Z]{2}$/.test(requestedCountry) ? requestedCountry : "";
-  const body = renderLandingStatsDashboard({
-    visits: visitData.visits,
-    events: eventData.events,
-    playbackSessions: playbackData.sessions,
-    episodes,
-    selectedEpisodeSlug,
-    selectedCountry,
-    limited: visitData.limited || eventData.limited || playbackData.limited
-  });
-
-  return new Response(request.method === "HEAD" ? null : body, {
-    headers: {
-      "content-type": "text/html;charset=UTF-8",
-      "cache-control": "no-store",
-      "x-robots-tag": "noindex, nofollow"
-    }
-  });
-};
-
 const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSuggestionData = null) => {
   const episodeOptions = episodes
     .map(
@@ -6939,7 +6108,7 @@ const renderAdminPage = (episodes, contentByEpisode, notice = "", locationSugges
     <main class="admin-shell">
       <section class="admin-panel">
         <a class="back-link" href="/">Back to site</a>
-        <a class="back-link" href="/admin/landing-stats">Landing-page statistics</a>
+        <a class="back-link" href="/admin/spreaker">Spreaker dashboard</a>
         <p class="section-kicker">Administration</p>
         <h1>Episode content</h1>
         <p>Manage companion articles, episode media, and map locations.</p>
@@ -7946,11 +7115,26 @@ export default {
       }
 
       if (
-        (url.pathname === "/admin/landing-stats" ||
-          url.pathname === "/admin/landing-stats/") &&
+        (url.pathname === "/admin/spreaker" || url.pathname === "/admin/spreaker/") &&
         ["GET", "HEAD"].includes(request.method)
       ) {
-        return handleLandingStatsDashboard(request, env, url);
+        if (!isAdmin(request, env)) return adminUnauthorized();
+        return handleSpreakerDashboard(request, env, url);
+      }
+
+      if (url.pathname === "/admin/spreaker/connect" && request.method === "GET") {
+        if (!isAdmin(request, env)) return adminUnauthorized();
+        return handleSpreakerConnect(request, env);
+      }
+
+      if (url.pathname === "/admin/spreaker/oauth/callback" && request.method === "GET") {
+        if (!isAdmin(request, env)) return adminUnauthorized();
+        return handleSpreakerCallback(request, env, url);
+      }
+
+      if (url.pathname === "/admin/spreaker/monetization" && request.method === "POST") {
+        if (!isAdmin(request, env)) return adminUnauthorized();
+        return handleSpreakerMonetizationUpload(request, env);
       }
 
       if (url.pathname === "/admin/content" && request.method === "GET") {

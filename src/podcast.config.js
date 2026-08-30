@@ -15,6 +15,16 @@ export const podcast = {
     episodeLimit: 50,
     videoOverviewTitleSuffixes: [" - Video Overview"],
     videoOverviewTitlePrefixes: ["Video Overview - "],
+    coldAudienceEpisodeTitles: [
+      "Chris Watts and the Frederick Murders",
+      "Gabby Petito: The Road Trip That Ended in Murder",
+      "The Zodiac Killer",
+      "Trace Natalee Holloway's final night in Aruba",
+      "The Murder of Laci Peterson",
+      "Tara Calico: The Disappearance and the Mysterious Polaroid",
+      "Amy Lynn Bradley: The Cruise Ship Disappearance That Still Has No Answer",
+      "Jennifer Kesse — The Camera That Missed Everything"
+    ],
     legacyEpisodeIds: {
       "How The Exonerated Five Rebuilt Their Lives": "72937477",
       "The Green River Killer Investigation": "72718740",

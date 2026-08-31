@@ -123,8 +123,10 @@ append-only session events in R2. The password-protected stats page is available
 GET /landing-page/stats
 ```
 
-It reports visits, unique Acast-play sessions, playback rate, bounces, and bounce rate by zone for
-up to 90 days. Playback rate is the share of visits with at least one Acast play. A bounce is a
+It reports visits, unique Acast-play sessions, playback rate, average percent played, bounces, and
+bounce rate by zone for up to 90 days. The embedded Acast player records first-party progress events
+at each 10% milestone plus 25% and 75%. Playback rate is the share of visits with at least one Acast play, while
+average percent played is the average highest milestone reached by playing sessions. A bounce is a
 visit without an Acast play, a 100-pixel scroll, or 10 seconds of active visible-page time. The
 stats page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
 the other admin tools.

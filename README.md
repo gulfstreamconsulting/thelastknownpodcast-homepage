@@ -110,17 +110,14 @@ pixels. It does not fire on page load. The event includes the engagement source,
 featured episode, and episode count as parameters. Acast play, pause, and progress events remain
 separate custom events.
 
-PropellerAds traffic can pass its zone ID to the directory with any of these query parameters:
+PropellerAds traffic must pass its zone ID to the directory using the `zoneid` query parameter:
 
 ```text
 GET /landing-page?zoneid=123456
-GET /landing-page?zone_id=123456
-GET /landing-page?zone=123456
 ```
 
-The preferred parameter is `zoneid`. Directory visits, meaningful engagement, and the first Acast
-play for each episode are stored as append-only session events in R2. The password-protected stats
-page is available at:
+Directory visits, meaningful engagement, and the first Acast play for each episode are stored as
+append-only session events in R2. The password-protected stats page is available at:
 
 ```text
 GET /landing-page/stats

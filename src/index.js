@@ -1381,9 +1381,7 @@ const handleAcastPlayerPlay = async (request, env, ctx) => {
 };
 
 const landingPageZoneId = (url) => {
-  const rawZoneId = ["zoneid", "zone_id", "zone"]
-    .map((name) => url.searchParams.get(name))
-    .find((value) => String(value ?? "").trim());
+  const rawZoneId = url.searchParams.get("zoneid");
   const zoneId = String(rawZoneId ?? "").trim();
 
   return /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "unattributed";
@@ -1580,6 +1578,13 @@ const landingPageStatsSummary = (events) => {
     .sort((left, right) => right.visits - left.visits || left.zoneId.localeCompare(right.zoneId));
 };
 
+const landingStatsRateFilter = (url, name, fallback) => {
+  const value = url.searchParams.get(name);
+  if (value === null || String(value).trim() === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : fallback;
+};
+
 const handleLandingPageStats = async (request, env, url) => {
   if (!isAdmin(request, env)) return adminUnauthorized();
   if (!env.EPISODE_CONTENT) {
@@ -1593,9 +1598,36 @@ const handleLandingPageStats = async (request, env, url) => {
   }
 
   const { from, to } = landingStatsDateRange(url);
+  const minPlaybackRate = landingStatsRateFilter(url, "minPlaybackRate", 0);
+  const maxPlaybackRate = landingStatsRateFilter(url, "maxPlaybackRate", 100);
+  const minBounceRate = landingStatsRateFilter(url, "minBounceRate", 0);
+  const maxBounceRate = landingStatsRateFilter(url, "maxBounceRate", 100);
   const rows = landingPageStatsSummary(
     await listLandingPageDirectoryEvents(env.EPISODE_CONTENT, from, to)
+  ).filter(
+    (row) =>
+      row.playbackRate >= Math.min(minPlaybackRate, maxPlaybackRate) &&
+      row.playbackRate <= Math.max(minPlaybackRate, maxPlaybackRate) &&
+      row.bounceRate >= Math.min(minBounceRate, maxBounceRate) &&
+      row.bounceRate <= Math.max(minBounceRate, maxBounceRate)
   );
+
+  if (url.searchParams.get("export") === "zoneids") {
+    const zoneIds = rows
+      .map((row) => row.zoneId)
+      .filter((zoneId) => zoneId !== "unattributed")
+      .join("\n");
+
+    return new Response(request.method === "HEAD" ? null : `${zoneIds}${zoneIds ? "\n" : ""}`, {
+      headers: {
+        "content-type": "text/plain;charset=UTF-8",
+        "content-disposition": 'attachment; filename="propellerads-excluded-zoneids.txt"',
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff"
+      }
+    });
+  }
+
   const total = rows.reduce(
     (summary, row) => ({
       visits: summary.visits + row.visits,
@@ -1638,8 +1670,9 @@ const handleLandingPageStats = async (request, env, url) => {
       form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 28px 0; padding: 18px; border: 1px solid #333; border-radius: 14px; background: #191919; }
       label { display: grid; gap: 6px; color: #bbb; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
       input, button { min-height: 44px; border-radius: 8px; font: inherit; }
-      input { border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
+      input { width: 150px; border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
       button { border: 0; padding: 9px 18px; background: #1ed760; color: #000; font-weight: 800; cursor: pointer; }
+      .export { background: #fff; }
       .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 24px; }
       .card { padding: 20px; border: 1px solid #333; border-radius: 14px; background: #191919; }
       .card span { display: block; color: #aaa; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
@@ -1662,7 +1695,12 @@ const handleLandingPageStats = async (request, env, url) => {
       <form method="get">
         <label>From <input type="date" name="from" value="${escapeHtml(from)}"></label>
         <label>To <input type="date" name="to" value="${escapeHtml(to)}"></label>
+        <label>Playback min % <input type="number" name="minPlaybackRate" min="0" max="100" step="0.1" value="${minPlaybackRate}"></label>
+        <label>Playback max % <input type="number" name="maxPlaybackRate" min="0" max="100" step="0.1" value="${maxPlaybackRate}"></label>
+        <label>Bounce min % <input type="number" name="minBounceRate" min="0" max="100" step="0.1" value="${minBounceRate}"></label>
+        <label>Bounce max % <input type="number" name="maxBounceRate" min="0" max="100" step="0.1" value="${maxBounceRate}"></label>
         <button type="submit">Update</button>
+        <button class="export" type="submit" name="export" value="zoneids">Export zone IDs</button>
       </form>
       <section class="cards" aria-label="Summary">
         <div class="card"><span>Visits</span><strong>${total.visits.toLocaleString("en-US")}</strong></div>
@@ -1675,7 +1713,7 @@ const handleLandingPageStats = async (request, env, url) => {
           <tbody>${tableRows}</tbody>
         </table>
       </div>
-      <p class="definition">Playback rate is the percentage of visits with at least one Acast play. A bounce is a visit with no Acast play, 100-pixel scroll, or 10 seconds of active page time. Date ranges are limited to 90 days.</p>
+      <p class="definition">Playback rate is the percentage of visits with at least one Acast play. A bounce is a visit with no Acast play, 100-pixel scroll, or 10 seconds of active page time. Filters apply to both the table and export. The export contains one attributed PropellerAds zone ID per line; unattributed traffic is omitted. Date ranges are limited to 90 days.</p>
     </main>
   </body>
 </html>`;

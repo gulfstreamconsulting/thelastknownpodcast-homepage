@@ -31,6 +31,7 @@ const EPISODE_DATA_CACHE_PREFIX = "/__cache/episode-data-v3";
 const LANDING_PAGE_VISIT_PREFIX = "analytics/landing-page-visits/";
 const LANDING_PAGE_EVENT_PREFIX = "analytics/landing-page-events/";
 const LANDING_PAGE_PLAYBACK_PREFIX = "analytics/landing-page-playback/";
+const LANDING_PAGE_DIRECTORY_EVENT_PREFIX = "analytics/landing-page-directory/";
 const EPISODES_PER_PAGE = 9;
 const SPOTIFY_SHOW_REDIRECT_ENDPOINTS = new Set([
   "/redirect",
@@ -42,6 +43,8 @@ const SPOTIFY_LANDING_PAGE_ENDPOINT = "/landing-page";
 const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
 const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/playback`;
 const ACAST_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/acast-play`;
+const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
+const LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
 const COLD_AUDIENCE_EPISODE_LIMIT = 8;
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const BOT_USER_AGENT_PATTERN =
@@ -1377,6 +1380,316 @@ const handleAcastPlayerPlay = async (request, env, ctx) => {
   });
 };
 
+const landingPageZoneId = (url) => {
+  const rawZoneId = ["zoneid", "zone_id", "zone"]
+    .map((name) => url.searchParams.get(name))
+    .find((value) => String(value ?? "").trim());
+  const zoneId = String(rawZoneId ?? "").trim();
+
+  return /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "unattributed";
+};
+
+const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) => {
+  if (!env.EPISODE_CONTENT || isLikelyBotRequest(request, "POST")) return;
+
+  const sessionId = String(input.sessionId ?? "").trim();
+  const eventType = String(input.eventType ?? "").trim();
+  const episodeId = String(input.episodeId ?? "").trim();
+
+  if (
+    !/^[A-Za-z0-9-]{8,80}$/.test(sessionId) ||
+    !new Set(["visit", "engaged", "acast_play"]).has(eventType) ||
+    (episodeId && !/^[A-Za-z0-9._:-]{1,200}$/.test(episodeId))
+  ) {
+    return;
+  }
+
+  const occurredAt = new Date().toISOString();
+  const record = {
+    sessionId,
+    eventType,
+    zoneId: landingPageZoneId(referrerUrl),
+    episodeId,
+    country: getCountryCode(request),
+    occurredAt
+  };
+  const key = `${LANDING_PAGE_DIRECTORY_EVENT_PREFIX}${occurredAt.slice(0, 10)}/${occurredAt}-${crypto.randomUUID()}.json`;
+
+  await env.EPISODE_CONTENT.put(key, JSON.stringify(record), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: record
+  });
+};
+
+const handleLandingPageTrack = async (request, env, ctx) => {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST", "cache-control": "no-store" }
+    });
+  }
+
+  if (!sameOriginRequest(request) || Number(request.headers.get("content-length") ?? 0) > 4096) {
+    return new Response("Invalid request", {
+      status: 403,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  let referrerUrl;
+  try {
+    referrerUrl = new URL(request.headers.get("referer") ?? "");
+  } catch {
+    return new Response("Invalid landing page", {
+      status: 400,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  if (
+    referrerUrl.origin !== new URL(request.url).origin ||
+    referrerUrl.pathname !== SPOTIFY_LANDING_PAGE_ENDPOINT
+  ) {
+    return new Response("Invalid landing page", {
+      status: 400,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  let input;
+  try {
+    input = await request.json();
+  } catch {
+    return new Response("Invalid event", {
+      status: 400,
+      headers: { "cache-control": "no-store" }
+    });
+  }
+
+  ctx.waitUntil(
+    saveLandingPageDirectoryEvent(env, request, input ?? {}, referrerUrl).catch((error) => {
+      console.error("Unable to save landing-page directory event", error);
+    })
+  );
+
+  return new Response(null, {
+    status: 204,
+    headers: { "cache-control": "no-store" }
+  });
+};
+
+const landingStatsDateRange = (url) => {
+  const isValidDate = (value) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value ?? "")) return false;
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+  };
+  const today = new Date();
+  const defaultFrom = new Date(today);
+  defaultFrom.setUTCDate(today.getUTCDate() - 29);
+  let from = isValidDate(url.searchParams.get("from"))
+    ? url.searchParams.get("from")
+    : defaultFrom.toISOString().slice(0, 10);
+  let to = isValidDate(url.searchParams.get("to"))
+    ? url.searchParams.get("to")
+    : today.toISOString().slice(0, 10);
+
+  if (from > to) [from, to] = [to, from];
+  const earliest = new Date(`${to}T00:00:00Z`);
+  earliest.setUTCDate(earliest.getUTCDate() - 89);
+  if (from < earliest.toISOString().slice(0, 10)) {
+    from = earliest.toISOString().slice(0, 10);
+  }
+
+  return { from, to };
+};
+
+const listLandingPageDirectoryEvents = async (bucket, from, to) => {
+  const events = [];
+  let cursor;
+  let finished = false;
+
+  do {
+    const result = await bucket.list({
+      prefix: LANDING_PAGE_DIRECTORY_EVENT_PREFIX,
+      startAfter: cursor ? undefined : `${LANDING_PAGE_DIRECTORY_EVENT_PREFIX}${from}`,
+      cursor,
+      include: ["customMetadata"],
+      limit: 1000
+    });
+
+    for (const object of result.objects) {
+      const eventDate = object.key.slice(LANDING_PAGE_DIRECTORY_EVENT_PREFIX.length).split("/")[0];
+      if (eventDate > to) {
+        finished = true;
+        break;
+      }
+      if (eventDate >= from && object.customMetadata) events.push(object.customMetadata);
+    }
+
+    cursor = !finished && result.truncated ? result.cursor : undefined;
+  } while (cursor);
+
+  return events;
+};
+
+const landingPageStatsSummary = (events) => {
+  const sessions = new Map();
+
+  for (const event of events) {
+    const sessionId = String(event.sessionId ?? "");
+    if (!sessionId) continue;
+    const session = sessions.get(sessionId) ?? {
+      zoneId: String(event.zoneId || "unattributed"),
+      visited: false,
+      engaged: false,
+      played: false
+    };
+
+    if (event.eventType === "visit") session.visited = true;
+    if (event.eventType === "engaged") session.engaged = true;
+    if (event.eventType === "acast_play") {
+      session.played = true;
+      session.engaged = true;
+    }
+    sessions.set(sessionId, session);
+  }
+
+  const rows = new Map();
+  for (const session of sessions.values()) {
+    if (!session.visited) continue;
+    const row = rows.get(session.zoneId) ?? {
+      zoneId: session.zoneId,
+      visits: 0,
+      plays: 0,
+      engaged: 0
+    };
+    row.visits += 1;
+    if (session.played) row.plays += 1;
+    if (session.engaged) row.engaged += 1;
+    rows.set(session.zoneId, row);
+  }
+
+  return [...rows.values()]
+    .map((row) => ({
+      ...row,
+      bounces: row.visits - row.engaged,
+      playbackRate: row.visits ? (row.plays / row.visits) * 100 : 0,
+      bounceRate: row.visits ? ((row.visits - row.engaged) / row.visits) * 100 : 0
+    }))
+    .sort((left, right) => right.visits - left.visits || left.zoneId.localeCompare(right.zoneId));
+};
+
+const handleLandingPageStats = async (request, env, url) => {
+  if (!isAdmin(request, env)) return adminUnauthorized();
+  if (!env.EPISODE_CONTENT) {
+    return new Response("EPISODE_CONTENT is not configured", { status: 503 });
+  }
+  if (!new Set(["GET", "HEAD"]).has(request.method)) {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "GET, HEAD", "cache-control": "no-store" }
+    });
+  }
+
+  const { from, to } = landingStatsDateRange(url);
+  const rows = landingPageStatsSummary(
+    await listLandingPageDirectoryEvents(env.EPISODE_CONTENT, from, to)
+  );
+  const total = rows.reduce(
+    (summary, row) => ({
+      visits: summary.visits + row.visits,
+      plays: summary.plays + row.plays,
+      engaged: summary.engaged + row.engaged
+    }),
+    { visits: 0, plays: 0, engaged: 0 }
+  );
+  const totalPlaybackRate = total.visits ? (total.plays / total.visits) * 100 : 0;
+  const totalBounces = total.visits - total.engaged;
+  const totalBounceRate = total.visits ? (totalBounces / total.visits) * 100 : 0;
+  const tableRows = rows.length
+    ? rows
+        .map(
+          (row) => `<tr>
+            <th scope="row">${escapeHtml(row.zoneId === "unattributed" ? "Unattributed" : row.zoneId)}</th>
+            <td>${row.visits.toLocaleString("en-US")}</td>
+            <td>${row.plays.toLocaleString("en-US")}</td>
+            <td>${row.playbackRate.toFixed(1)}%</td>
+            <td>${row.bounces.toLocaleString("en-US")}</td>
+            <td>${row.bounceRate.toFixed(1)}%</td>
+          </tr>`
+        )
+        .join("")
+    : '<tr><td colspan="6" class="empty">No tracked visits in this date range.</td></tr>';
+  const body = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Landing Page Stats | ${escapeHtml(podcast.name)}</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 32px 20px 64px; background: #111; color: #fff; }
+      main { width: min(100%, 1080px); margin: 0 auto; }
+      h1 { margin: 0 0 6px; font-size: clamp(1.8rem, 5vw, 2.6rem); }
+      .subtitle, .definition { color: #aaa; line-height: 1.5; }
+      form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 28px 0; padding: 18px; border: 1px solid #333; border-radius: 14px; background: #191919; }
+      label { display: grid; gap: 6px; color: #bbb; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
+      input, button { min-height: 44px; border-radius: 8px; font: inherit; }
+      input { border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
+      button { border: 0; padding: 9px 18px; background: #1ed760; color: #000; font-weight: 800; cursor: pointer; }
+      .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 24px; }
+      .card { padding: 20px; border: 1px solid #333; border-radius: 14px; background: #191919; }
+      .card span { display: block; color: #aaa; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
+      .card strong { display: block; margin-top: 6px; font-size: 1.8rem; }
+      .table-wrap { overflow-x: auto; border: 1px solid #333; border-radius: 14px; }
+      table { width: 100%; border-collapse: collapse; background: #191919; }
+      th, td { padding: 14px 16px; border-bottom: 1px solid #333; text-align: right; white-space: nowrap; }
+      th:first-child { text-align: left; }
+      thead th { color: #aaa; font-size: .76rem; text-transform: uppercase; }
+      tbody tr:last-child th, tbody tr:last-child td { border-bottom: 0; }
+      .empty { padding: 32px; color: #aaa; text-align: center; }
+      .definition { margin-top: 18px; font-size: .9rem; }
+      @media (max-width: 640px) { .cards { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Landing Page Stats</h1>
+      <p class="subtitle">Acast playback and bounce performance by PropellerAds zone.</p>
+      <form method="get">
+        <label>From <input type="date" name="from" value="${escapeHtml(from)}"></label>
+        <label>To <input type="date" name="to" value="${escapeHtml(to)}"></label>
+        <button type="submit">Update</button>
+      </form>
+      <section class="cards" aria-label="Summary">
+        <div class="card"><span>Visits</span><strong>${total.visits.toLocaleString("en-US")}</strong></div>
+        <div class="card"><span>Acast playback rate</span><strong>${totalPlaybackRate.toFixed(1)}%</strong></div>
+        <div class="card"><span>Bounce rate</span><strong>${totalBounceRate.toFixed(1)}%</strong></div>
+      </section>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Zone</th><th>Visits</th><th>Acast plays</th><th>Playback rate</th><th>Bounces</th><th>Bounce rate</th></tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>
+      <p class="definition">Playback rate is the percentage of visits with at least one Acast play. A bounce is a visit with no Acast play, 100-pixel scroll, or 10 seconds of active page time. Date ranges are limited to 90 days.</p>
+    </main>
+  </body>
+</html>`;
+
+  return new Response(request.method === "HEAD" ? null : body, {
+    headers: {
+      "content-type": "text/html;charset=UTF-8",
+      "cache-control": "no-store",
+      "x-robots-tag": "noindex, nofollow",
+      "x-content-type-options": "nosniff"
+    }
+  });
+};
+
 const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}) => {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed", {
@@ -1736,7 +2049,35 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
         const milestones = [25, 50, 75];
         const statesByWindow = new Map();
         const viewContentParameters = ${viewContentParameters || "null"};
+        const landingSessionId = typeof window.crypto.randomUUID === "function"
+          ? window.crypto.randomUUID()
+          : "session-" + Array.from(window.crypto.getRandomValues(new Uint32Array(4)), (value) =>
+              value.toString(36)
+            ).join("-");
+        const trackedLandingEvents = new Set();
         let hasTrackedViewContent = false;
+        let activeSeconds = 0;
+
+        const trackLandingEvent = (eventType, episodeId) => {
+          const eventKey = eventType === "acast_play"
+            ? eventType + ":" + String(episodeId || "")
+            : eventType;
+          if (trackedLandingEvents.has(eventKey)) return;
+          trackedLandingEvents.add(eventKey);
+          fetch("${escapeHtml(LANDING_PAGE_TRACK_ENDPOINT)}", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              sessionId: landingSessionId,
+              eventType: eventType,
+              episodeId: episodeId || ""
+            }),
+            keepalive: true
+          }).catch(() => {});
+        };
+
+        const trackLandingEngagement = () => trackLandingEvent("engaged");
+        trackLandingEvent("visit");
 
         const trackViewContent = (engagementSource) => {
           if (
@@ -1763,13 +2104,20 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
 
         const handleEngagedScroll = () => {
           if (window.scrollY >= 100) {
+            trackLandingEngagement();
             trackViewContent("scroll");
           }
         };
 
-        if (viewContentParameters) {
-          window.addEventListener("scroll", handleEngagedScroll, { passive: true });
-        }
+        window.addEventListener("scroll", handleEngagedScroll, { passive: true });
+        const engagementTimer = window.setInterval(() => {
+          if (document.visibilityState !== "visible") return;
+          activeSeconds += 1;
+          if (activeSeconds >= 10) {
+            trackLandingEngagement();
+            window.clearInterval(engagementTimer);
+          }
+        }, 1000);
 
         players.forEach((player) => {
           if (!player.contentWindow) return;
@@ -1838,6 +2186,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           }
 
           if (action === "play") {
+            trackLandingEvent("acast_play", state.episodeId);
             fetch("${escapeHtml(ACAST_PLAYER_PLAY_ENDPOINT)}", {
               method: "POST",
               headers: { "content-type": "application/json" },
@@ -1930,6 +2279,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           "pagehide",
           () => {
             window.removeEventListener("scroll", handleEngagedScroll);
+            window.clearInterval(engagementTimer);
             statesByWindow.forEach((state) => stopProgressChecks(state));
           },
           { once: true }
@@ -7005,6 +7355,27 @@ export default {
       } catch (error) {
         console.error("Acast player play tracking failed", error);
         return new Response(null, { status: 204 });
+      }
+    }
+
+    if (url.pathname === LANDING_PAGE_TRACK_ENDPOINT) {
+      try {
+        return await handleLandingPageTrack(request, env, ctx);
+      } catch (error) {
+        console.error("Landing-page directory tracking failed", error);
+        return new Response(null, { status: 204 });
+      }
+    }
+
+    if (url.pathname === LANDING_PAGE_STATS_ENDPOINT) {
+      try {
+        return await handleLandingPageStats(request, env, url);
+      } catch (error) {
+        console.error("Landing-page stats failed", error);
+        return new Response("Unable to load landing-page stats", {
+          status: 500,
+          headers: { "cache-control": "no-store" }
+        });
       }
     }
 

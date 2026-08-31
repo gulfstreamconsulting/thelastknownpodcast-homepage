@@ -110,6 +110,28 @@ pixels. It does not fire on page load. The event includes the engagement source,
 featured episode, and episode count as parameters. Acast play, pause, and progress events remain
 separate custom events.
 
+PropellerAds traffic can pass its zone ID to the directory with any of these query parameters:
+
+```text
+GET /landing-page?zoneid=123456
+GET /landing-page?zone_id=123456
+GET /landing-page?zone=123456
+```
+
+The preferred parameter is `zoneid`. Directory visits, meaningful engagement, and the first Acast
+play for each episode are stored as append-only session events in R2. The password-protected stats
+page is available at:
+
+```text
+GET /landing-page/stats
+```
+
+It reports visits, unique Acast-play sessions, playback rate, bounces, and bounce rate by zone for
+up to 90 days. Playback rate is the share of visits with at least one Acast play. A bounce is a
+visit without an Acast play, a 100-pixel scroll, or 10 seconds of active visible-page time. The
+stats page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
+the other admin tools.
+
 ## Episode Content
 
 The password-protected `/admin/content` page lets you manage companion articles, maps, and supporting files. Images, PDFs, and other supporting files are stored in Cloudflare R2. Public video overview links are discovered from matching Spotify episodes and do not use legacy R2 or YouTube video assets.

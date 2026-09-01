@@ -36,6 +36,7 @@ GET /landing-page
 GET /landing-page?audience=cold
 GET /landing-page/:episode-slug
 GET /landing-page/:episode-slug/spotify
+GET /landing-page/:episode-slug/apple
 ```
 
 The directory lists the published episodes with an episode-specific Acast player and prominent
@@ -43,6 +44,13 @@ play button on each card, including the eight-card cold-audience view.
 The episode-specific `/spotify` route displays the landing page for two seconds so analytics
 pixels can fire, then redirects to that episode on Spotify. Tapping a Spotify link sends an
 internal analytics request to `/landing-page/click` with the Spotify episode ID.
+
+Every episode card also links through its episode-specific `/apple` route. That route displays the
+same two-second analytics interstitial, then redirects to that episode's Apple Podcasts page. The
+Worker matches the RSS GUID first and normalized episode title second against Apple's cached
+podcast-episode lookup response. If Apple has not indexed an episode yet, the route reports that it
+is unavailable instead of redirecting to the show page. An Apple click counts as landing-page
+engagement for bounce-rate reporting.
 
 The `?audience=cold` option limits the directory to eight curated, high-interest starter episodes.
 The priority order is configured with `spotify.coldAudienceEpisodeTitles` in

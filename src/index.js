@@ -45,6 +45,10 @@ const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/play
 const ACAST_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/acast-play`;
 const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
 const LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
+const APPLE_PODCASTS_SHOW_URL =
+  podcast.links.find((link) => link.label === "Apple Podcasts")?.href || "#";
+const APPLE_PODCASTS_SHOW_ID = APPLE_PODCASTS_SHOW_URL.match(/\/id(\d+)/)?.[1] || "";
+const APPLE_PODCASTS_CACHE_SECONDS = 15 * 60;
 const COLD_AUDIENCE_EPISODE_LIMIT = 8;
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const BOT_USER_AGENT_PATTERN =
@@ -196,6 +200,52 @@ const rssEpisodeFallbackId = (itemXml, title) => {
   return xmlElement(itemXml, "guid").replace(/[^A-Za-z0-9]/g, "") || slugify(title);
 };
 
+const safeApplePodcastsUrl = (value) => {
+  try {
+    const url = new URL(String(value ?? ""));
+    return url.protocol === "https:" && url.hostname === "podcasts.apple.com" ? url.href : "";
+  } catch {
+    return "";
+  }
+};
+
+const fetchApplePodcastEpisodeUrls = async () => {
+  const byGuid = new Map();
+  const byTitle = new Map();
+  if (!APPLE_PODCASTS_SHOW_ID) return { byGuid, byTitle };
+
+  const url = new URL("https://itunes.apple.com/lookup");
+  url.searchParams.set("id", APPLE_PODCASTS_SHOW_ID);
+  url.searchParams.set("entity", "podcastEpisode");
+  url.searchParams.set("limit", "200");
+  url.searchParams.set("country", "us");
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      "user-agent": "The Last Known Podcast Website"
+    },
+    cf: {
+      cacheTtl: APPLE_PODCASTS_CACHE_SECONDS,
+      cacheEverything: true
+    }
+  });
+
+  if (!response.ok) return { byGuid, byTitle };
+  const payload = await response.json();
+
+  for (const result of Array.isArray(payload?.results) ? payload.results : []) {
+    if (result?.wrapperType !== "podcastEpisode") continue;
+    const episodeUrl = safeApplePodcastsUrl(result.trackViewUrl);
+    if (!episodeUrl) continue;
+    const guid = String(result.episodeGuid ?? "").trim();
+    const title = normalizeSearchText(result.trackName);
+    if (guid) byGuid.set(guid, episodeUrl);
+    if (title) byTitle.set(title, episodeUrl);
+  }
+
+  return { byGuid, byTitle };
+};
+
 const fetchPodcastRssEpisodes = async () => {
   const cacheSeconds = Math.max(30, podcast.spotify.cacheSeconds ?? 60);
   const cacheKey = String(Math.floor(Date.now() / (cacheSeconds * 1000)));
@@ -213,9 +263,10 @@ const fetchPodcastRssEpisodes = async () => {
       cacheEverything: true
     }
   };
-  const [rssResponse, creatorsResponse] = await Promise.all([
+  const [rssResponse, creatorsResponse, appleEpisodeUrls] = await Promise.all([
     fetch(rssUrl, requestOptions),
-    fetch(creatorsUrl, requestOptions).catch(() => null)
+    fetch(creatorsUrl, requestOptions).catch(() => null),
+    fetchApplePodcastEpisodeUrls().catch(() => ({ byGuid: new Map(), byTitle: new Map() }))
   ]);
 
   if (!rssResponse.ok) {
@@ -250,6 +301,7 @@ const fetchPodcastRssEpisodes = async () => {
       const transcriptType = xmlAttribute(itemXml, "podcast:transcript", "type");
       const acastEpisodeId = xmlElement(itemXml, "acast:episodeId").trim();
       const acastShowId = xmlElement(itemXml, "acast:showId").trim();
+      const episodeGuid = xmlElement(itemXml, "guid").trim();
       const spotifyEpisodeId = spotifyIdsByTitle.get(normalizeSearchText(title)) || "";
       const spotifyUrl = spotifyEpisodeId
         ? `https://open.spotify.com/episode/${spotifyEpisodeId}`
@@ -261,6 +313,10 @@ const fetchPodcastRssEpisodes = async () => {
           spotifyEpisodeId,
           acastEpisodeId,
           acastShowId,
+          appleEpisodeUrl:
+            appleEpisodeUrls.byGuid.get(episodeGuid) ||
+            appleEpisodeUrls.byTitle.get(normalizeSearchText(title)) ||
+            "",
           slug: slugify(title),
           status: "Episode",
           title,
@@ -1238,7 +1294,7 @@ const handleSpotifyLandingClick = (request, env, ctx) => {
   const episodeId = String(url.searchParams.get("episode") ?? "").trim();
   const episodeSlug = String(url.searchParams.get("slug") ?? "").trim();
 
-  if (!new Set(["spotify", "app", "browser", "player"]).has(destination)) {
+  if (!new Set(["spotify", "app", "browser", "player", "apple"]).has(destination)) {
     return new Response("Invalid destination", {
       status: 400,
       headers: { "cache-control": "no-store" }
@@ -1706,6 +1762,23 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
     episode.spotifyEpisodeUrl || `https://open.spotify.com/episode/${episodeId}`;
   const trackedSpotifyUrl = `${spotifyLandingPagePath(episode)}/spotify`;
   const autoRedirect = options.autoRedirect === true;
+  const isAppleRedirect = options.platform === "apple";
+  const appleEpisodeUrl = safeApplePodcastsUrl(episode.appleEpisodeUrl);
+
+  if (isAppleRedirect && !appleEpisodeUrl) {
+    return new Response("This episode is not available on Apple Podcasts yet.", {
+      status: 503,
+      headers: {
+        "content-type": "text/plain;charset=UTF-8",
+        "cache-control": "no-store",
+        "x-robots-tag": "noindex, nofollow"
+      }
+    });
+  }
+
+  const platformName = isAppleRedirect ? "Apple Podcasts" : "Spotify";
+  const destination = isAppleRedirect ? "apple" : "app";
+  const destinationUrl = isAppleRedirect ? appleEpisodeUrl : spotifyEpisodeUrl;
   const countryCode = analytics.countryCode || "XX";
   const body = `<!doctype html>
 <html lang="en">
@@ -1713,7 +1786,7 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex, nofollow">
-    <title>${escapeHtml(episode.title)} | Spotify</title>
+    <title>${escapeHtml(episode.title)} | ${escapeHtml(platformName)}</title>
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(analytics.facebookPixelId)}
     <style>
@@ -1740,12 +1813,12 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
       <h1>${escapeHtml(episode.title)}</h1>
       <p class="intro">${
         autoRedirect
-          ? "Opening this episode in Spotify&hellip;"
+          ? `Opening this episode in ${escapeHtml(platformName)}&hellip;`
           : "Open this episode in Spotify."
       }</p>
-      <a class="app" data-destination="app" href="${escapeHtml(
-        autoRedirect ? spotifyEpisodeUrl : trackedSpotifyUrl
-      )}">${autoRedirect ? "Continue to Spotify" : "Listen on Spotify"}</a>
+      <a class="app" data-destination="${escapeHtml(destination)}" href="${escapeHtml(
+        autoRedirect ? destinationUrl : trackedSpotifyUrl
+      )}">${autoRedirect ? `Continue to ${escapeHtml(platformName)}` : "Listen on Spotify"}</a>
     </main>
     <script>
       (function () {
@@ -1778,8 +1851,8 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
           }
         };
 
-        document.querySelector("[data-destination='app']").addEventListener("click", () => {
-          track("app");
+        document.querySelector("[data-destination='${escapeHtml(destination)}']").addEventListener("click", () => {
+          track("${escapeHtml(destination)}");
         });
       })();
     </script>
@@ -1788,7 +1861,7 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
         ? `<script>
       window.addEventListener("load", function () {
         window.setTimeout(function () {
-          window.location.replace(${safeJson(spotifyEpisodeUrl)});
+          window.location.replace(${safeJson(destinationUrl)});
         }, 2000);
       }, { once: true });
     </script>`
@@ -1829,6 +1902,7 @@ const handleSpotifyEpisodeLandingPage = async (
 
     if (
       options.autoRedirect === true &&
+      options.platform !== "apple" &&
       request.method === "GET" &&
       !isLikelyBotRequest(request, "GET")
     ) {
@@ -1897,6 +1971,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
     const isColdAudience = pageUrl.searchParams.get("audience")?.toLowerCase() === "cold";
     const attributionSource =
       pageUrl.searchParams.get("source") === "facebook_ad" ? "facebook_ad" : "";
+    const zoneId = landingPageZoneId(pageUrl);
     const countryCode = analytics.countryCode || "XX";
 
     if (!episodes.length) {
@@ -1933,11 +2008,14 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       .map(
         (episode, episodeIndex) => {
           const isFeaturedColdEpisode = isColdAudience && episodeIndex === 0;
+          const outboundParams = new URLSearchParams();
+          if (attributionSource) outboundParams.set("source", attributionSource);
+          if (zoneId !== "unattributed") outboundParams.set("zoneid", zoneId);
+          const outboundQuery = outboundParams.size ? `?${outboundParams}` : "";
           const episodeHref = isColdAudience
-            ? `${spotifyLandingPagePath(episode)}/spotify${
-                attributionSource ? `?source=${encodeURIComponent(attributionSource)}` : ""
-              }`
+            ? `${spotifyLandingPagePath(episode)}/spotify${outboundQuery}`
             : spotifyLandingPagePath(episode);
+          const appleHref = `${spotifyLandingPagePath(episode)}/apple${outboundQuery}`;
           const acastEmbedUrl =
             episode.acastShowId && episode.acastEpisodeId
               ? `https://embed.acast.com/${encodeURIComponent(episode.acastShowId)}/${encodeURIComponent(
@@ -1965,6 +2043,10 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             : `<a class="episode-link" href="${escapeHtml(episodeHref)}">${
                 isColdAudience ? "Listen on Spotify" : "Open episode"
               }</a>`;
+          const appleAction = `<a class="episode-link apple-link" data-apple-link href="${escapeHtml(
+            appleHref
+          )}">Listen on Apple Podcasts</a>`;
+          const episodeActions = `${episodeAction}${appleAction}`;
 
           return `
           <article class="episode">
@@ -1976,9 +2058,9 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             >
             <p class="published">${escapeHtml(episode.publishedAt)}</p>
             <h2>${escapeHtml(episode.title)}</h2>
-            ${isFeaturedColdEpisode ? episodeAction : ""}
+            ${isFeaturedColdEpisode ? episodeActions : ""}
             <p class="intro">${escapeHtml(episode.summary)}</p>
-            ${isFeaturedColdEpisode ? "" : episodeAction}
+            ${isFeaturedColdEpisode ? "" : episodeActions}
           </article>`;
         }
       )
@@ -2018,6 +2100,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       .intro { margin: 0 0 28px; }
       a { text-decoration: none; }
       .episode-link { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; background: #1ed760; color: #000; font-size: 1.125rem; font-weight: 800; }
+      .apple-link { margin-top: 14px; background: #fff; color: #111; }
       a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
       body.cold-audience { padding-top: 20px; }
       .cold-audience .page-intro { margin-bottom: 12px; }
@@ -2078,6 +2161,9 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
 
         const trackLandingEngagement = () => trackLandingEvent("engaged");
         trackLandingEvent("visit");
+        document.querySelectorAll("[data-apple-link]").forEach((link) => {
+          link.addEventListener("click", trackLandingEngagement);
+        });
 
         const trackViewContent = (engagementSource) => {
           if (
@@ -2320,7 +2406,7 @@ const spotifyLandingPagePath = (episode) =>
 const episodeAnchor = (episode) => `episode-${episode.slug}`;
 
 const spotifyLandingPageSlugFromPath = (pathname) => {
-  const match = pathname.match(/^\/landing-page\/([^/]+)(?:\/spotify)?\/?$/);
+  const match = pathname.match(/^\/landing-page\/([^/]+)(?:\/(?:spotify|apple))?\/?$/);
 
   if (!match || match[1] === "click") {
     return null;
@@ -2402,7 +2488,9 @@ const serializeEpisode = (episode, origin) => ({
   publishedAtDisplay: episode.publishedAt,
   detailPageUrl: absoluteUrl(episodePath(episode), origin),
   spotifyLandingPageUrl: absoluteUrl(spotifyLandingPagePath(episode), origin),
+  appleLandingPageUrl: absoluteUrl(`${spotifyLandingPagePath(episode)}/apple`, origin),
   spotifyUrl: episode.spotifyUrl,
+  appleUrl: episode.appleEpisodeUrl || null,
   audioUrl: episode.audioUrl,
   artworkUrl: absoluteUrl(episode.image, origin),
   player: {
@@ -7301,7 +7389,7 @@ export default {
     const cacheControl = `public, max-age=${podcast.spotify.cacheSeconds}`;
     const apiEpisodeMatch = url.pathname.match(/^\/api\/episodes\/([^/]+)\/?$/);
     const spotifyLandingPageMatch = url.pathname.match(
-      /^\/landing-page\/([^/]+)(\/spotify)?\/?$/
+      /^\/landing-page\/([^/]+)(\/(?:spotify|apple))?\/?$/
     );
     const isApiRequest =
       url.pathname === "/api/podcast" ||
@@ -7393,7 +7481,8 @@ export default {
       }
 
       return handleSpotifyEpisodeLandingPage(request, episodeSlug, analytics, env, ctx, {
-        autoRedirect: Boolean(spotifyLandingPageMatch[2])
+        autoRedirect: Boolean(spotifyLandingPageMatch[2]),
+        platform: spotifyLandingPageMatch[2] === "/apple" ? "apple" : "spotify"
       });
     }
 

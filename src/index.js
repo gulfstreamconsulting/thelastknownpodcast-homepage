@@ -1437,9 +1437,7 @@ const handleAcastPlayerPlay = async (request, env, ctx) => {
 };
 
 const landingPageZoneId = (url) => {
-  const rawZoneId = ["zoneid", "zone_id", "zone"]
-    .map((name) => url.searchParams.get(name))
-    .find((value) => String(value ?? "").trim());
+  const rawZoneId = url.searchParams.get("zoneid");
   const zoneId = String(rawZoneId ?? "").trim();
 
   return /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "unattributed";
@@ -1451,11 +1449,14 @@ const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) =
   const sessionId = String(input.sessionId ?? "").trim();
   const eventType = String(input.eventType ?? "").trim();
   const episodeId = String(input.episodeId ?? "").trim();
+  const percentPlayed = Math.round(Number(input.percentPlayed));
 
   if (
     !/^[A-Za-z0-9-]{8,80}$/.test(sessionId) ||
-    !new Set(["visit", "engaged", "acast_play"]).has(eventType) ||
-    (episodeId && !/^[A-Za-z0-9._:-]{1,200}$/.test(episodeId))
+    !new Set(["visit", "engaged", "acast_play", "acast_progress"]).has(eventType) ||
+    (episodeId && !/^[A-Za-z0-9._:-]{1,200}$/.test(episodeId)) ||
+    (eventType === "acast_progress" &&
+      ![10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100].includes(percentPlayed))
   ) {
     return;
   }
@@ -1466,6 +1467,7 @@ const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) =
     eventType,
     zoneId: landingPageZoneId(referrerUrl),
     episodeId,
+    percentPlayed: eventType === "acast_progress" ? String(percentPlayed) : "",
     country: getCountryCode(request),
     occurredAt
   };
@@ -1599,7 +1601,8 @@ const landingPageStatsSummary = (events) => {
       zoneId: String(event.zoneId || "unattributed"),
       visited: false,
       engaged: false,
-      played: false
+      played: false,
+      highestPlaybackPercent: 0
     };
 
     if (event.eventType === "visit") session.visited = true;
@@ -1607,6 +1610,14 @@ const landingPageStatsSummary = (events) => {
     if (event.eventType === "acast_play") {
       session.played = true;
       session.engaged = true;
+    }
+    if (event.eventType === "acast_progress") {
+      session.played = true;
+      session.engaged = true;
+      session.highestPlaybackPercent = Math.max(
+        session.highestPlaybackPercent,
+        Math.min(100, Math.max(0, Number(event.percentPlayed) || 0))
+      );
     }
     sessions.set(sessionId, session);
   }
@@ -1618,10 +1629,14 @@ const landingPageStatsSummary = (events) => {
       zoneId: session.zoneId,
       visits: 0,
       plays: 0,
-      engaged: 0
+      engaged: 0,
+      playbackPercentTotal: 0
     };
     row.visits += 1;
-    if (session.played) row.plays += 1;
+    if (session.played) {
+      row.plays += 1;
+      row.playbackPercentTotal += session.highestPlaybackPercent;
+    }
     if (session.engaged) row.engaged += 1;
     rows.set(session.zoneId, row);
   }
@@ -1631,9 +1646,17 @@ const landingPageStatsSummary = (events) => {
       ...row,
       bounces: row.visits - row.engaged,
       playbackRate: row.visits ? (row.plays / row.visits) * 100 : 0,
+      averagePlaybackPercent: row.plays ? row.playbackPercentTotal / row.plays : 0,
       bounceRate: row.visits ? ((row.visits - row.engaged) / row.visits) * 100 : 0
     }))
     .sort((left, right) => right.visits - left.visits || left.zoneId.localeCompare(right.zoneId));
+};
+
+const landingStatsRateFilter = (url, name, fallback) => {
+  const value = url.searchParams.get(name);
+  if (value === null || String(value).trim() === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : fallback;
 };
 
 const handleLandingPageStats = async (request, env, url) => {
@@ -1649,18 +1672,53 @@ const handleLandingPageStats = async (request, env, url) => {
   }
 
   const { from, to } = landingStatsDateRange(url);
+  const minPlaybackRate = landingStatsRateFilter(url, "minPlaybackRate", 0);
+  const maxPlaybackRate = landingStatsRateFilter(url, "maxPlaybackRate", 100);
+  const minBounceRate = landingStatsRateFilter(url, "minBounceRate", 0);
+  const maxBounceRate = landingStatsRateFilter(url, "maxBounceRate", 100);
+  const minPlaybackPercent = landingStatsRateFilter(url, "minPlaybackPercent", 0);
+  const maxPlaybackPercent = landingStatsRateFilter(url, "maxPlaybackPercent", 100);
   const rows = landingPageStatsSummary(
     await listLandingPageDirectoryEvents(env.EPISODE_CONTENT, from, to)
+  ).filter(
+    (row) =>
+      row.playbackRate >= Math.min(minPlaybackRate, maxPlaybackRate) &&
+      row.playbackRate <= Math.max(minPlaybackRate, maxPlaybackRate) &&
+      row.averagePlaybackPercent >= Math.min(minPlaybackPercent, maxPlaybackPercent) &&
+      row.averagePlaybackPercent <= Math.max(minPlaybackPercent, maxPlaybackPercent) &&
+      row.bounceRate >= Math.min(minBounceRate, maxBounceRate) &&
+      row.bounceRate <= Math.max(minBounceRate, maxBounceRate)
   );
+
+  if (url.searchParams.get("export") === "zoneids") {
+    const zoneIds = rows
+      .map((row) => row.zoneId)
+      .filter((zoneId) => zoneId !== "unattributed")
+      .join("\n");
+
+    return new Response(request.method === "HEAD" ? null : `${zoneIds}${zoneIds ? "\n" : ""}`, {
+      headers: {
+        "content-type": "text/plain;charset=UTF-8",
+        "content-disposition": 'attachment; filename="propellerads-excluded-zoneids.txt"',
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff"
+      }
+    });
+  }
+
   const total = rows.reduce(
     (summary, row) => ({
       visits: summary.visits + row.visits,
       plays: summary.plays + row.plays,
-      engaged: summary.engaged + row.engaged
+      engaged: summary.engaged + row.engaged,
+      playbackPercentTotal: summary.playbackPercentTotal + row.playbackPercentTotal
     }),
-    { visits: 0, plays: 0, engaged: 0 }
+    { visits: 0, plays: 0, engaged: 0, playbackPercentTotal: 0 }
   );
   const totalPlaybackRate = total.visits ? (total.plays / total.visits) * 100 : 0;
+  const totalAveragePlaybackPercent = total.plays
+    ? total.playbackPercentTotal / total.plays
+    : 0;
   const totalBounces = total.visits - total.engaged;
   const totalBounceRate = total.visits ? (totalBounces / total.visits) * 100 : 0;
   const tableRows = rows.length
@@ -1671,12 +1729,13 @@ const handleLandingPageStats = async (request, env, url) => {
             <td>${row.visits.toLocaleString("en-US")}</td>
             <td>${row.plays.toLocaleString("en-US")}</td>
             <td>${row.playbackRate.toFixed(1)}%</td>
+            <td>${row.averagePlaybackPercent.toFixed(1)}%</td>
             <td>${row.bounces.toLocaleString("en-US")}</td>
             <td>${row.bounceRate.toFixed(1)}%</td>
           </tr>`
         )
         .join("")
-    : '<tr><td colspan="6" class="empty">No tracked visits in this date range.</td></tr>';
+    : '<tr><td colspan="7" class="empty">No tracked visits match these filters.</td></tr>';
   const body = `<!doctype html>
 <html lang="en">
   <head>
@@ -1694,9 +1753,10 @@ const handleLandingPageStats = async (request, env, url) => {
       form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 28px 0; padding: 18px; border: 1px solid #333; border-radius: 14px; background: #191919; }
       label { display: grid; gap: 6px; color: #bbb; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
       input, button { min-height: 44px; border-radius: 8px; font: inherit; }
-      input { border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
+      input { width: 150px; border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
       button { border: 0; padding: 9px 18px; background: #1ed760; color: #000; font-weight: 800; cursor: pointer; }
-      .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 24px; }
+      .export { background: #fff; }
+      .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 24px; }
       .card { padding: 20px; border: 1px solid #333; border-radius: 14px; background: #191919; }
       .card span { display: block; color: #aaa; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
       .card strong { display: block; margin-top: 6px; font-size: 1.8rem; }
@@ -1718,20 +1778,28 @@ const handleLandingPageStats = async (request, env, url) => {
       <form method="get">
         <label>From <input type="date" name="from" value="${escapeHtml(from)}"></label>
         <label>To <input type="date" name="to" value="${escapeHtml(to)}"></label>
+        <label>Playback min % <input type="number" name="minPlaybackRate" min="0" max="100" step="0.1" value="${minPlaybackRate}"></label>
+        <label>Playback max % <input type="number" name="maxPlaybackRate" min="0" max="100" step="0.1" value="${maxPlaybackRate}"></label>
+        <label>Played min % <input type="number" name="minPlaybackPercent" min="0" max="100" step="0.1" value="${minPlaybackPercent}"></label>
+        <label>Played max % <input type="number" name="maxPlaybackPercent" min="0" max="100" step="0.1" value="${maxPlaybackPercent}"></label>
+        <label>Bounce min % <input type="number" name="minBounceRate" min="0" max="100" step="0.1" value="${minBounceRate}"></label>
+        <label>Bounce max % <input type="number" name="maxBounceRate" min="0" max="100" step="0.1" value="${maxBounceRate}"></label>
         <button type="submit">Update</button>
+        <button class="export" type="submit" name="export" value="zoneids">Export zone IDs</button>
       </form>
       <section class="cards" aria-label="Summary">
         <div class="card"><span>Visits</span><strong>${total.visits.toLocaleString("en-US")}</strong></div>
         <div class="card"><span>Acast playback rate</span><strong>${totalPlaybackRate.toFixed(1)}%</strong></div>
+        <div class="card"><span>Average played</span><strong>${totalAveragePlaybackPercent.toFixed(1)}%</strong></div>
         <div class="card"><span>Bounce rate</span><strong>${totalBounceRate.toFixed(1)}%</strong></div>
       </section>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Zone</th><th>Visits</th><th>Acast plays</th><th>Playback rate</th><th>Bounces</th><th>Bounce rate</th></tr></thead>
+          <thead><tr><th>Zone</th><th>Visits</th><th>Acast plays</th><th>Playback rate</th><th>Average played</th><th>Bounces</th><th>Bounce rate</th></tr></thead>
           <tbody>${tableRows}</tbody>
         </table>
       </div>
-      <p class="definition">Playback rate is the percentage of visits with at least one Acast play. A bounce is a visit with no Acast play, 100-pixel scroll, or 10 seconds of active page time. Date ranges are limited to 90 days.</p>
+      <p class="definition">Playback rate is the percentage of visits with at least one Acast play. Average played is the average highest Acast progress milestone reached among playing sessions, measured every 10% plus 25% and 75%. A bounce is a visit with no Acast play, 100-pixel scroll, or 10 seconds of active page time. Filters apply to both the table and export. The export contains one attributed PropellerAds zone ID per line; unattributed traffic is omitted. Date ranges are limited to 90 days.</p>
     </main>
   </body>
 </html>`;
@@ -2129,7 +2197,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
     <script>
       (function () {
         const players = Array.from(document.querySelectorAll("[data-acast-player]"));
-        const milestones = [25, 50, 75];
+        const milestones = [10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100];
         const statesByWindow = new Map();
         const viewContentParameters = ${viewContentParameters || "null"};
         const landingSessionId = typeof window.crypto.randomUUID === "function"
@@ -2141,9 +2209,9 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
         let hasTrackedViewContent = false;
         let activeSeconds = 0;
 
-        const trackLandingEvent = (eventType, episodeId) => {
-          const eventKey = eventType === "acast_play"
-            ? eventType + ":" + String(episodeId || "")
+        const trackLandingEvent = (eventType, episodeId, percentPlayed) => {
+          const eventKey = eventType.startsWith("acast_")
+            ? [eventType, String(episodeId || ""), String(percentPlayed || "")].join(":")
             : eventType;
           if (trackedLandingEvents.has(eventKey)) return;
           trackedLandingEvents.add(eventKey);
@@ -2153,7 +2221,8 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             body: JSON.stringify({
               sessionId: landingSessionId,
               eventType: eventType,
-              episodeId: episodeId || ""
+              episodeId: episodeId || "",
+              percentPlayed: percentPlayed || 0
             }),
             keepalive: true
           }).catch(() => {});
@@ -2280,11 +2349,14 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
               keepalive: true
             }).catch(() => {});
           }
+          if (action === "progress" && typeof percent === "number") {
+            trackLandingEvent("acast_progress", state.episodeId, percent);
+          }
         };
 
-        const checkMilestones = (state, progress) => {
-          if (!(state.duration > 0) || !(progress >= 0)) return;
-          const percentComplete = (progress / state.duration) * 100;
+        const checkMilestones = (state, progressPercent) => {
+          if (!Number.isFinite(progressPercent) || progressPercent < 0) return;
+          const percentComplete = Math.min(100, progressPercent);
 
           milestones.forEach((milestone) => {
             if (percentComplete >= milestone && !state.reached.has(milestone)) {

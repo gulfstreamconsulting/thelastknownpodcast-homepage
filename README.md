@@ -49,8 +49,18 @@ Every episode card also links through its episode-specific `/apple` route. That 
 same two-second analytics interstitial, then redirects to that episode's Apple Podcasts page. The
 Worker matches the RSS GUID first and normalized episode title second against Apple's cached
 podcast-episode lookup response. If Apple has not indexed an episode yet, the route reports that it
-is unavailable instead of redirecting to the show page. An Apple click counts as landing-page
-engagement for bounce-rate reporting.
+is unavailable instead of redirecting to the show page. Apple redirects are recorded as first-party
+conversions and count as landing-page engagement for bounce-rate reporting. The redirect
+interstitial also emits the same Google Analytics and Meta custom click event as the Spotify flow,
+with `destination` set to `apple`.
+
+Real browser GET requests to an episode-specific `/apple` route send a background IFTTT
+notification containing the episode title, tracked redirect URL, and resolved Apple episode URL.
+Configure its private Maker Webhooks URL as a Worker secret:
+
+```bash
+npx wrangler secret put IFTTT_APPLE_PODCAST_REDIRECT_WEBHOOK_URL
+```
 
 The `?audience=cold` option limits the directory to eight curated, high-interest starter episodes.
 The priority order is configured with `spotify.coldAudienceEpisodeTitles` in
@@ -124,20 +134,22 @@ PropellerAds traffic must pass its zone ID to the directory using the `zoneid` q
 GET /landing-page?zoneid=123456
 ```
 
-Directory visits, meaningful engagement, and the first Acast play for each episode are stored as
-append-only session events in R2. The password-protected stats page is available at:
+Directory visits, meaningful engagement, the first Acast play for each episode, Acast progress,
+and Apple episode redirects are stored as append-only session events in R2. The password-protected
+stats page is available at:
 
 ```text
 GET /landing-page/stats
 ```
 
-It reports visits, unique Acast-play sessions, playback rate, average percent played, bounces, and
-bounce rate by zone for up to 90 days. The embedded Acast player records first-party progress events
-at each 10% milestone plus 25% and 75%. Playback rate is the share of visits with at least one Acast play, while
+It reports visits, unique Acast-play sessions, playback rate, average percent played, Apple episode
+redirects, Apple redirect rate, bounces, and bounce rate by zone for up to 90 days. The embedded
+Acast player records first-party progress events at each 10% milestone plus 25% and 75%. Playback
+and Apple redirect rates are the share of visits with at least one matching conversion, while
 average percent played is the average highest milestone reached by playing sessions. A bounce is a
-visit without an Acast play, a 100-pixel scroll, or 10 seconds of active visible-page time. The
-stats page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
-the other admin tools.
+visit without an Acast play, Apple redirect, 100-pixel scroll, or 10 seconds of active visible-page
+time. The stats page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication
+credentials as the other admin tools.
 
 ## Episode Content
 

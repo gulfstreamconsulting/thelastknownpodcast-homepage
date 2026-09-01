@@ -38,7 +38,7 @@ GET /landing-page/:episode-slug
 GET /landing-page/:episode-slug/spotify
 ```
 
-The directory lists the published episodes with an episode-specific Acast player and prominent
+The directory lists the published episodes from the Spreaker RSS feed with an episode-specific Spreaker player and prominent
 play button on each card, including the eight-card cold-audience view.
 The episode-specific `/spotify` route displays the landing page for two seconds so analytics
 pixels can fire, then redirects to that episode on Spotify. Tapping a Spotify link sends an
@@ -56,11 +56,11 @@ notification. Configure its private Maker Webhooks URL as a Worker secret:
 npx wrangler secret put IFTTT_SPOTIFY_EPISODE_REDIRECT_WEBHOOK_URL
 ```
 
-Each Acast episode player on `/landing-page` also sends an IFTTT notification when playback starts.
+Each Spreaker episode player on `/landing-page` also sends an IFTTT notification when playback starts.
 Configure its private Maker Webhooks URL separately:
 
 ```bash
-npx wrangler secret put IFTTT_ACAST_PLAYER_PLAY_WEBHOOK_URL
+npx wrangler secret put IFTTT_SPREAKER_PLAYER_PLAY_WEBHOOK_URL
 ```
 
 Individual episode landing pages record a view as soon as the page renders so Spotify clicks use
@@ -105,9 +105,9 @@ npx wrangler secret put FACEBOOK_PIXEL_ID
 ```
 
 The cold-audience landing page emits a `ViewContent` event to both Google Analytics and Meta once
-after meaningful engagement: either the first Acast play or a deliberate scroll of at least 100
+after meaningful engagement: either the first Spreaker play or a deliberate scroll of at least 100
 pixels. It does not fire on page load. The event includes the engagement source, page variant,
-featured episode, and episode count as parameters. Acast play, pause, and progress events remain
+featured episode, and episode count as parameters. Spreaker play, pause, and progress events remain
 separate custom events.
 
 PropellerAds traffic must pass its zone ID to the directory using the `zoneid` query parameter:
@@ -116,20 +116,21 @@ PropellerAds traffic must pass its zone ID to the directory using the `zoneid` q
 GET /landing-page?zoneid=123456
 ```
 
-Directory visits, meaningful engagement, and the first Acast play for each episode are stored as
+Directory visits, meaningful engagement, and the first Spreaker play for each episode are stored as
 append-only session events in R2. The password-protected stats page is available at:
 
 ```text
 GET /landing-page/stats
 ```
 
-It reports visits, unique Acast-play sessions, playback rate, average percent played, bounces, and
-bounce rate by zone for up to 90 days. The embedded Acast player records first-party progress events
-at each 10% milestone plus 25% and 75%. Playback rate is the share of visits with at least one Acast play, while
+It reports visits, unique embedded-player sessions, playback rate, average percent played, bounces, and
+bounce rate by zone for up to 90 days. The embedded Spreaker player records first-party progress events
+at each 10% milestone plus 25% and 75%. Playback rate is the share of visits with at least one player play, while
 average percent played is the average highest milestone reached by playing sessions. A bounce is a
-visit without an Acast play, a 100-pixel scroll, or 10 seconds of active visible-page time. The
+visit without a player play, a 100-pixel scroll, or 10 seconds of active visible-page time. The
 stats page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
-the other admin tools.
+the other admin tools. Filtered zone results are paginated at 25, 50, or 100 rows per page; exports
+continue to include every matching zone across all pages.
 
 ## Episode Content
 

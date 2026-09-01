@@ -42,7 +42,7 @@ const SPOTIFY_SHOW_REDIRECT_ENDPOINTS = new Set([
 const SPOTIFY_LANDING_PAGE_ENDPOINT = "/landing-page";
 const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
 const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/playback`;
-const ACAST_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/acast-play`;
+const SPREAKER_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/spreaker-play`;
 const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
 const LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
 const COLD_AUDIENCE_EPISODE_LIMIT = 8;
@@ -248,8 +248,10 @@ const fetchPodcastRssEpisodes = async () => {
       const audioType = xmlAttribute(itemXml, "enclosure", "type");
       const transcriptUrl = xmlAttribute(itemXml, "podcast:transcript", "url");
       const transcriptType = xmlAttribute(itemXml, "podcast:transcript", "type");
-      const acastEpisodeId = xmlElement(itemXml, "acast:episodeId").trim();
-      const acastShowId = xmlElement(itemXml, "acast:showId").trim();
+      const spreakerEpisodeId =
+        rssItemUrl.match(/--(\d+)(?:[/?#]|$)/)?.[1] ||
+        audioUrl.match(/\/episode\/(\d+)(?:[/?#]|$)/)?.[1] ||
+        "";
       const spotifyEpisodeId = spotifyIdsByTitle.get(normalizeSearchText(title)) || "";
       const spotifyUrl = spotifyEpisodeId
         ? `https://open.spotify.com/episode/${spotifyEpisodeId}`
@@ -259,8 +261,7 @@ const fetchPodcastRssEpisodes = async () => {
       return {
           id: legacyEpisodeId(title) || spotifyEpisodeId || fallbackId,
           spotifyEpisodeId,
-          acastEpisodeId,
-          acastShowId,
+          spreakerEpisodeId,
           slug: slugify(title),
           status: "Episode",
           title,
@@ -1308,8 +1309,9 @@ const notifySpotifyEpisodeRedirect = async (env, request, episode) => {
   }
 };
 
-const notifyAcastPlayerPlay = async (env, request, episodeId) => {
-  const webhookUrl = env.IFTTT_ACAST_PLAYER_PLAY_WEBHOOK_URL;
+const notifySpreakerPlayerPlay = async (env, request, episodeId) => {
+  const webhookUrl =
+    env.IFTTT_SPREAKER_PLAYER_PLAY_WEBHOOK_URL || env.IFTTT_ACAST_PLAYER_PLAY_WEBHOOK_URL;
 
   if (!webhookUrl) {
     return;
@@ -1319,18 +1321,18 @@ const notifyAcastPlayerPlay = async (env, request, episodeId) => {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      value1: "acast_player_play",
+      value1: "spreaker_player_play",
       value2: String(episodeId || "unknown").slice(0, 1000),
       value3: String(request.headers.get("referer") || request.url).slice(0, 1000)
     })
   });
 
   if (!response.ok) {
-    throw new Error(`IFTTT Acast play webhook returned ${response.status}`);
+    throw new Error(`IFTTT Spreaker play webhook returned ${response.status}`);
   }
 };
 
-const handleAcastPlayerPlay = async (request, env, ctx) => {
+const handleSpreakerPlayerPlay = async (request, env, ctx) => {
   if (request.method !== "POST") {
     return new Response("Method not allowed", {
       status: 405,
@@ -1369,8 +1371,8 @@ const handleAcastPlayerPlay = async (request, env, ctx) => {
 
   const episodeId = String(input?.episodeId || "unknown").slice(0, 200);
   ctx.waitUntil(
-    notifyAcastPlayerPlay(env, request, episodeId).catch((error) => {
-      console.error("Acast player play webhook failed", error);
+    notifySpreakerPlayerPlay(env, request, episodeId).catch((error) => {
+      console.error("Spreaker player play webhook failed", error);
     })
   );
 
@@ -1397,9 +1399,9 @@ const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) =
 
   if (
     !/^[A-Za-z0-9-]{8,80}$/.test(sessionId) ||
-    !new Set(["visit", "engaged", "acast_play", "acast_progress"]).has(eventType) ||
+    !new Set(["visit", "engaged", "acast_play", "acast_progress", "spreaker_play", "spreaker_progress"]).has(eventType) ||
     (episodeId && !/^[A-Za-z0-9._:-]{1,200}$/.test(episodeId)) ||
-    (eventType === "acast_progress" &&
+    (eventType.endsWith("_progress") &&
       ![10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100].includes(percentPlayed))
   ) {
     return;
@@ -1411,7 +1413,7 @@ const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) =
     eventType,
     zoneId: landingPageZoneId(referrerUrl),
     episodeId,
-    percentPlayed: eventType === "acast_progress" ? String(percentPlayed) : "",
+    percentPlayed: eventType.endsWith("_progress") ? String(percentPlayed) : "",
     country: getCountryCode(request),
     occurredAt
   };
@@ -1551,11 +1553,11 @@ const landingPageStatsSummary = (events) => {
 
     if (event.eventType === "visit") session.visited = true;
     if (event.eventType === "engaged") session.engaged = true;
-    if (event.eventType === "acast_play") {
+    if (event.eventType === "acast_play" || event.eventType === "spreaker_play") {
       session.played = true;
       session.engaged = true;
     }
-    if (event.eventType === "acast_progress") {
+    if (event.eventType === "acast_progress" || event.eventType === "spreaker_progress") {
       session.played = true;
       session.engaged = true;
       session.highestPlaybackPercent = Math.max(
@@ -1650,6 +1652,23 @@ const handleLandingPageStats = async (request, env, url) => {
     });
   }
 
+  const requestedPageSize = Number.parseInt(url.searchParams.get("pageSize") ?? "25", 10);
+  const pageSize = [25, 50, 100].includes(requestedPageSize) ? requestedPageSize : 25;
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  const requestedPage = Number.parseInt(url.searchParams.get("page") ?? "1", 10);
+  const currentPage = Math.min(
+    pageCount,
+    Math.max(1, Number.isFinite(requestedPage) ? requestedPage : 1)
+  );
+  const pageRows = rows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const statsPageHref = (page) => {
+    const params = new URLSearchParams(url.searchParams);
+    params.delete("export");
+    params.set("page", String(page));
+    params.set("pageSize", String(pageSize));
+    return `?${params.toString()}`;
+  };
+
   const total = rows.reduce(
     (summary, row) => ({
       visits: summary.visits + row.visits,
@@ -1665,8 +1684,8 @@ const handleLandingPageStats = async (request, env, url) => {
     : 0;
   const totalBounces = total.visits - total.engaged;
   const totalBounceRate = total.visits ? (totalBounces / total.visits) * 100 : 0;
-  const tableRows = rows.length
-    ? rows
+  const tableRows = pageRows.length
+    ? pageRows
         .map(
           (row) => `<tr>
             <th scope="row">${escapeHtml(row.zoneId === "unattributed" ? "Unattributed" : row.zoneId)}</th>
@@ -1680,6 +1699,13 @@ const handleLandingPageStats = async (request, env, url) => {
         )
         .join("")
     : '<tr><td colspan="7" class="empty">No tracked visits match these filters.</td></tr>';
+  const pagination = rows.length
+    ? `<nav class="pagination" aria-label="Stats pages">
+        ${currentPage > 1 ? `<a href="${escapeHtml(statsPageHref(currentPage - 1))}">Previous</a>` : '<span aria-disabled="true">Previous</span>'}
+        <strong>Page ${currentPage.toLocaleString("en-US")} of ${pageCount.toLocaleString("en-US")}</strong>
+        ${currentPage < pageCount ? `<a href="${escapeHtml(statsPageHref(currentPage + 1))}">Next</a>` : '<span aria-disabled="true">Next</span>'}
+      </nav>`
+    : "";
   const body = `<!doctype html>
 <html lang="en">
   <head>
@@ -1696,8 +1722,8 @@ const handleLandingPageStats = async (request, env, url) => {
       .subtitle, .definition { color: #aaa; line-height: 1.5; }
       form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 28px 0; padding: 18px; border: 1px solid #333; border-radius: 14px; background: #191919; }
       label { display: grid; gap: 6px; color: #bbb; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
-      input, button { min-height: 44px; border-radius: 8px; font: inherit; }
-      input { width: 150px; border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
+      input, select, button { min-height: 44px; border-radius: 8px; font: inherit; }
+      input, select { width: 150px; border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
       button { border: 0; padding: 9px 18px; background: #1ed760; color: #000; font-weight: 800; cursor: pointer; }
       .export { background: #fff; }
       .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 24px; }
@@ -1705,6 +1731,10 @@ const handleLandingPageStats = async (request, env, url) => {
       .card span { display: block; color: #aaa; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
       .card strong { display: block; margin-top: 6px; font-size: 1.8rem; }
       .table-wrap { overflow-x: auto; border: 1px solid #333; border-radius: 14px; }
+      .pagination { display: flex; align-items: center; justify-content: center; gap: 18px; margin: 20px 0; }
+      .pagination a, .pagination span { padding: 10px 14px; border-radius: 8px; }
+      .pagination a { background: #1ed760; color: #000; font-weight: 800; text-decoration: none; }
+      .pagination span { color: #666; background: #191919; }
       table { width: 100%; border-collapse: collapse; background: #191919; }
       th, td { padding: 14px 16px; border-bottom: 1px solid #333; text-align: right; white-space: nowrap; }
       th:first-child { text-align: left; }
@@ -1718,7 +1748,7 @@ const handleLandingPageStats = async (request, env, url) => {
   <body>
     <main>
       <h1>Landing Page Stats</h1>
-      <p class="subtitle">Acast playback and bounce performance by PropellerAds zone.</p>
+      <p class="subtitle">Spreaker playback and bounce performance by PropellerAds zone.</p>
       <form method="get">
         <label>From <input type="date" name="from" value="${escapeHtml(from)}"></label>
         <label>To <input type="date" name="to" value="${escapeHtml(to)}"></label>
@@ -1728,22 +1758,29 @@ const handleLandingPageStats = async (request, env, url) => {
         <label>Played max % <input type="number" name="maxPlaybackPercent" min="0" max="100" step="0.1" value="${maxPlaybackPercent}"></label>
         <label>Bounce min % <input type="number" name="minBounceRate" min="0" max="100" step="0.1" value="${minBounceRate}"></label>
         <label>Bounce max % <input type="number" name="maxBounceRate" min="0" max="100" step="0.1" value="${maxBounceRate}"></label>
+        <label>Rows per page
+          <select name="pageSize">
+            ${[25, 50, 100].map((size) => `<option value="${size}"${size === pageSize ? " selected" : ""}>${size}</option>`).join("")}
+          </select>
+        </label>
         <button type="submit">Update</button>
         <button class="export" type="submit" name="export" value="zoneids">Export zone IDs</button>
       </form>
       <section class="cards" aria-label="Summary">
         <div class="card"><span>Visits</span><strong>${total.visits.toLocaleString("en-US")}</strong></div>
-        <div class="card"><span>Acast playback rate</span><strong>${totalPlaybackRate.toFixed(1)}%</strong></div>
+        <div class="card"><span>Spreaker playback rate</span><strong>${totalPlaybackRate.toFixed(1)}%</strong></div>
         <div class="card"><span>Average played</span><strong>${totalAveragePlaybackPercent.toFixed(1)}%</strong></div>
         <div class="card"><span>Bounce rate</span><strong>${totalBounceRate.toFixed(1)}%</strong></div>
       </section>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Zone</th><th>Visits</th><th>Acast plays</th><th>Playback rate</th><th>Average played</th><th>Bounces</th><th>Bounce rate</th></tr></thead>
+          <thead><tr><th>Zone</th><th>Visits</th><th>Spreaker plays</th><th>Playback rate</th><th>Average played</th><th>Bounces</th><th>Bounce rate</th></tr></thead>
           <tbody>${tableRows}</tbody>
         </table>
       </div>
-      <p class="definition">Playback rate is the percentage of visits with at least one Acast play. Average played is the average highest Acast progress milestone reached among playing sessions, measured every 10% plus 25% and 75%. A bounce is a visit with no Acast play, 100-pixel scroll, or 10 seconds of active page time. Filters apply to both the table and export. The export contains one attributed PropellerAds zone ID per line; unattributed traffic is omitted. Date ranges are limited to 90 days.</p>
+      ${rows.length ? `<p class="definition">Showing ${((currentPage - 1) * pageSize + 1).toLocaleString("en-US")}–${Math.min(currentPage * pageSize, rows.length).toLocaleString("en-US")} of ${rows.length.toLocaleString("en-US")} matching zones.</p>` : ""}
+      ${pagination}
+      <p class="definition">Playback rate is the percentage of visits with at least one embedded-player play. Average played is the average highest progress milestone reached among playing sessions, measured every 10% plus 25% and 75%. Historical Acast events and new Spreaker events are combined. A bounce is a visit with no player play, 100-pixel scroll, or 10 seconds of active page time. Filters apply to both the table and export. The export contains one attributed PropellerAds zone ID per line; unattributed traffic is omitted. Date ranges are limited to 90 days.</p>
     </main>
   </body>
 </html>`;
@@ -2006,28 +2043,27 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
                 attributionSource ? `?source=${encodeURIComponent(attributionSource)}` : ""
               }`
             : spotifyLandingPagePath(episode);
-          const acastEmbedUrl =
-            episode.acastShowId && episode.acastEpisodeId
-              ? `https://embed.acast.com/${encodeURIComponent(episode.acastShowId)}/${encodeURIComponent(
-                  episode.acastEpisodeId
-                )}`
+          const spreakerEmbedUrl = episode.spreakerEpisodeId
+              ? `https://widget.spreaker.com/player?episode_id=${encodeURIComponent(
+                  episode.spreakerEpisodeId
+                )}&theme=dark&playlist=false&autoplay=false`
               : "";
-          const episodeAction = acastEmbedUrl
+          const episodeAction = spreakerEmbedUrl
             ? `<div class="episode-player">
                 <button
                   class="episode-play-cta"
                   type="button"
-                  data-acast-play
+                  data-spreaker-play
                   aria-label="${escapeHtml(`Play ${episode.title}`)}"
                 ><span aria-hidden="true">▶</span> Play Episode</button>
                 <iframe
-                    class="acast-player"
-                    data-acast-player
-                    data-episode-id="${escapeHtml(episode.acastEpisodeId)}"
-                    src="${escapeHtml(acastEmbedUrl)}"
+                    class="spreaker-player"
+                    data-spreaker-player
+                    data-episode-id="${escapeHtml(episode.spreakerEpisodeId)}"
+                    src="${escapeHtml(spreakerEmbedUrl)}"
                     loading="lazy"
                     allow="autoplay"
-                    title="${escapeHtml(`${episode.title} Acast player`)}"
+                    title="${escapeHtml(`${episode.title} Spreaker player`)}"
                   ></iframe>
               </div>`
             : `<a class="episode-link" href="${escapeHtml(episodeHref)}">${
@@ -2071,7 +2107,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       h1 { margin: 0 0 12px; font-size: clamp(1.75rem, 8vw, 2.5rem); }
       .page-intro, .intro { color: #b3b3b3; line-height: 1.5; }
       .page-intro { margin: 0 0 28px; }
-      .acast-player { display: block; width: 100%; height: 190px; margin: 0; border: 0; }
+      .spreaker-player { display: block; width: 100%; height: 200px; margin: 0; border: 0; }
       .episode-player { width: 100%; }
       .episode-play-cta { display: flex; align-items: center; justify-content: center; gap: 12px; width: 100%; min-height: 64px; margin: 0 0 14px; padding: 18px 24px; border: 0; border-radius: 999px; background: #1ed760; color: #000; font: inherit; font-size: 1.2rem; font-weight: 900; cursor: pointer; box-shadow: 0 8px 24px rgba(30, 215, 96, .22); }
       .episode-play-cta:hover { background: #3be477; transform: translateY(-1px); }
@@ -2111,9 +2147,10 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       }</p>
       ${episodeSections}
     </main>
+    <script src="https://cdn.embed.ly/player-0.1.0.min.js"></script>
     <script>
       (function () {
-        const players = Array.from(document.querySelectorAll("[data-acast-player]"));
+        const players = Array.from(document.querySelectorAll("[data-spreaker-player]"));
         const milestones = [10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100];
         const statesByWindow = new Map();
         const viewContentParameters = ${viewContentParameters || "null"};
@@ -2127,7 +2164,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
         let activeSeconds = 0;
 
         const trackLandingEvent = (eventType, episodeId, percentPlayed) => {
-          const eventKey = eventType.startsWith("acast_")
+          const eventKey = eventType.startsWith("spreaker_")
             ? [eventType, String(episodeId || ""), String(percentPlayed || "")].join(":")
             : eventType;
           if (trackedLandingEvents.has(eventKey)) return;
@@ -2188,47 +2225,9 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           }
         }, 1000);
 
-        players.forEach((player) => {
-          if (!player.contentWindow) return;
-          const state = {
-            player: player,
-            playButton: player.closest(".episode")?.querySelector("[data-acast-play]") || null,
-            episodeId: player.dataset.episodeId || "unknown",
-            duration: 0,
-            isPlaying: false,
-            pendingPlay: false,
-            progressTimer: null,
-            reached: new Set()
-          };
-          statesByWindow.set(player.contentWindow, state);
-
-          const requestPlayback = () => {
-            statesByWindow.forEach((otherState) => {
-              if (otherState !== state && otherState.isPlaying) {
-                sendPlayerMessage(otherState, "postmessage:do:pause");
-              }
-            });
-            state.pendingPlay = true;
-            sendPlayerMessage(state, "postmessage:do:play");
-          };
-
-          state.playButton?.addEventListener("click", requestPlayback);
-          player.addEventListener("load", () => {
-            if (state.pendingPlay && !state.isPlaying) requestPlayback();
-          });
-        });
-
-        const sendPlayerMessage = (state, eventName) => {
-          if (!state.player.contentWindow) return;
-          state.player.contentWindow.postMessage(
-            JSON.stringify({ eventName: eventName, data: {} }),
-            "https://embed.acast.com"
-          );
-        };
-
         const playerEventParameters = (state, action, percent) => {
           const parameters = {
-            player: "acast",
+            player: "spreaker",
             player_action: action,
             episode_id: state.episodeId,
             country_code: "${escapeHtml(countryCode)}",
@@ -2241,8 +2240,8 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
 
         const trackPlayerEvent = (state, action, percent) => {
           const baseEventName = typeof percent === "number"
-            ? "acast_player_" + percent + "_percent"
-            : "acast_player_" + action;
+            ? "spreaker_player_" + percent + "_percent"
+            : "spreaker_player_" + action;
           const eventName = baseEventName + "_${escapeHtml(countryCode)}";
           const parameters = playerEventParameters(state, action, percent);
 
@@ -2255,8 +2254,8 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           }
 
           if (action === "play") {
-            trackLandingEvent("acast_play", state.episodeId);
-            fetch("${escapeHtml(ACAST_PLAYER_PLAY_ENDPOINT)}", {
+            trackLandingEvent("spreaker_play", state.episodeId);
+            fetch("${escapeHtml(SPREAKER_PLAYER_PLAY_ENDPOINT)}", {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ episodeId: state.episodeId }),
@@ -2264,7 +2263,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             }).catch(() => {});
           }
           if (action === "progress" && typeof percent === "number") {
-            trackLandingEvent("acast_progress", state.episodeId, percent);
+            trackLandingEvent("spreaker_progress", state.episodeId, percent);
           }
         };
 
@@ -2282,11 +2281,23 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
 
         const startProgressChecks = (state) => {
           if (state.progressTimer) return;
-          sendPlayerMessage(state, "postmessage:get:current");
-          sendPlayerMessage(state, "postmessage:get:duration");
-          sendPlayerMessage(state, "postmessage:get:progress");
+          const updateProgress = () => {
+            state.api.getDuration((duration) => {
+              const numericDuration = Number(duration);
+              if (Number.isFinite(numericDuration) && numericDuration > 0) {
+                state.duration = numericDuration;
+              }
+            });
+            state.api.getCurrentTime((position) => {
+              const numericPosition = Number(position);
+              if (state.duration > 0 && Number.isFinite(numericPosition)) {
+                checkMilestones(state, (numericPosition / state.duration) * 100);
+              }
+            });
+          };
+          updateProgress();
           state.progressTimer = window.setInterval(() => {
-            sendPlayerMessage(state, "postmessage:get:progress");
+            updateProgress();
           }, 1000);
         };
 
@@ -2296,55 +2307,54 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           state.progressTimer = null;
         };
 
-        window.addEventListener("message", (event) => {
-          if (event.origin !== "https://embed.acast.com") return;
-          const state = statesByWindow.get(event.source);
-          if (!state) return;
+        players.forEach((player) => {
+          if (!player.contentWindow || !window.playerjs?.Player) return;
+          const state = {
+            player: player,
+            api: new window.playerjs.Player(player),
+            playButton: player.closest(".episode")?.querySelector("[data-spreaker-play]") || null,
+            episodeId: player.dataset.episodeId || "unknown",
+            duration: 0,
+            isPlaying: false,
+            progressTimer: null,
+            reached: new Set()
+          };
+          statesByWindow.set(player.contentWindow, state);
 
-          let message = event.data;
-          if (typeof message === "string") {
-            try {
-              message = JSON.parse(message);
-            } catch {
-              return;
-            }
-          }
+          state.playButton?.addEventListener("click", () => {
+            statesByWindow.forEach((otherState) => {
+              if (otherState !== state && otherState.isPlaying) otherState.api.pause();
+            });
+            state.api.play();
+          });
 
-          if (!message || typeof message !== "object") return;
-          const rawData = message.data;
-          const data = rawData && typeof rawData === "object" ? rawData : {};
-
-          if (message.eventName === "postmessage:on:play") {
-            trackViewContent("acast_play");
-            if (!state.isPlaying) trackPlayerEvent(state, "play");
-            state.isPlaying = true;
-            state.pendingPlay = false;
-            if (state.playButton) {
-              state.playButton.setAttribute("aria-pressed", "true");
-              state.playButton.innerHTML = '<span aria-hidden="true">▶</span> Playing';
-            }
-            startProgressChecks(state);
-          } else if (message.eventName === "postmessage:on:pause") {
-            if (state.isPlaying) trackPlayerEvent(state, "pause");
-            state.isPlaying = false;
-            state.pendingPlay = false;
-            if (state.playButton) {
-              state.playButton.setAttribute("aria-pressed", "false");
-              state.playButton.innerHTML = '<span aria-hidden="true">▶</span> Play Episode';
-            }
-            sendPlayerMessage(state, "postmessage:get:progress");
-            stopProgressChecks(state);
-          } else if (message.eventName === "postmessage:get:duration") {
-            const value = Number(
-              data.duration ?? message.duration ?? (typeof rawData === "object" ? NaN : rawData)
-            );
-            if (Number.isFinite(value) && value > 0) state.duration = value;
-          } else if (message.eventName === "postmessage:get:progress") {
-            const value = Number(
-              data.progress ?? message.progress ?? (typeof rawData === "object" ? NaN : rawData)
-            );
-            if (Number.isFinite(value)) checkMilestones(state, value);
-          }
+          state.api.on("ready", () => {
+            state.api.on("play", () => {
+              trackViewContent("spreaker_play");
+              if (!state.isPlaying) trackPlayerEvent(state, "play");
+              state.isPlaying = true;
+              if (state.playButton) {
+                state.playButton.setAttribute("aria-pressed", "true");
+                state.playButton.innerHTML = '<span aria-hidden="true">▶</span> Playing';
+              }
+              startProgressChecks(state);
+            });
+            state.api.on("pause", () => {
+              if (state.isPlaying) trackPlayerEvent(state, "pause");
+              state.isPlaying = false;
+              if (state.playButton) {
+                state.playButton.setAttribute("aria-pressed", "false");
+                state.playButton.innerHTML = '<span aria-hidden="true">▶</span> Play Episode';
+              }
+              stopProgressChecks(state);
+            });
+            state.api.on("ended", () => {
+              checkMilestones(state, 100);
+              trackPlayerEvent(state, "ended");
+              state.isPlaying = false;
+              stopProgressChecks(state);
+            });
+          });
         });
 
         window.addEventListener(
@@ -7421,11 +7431,11 @@ export default {
       }
     }
 
-    if (url.pathname === ACAST_PLAYER_PLAY_ENDPOINT) {
+    if (url.pathname === SPREAKER_PLAYER_PLAY_ENDPOINT) {
       try {
-        return await handleAcastPlayerPlay(request, env, ctx);
+        return await handleSpreakerPlayerPlay(request, env, ctx);
       } catch (error) {
-        console.error("Acast player play tracking failed", error);
+        console.error("Spreaker player play tracking failed", error);
         return new Response(null, { status: 204 });
       }
     }

@@ -484,7 +484,7 @@ const monetizationPanel = (monetization, uploadMessage = "") => {
   </section>`;
 };
 
-const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, from, to, warning, uploadMessage }) => {
+const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, from, to, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
   const totals = overall?.statistics || {};
   const last30Totals = sumPlayStats(last30Plays?.statistics);
   const last30Value = (key) => (last30Plays ? number(last30Totals[key]) : "—");
@@ -499,7 +499,7 @@ const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes,
     <nav class="nav" aria-label="Admin navigation"><a href="/">Site</a><a href="/admin/content">Episode content</a><a href="${FEED_URL}">RSS feed</a></nav>
     <section class="hero"><div class="hero-row"><div class="show">${showData.image_url ? `<img class="cover" src="${escapeHtml(showData.image_url)}" alt="">` : ""}<div><p class="kicker">Spreaker analytics</p><h1>${escapeHtml(showData.title || "The Last Known")}</h1><p>Show ${SHOW_ID} · ${escapeHtml(from)} through ${escapeHtml(to)}</p></div></div><div class="nav"><a class="button secondary" href="${escapeHtml(showData.site_url || `https://www.spreaker.com/show/${SHOW_ID}`)}">Open in Spreaker</a><a class="button secondary" href="${DASHBOARD_PATH}/connect">Reconnect</a></div></div></section>
     ${warning ? `<p class="notice error">${escapeHtml(warning)}</p>` : ""}
-    <section class="panel"><form class="filter" method="get" action="${DASHBOARD_PATH}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label><label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label><button class="button" type="submit">Update range</button></form></section>
+    <section class="panel"><form class="filter" method="get" action="${escapeHtml(statsPath)}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label><label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label><button class="button" type="submit">Update range</button></form></section>
     <section class="panel"><p class="kicker">At a glance</p><div class="metrics"><div class="metric"><span>All-time plays</span><strong>${number(totals.plays_count)}</strong></div><div class="metric"><span>All-time downloads</span><strong>${number(totals.downloads_count)}</strong></div><div class="metric"><span>Episodes</span><strong>${number(totals.episodes_count)}</strong></div><div class="metric"><span>Daily listeners total</span><strong>${number(totalListeners)}</strong></div></div><h2>Podcast statistics</h2><div class="table-wrap"><table><thead><tr><th>Metric</th><th>All time</th><th>Last 30 days</th></tr></thead><tbody><tr><td>Total plays</td><td>${number(totals.plays_count)}</td><td>${last30Value("plays_count")}</td></tr><tr><td>On-demand plays</td><td>${number(totals.plays_ondemand_count)}</td><td>${last30Value("plays_ondemand_count")}</td></tr><tr><td>Live plays</td><td>${number(totals.plays_live_count)}</td><td>${last30Value("plays_live_count")}</td></tr><tr><td>Downloads</td><td>${number(totals.downloads_count)}</td><td>${last30Value("downloads_count")}</td></tr></tbody></table></div></section>
     <div class="grid">
       ${monetizationPanel(monetization, uploadMessage)}
@@ -680,6 +680,7 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     uploadMessage:
       url.searchParams.get("monetization") === "imported"
         ? "Monetization report imported successfully."
-        : ""
+        : "",
+    statsPath: url.pathname === "/stats" ? "/stats" : DASHBOARD_PATH
   }));
 };

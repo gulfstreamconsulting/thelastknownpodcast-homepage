@@ -36,6 +36,7 @@ GET /landing-page
 GET /landing-page?audience=cold
 GET /landing-page/:episode-slug
 GET /landing-page/:episode-slug/spotify
+GET /landing-page/:episode-slug/apple
 ```
 
 The directory lists the published episodes from the Spreaker RSS feed with an episode-specific Spreaker player and prominent
@@ -43,6 +44,23 @@ play button on each card, including the eight-card cold-audience view.
 The episode-specific `/spotify` route displays the landing page for two seconds so analytics
 pixels can fire, then redirects to that episode on Spotify. Tapping a Spotify link sends an
 internal analytics request to `/landing-page/click` with the Spotify episode ID.
+
+Every episode card also links through its episode-specific `/apple` route. That route displays the
+same two-second analytics interstitial, then redirects to that episode's Apple Podcasts page. The
+Worker matches the RSS GUID first and normalized episode title second against Apple's cached
+podcast-episode lookup response. If Apple has not indexed an episode yet, the route reports that it
+is unavailable instead of redirecting to the show page. Apple redirects are recorded as first-party
+conversions and count as landing-page engagement for bounce-rate reporting. The redirect
+interstitial also emits the same Google Analytics and Meta custom click event as the Spotify flow,
+with `destination` set to `apple`.
+
+Real browser GET requests to an episode-specific `/apple` route send a background IFTTT
+notification containing the episode title, tracked redirect URL, and resolved Apple episode URL.
+Configure its private Maker Webhooks URL as a Worker secret:
+
+```bash
+npx wrangler secret put IFTTT_APPLE_PODCAST_REDIRECT_WEBHOOK_URL
+```
 
 The `?audience=cold` option limits the directory to eight curated, high-interest starter episodes.
 The priority order is configured with `spotify.coldAudienceEpisodeTitles` in
@@ -90,6 +108,17 @@ GET /api/home?category=missing-persons&page=2
 GET /api/episodes/:slug
 ```
 
+Each episode detail page links to `/episodes/:slug/listen`, a compact platform hub with the episode
+artwork, an episode-specific Spreaker player, and Spotify, Apple Podcasts, and Amazon Music listening
+options. Three additional episode players appear below the platform links. Every player emits
+country-suffixed Google Analytics and Meta events for play, pause, ended,
+and progress milestones at every 10% plus 25% and 75%, with the two-letter country code also included
+as an event parameter. Platform clicks are sent
+server-side to IFTTT with episode, destination, referrer, Cloudflare location, browser, and timestamp
+details. The page also emits `episode_link_click_spotify`, `episode_link_click_apple`, and
+`episode_link_click_amazon` custom events to Google Analytics and Meta. Configure the private webhook
+as `IFTTT_EPISODE_LINK_CLICKED_WEBHOOK_URL`.
+
 During local development, use `http://localhost:8787/api/podcast`.
 
 `/api/podcast` remains the full catalog endpoint and includes `screens.home` for clients that want one bootstrap payload. `/api/home` returns a focused native-screen payload for the homepage, including the hero, latest episode, generated categories, paginated archive, and section metadata. `/api/episodes/:slug` returns a native-screen payload for an episode detail page, including hero/player data, section navigation, optional hosted or YouTube video, case locations, materials, companion article markdown, transcript paragraphs, and related episodes. API version 1.2 exposes `spotifyUrl`, `audioUrl`, and a Spotify player descriptor on each episode.
@@ -116,21 +145,18 @@ PropellerAds traffic must pass its zone ID to the directory using the `zoneid` q
 GET /landing-page?zoneid=123456
 ```
 
-Directory visits, meaningful engagement, and the first Spreaker play for each episode are stored as
-append-only session events in R2. The password-protected stats page is available at:
+Directory visits, meaningful engagement, Spreaker playback, historical Acast playback, and Apple
+episode redirects are stored as append-only session events in R2. The password-protected stats page
+is available at:
 
 ```text
-GET /landing-page/stats
+GET /stats
 ```
 
-It reports visits, unique embedded-player sessions, playback rate, average percent played, bounces, and
-bounce rate by zone for up to 90 days. The embedded Spreaker player records first-party progress events
-at each 10% milestone plus 25% and 75%. Playback rate is the share of visits with at least one player play, while
-average percent played is the average highest milestone reached by playing sessions. A bounce is a
-visit without a player play, a 100-pixel scroll, or 10 seconds of active visible-page time. The
-stats page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
-the other admin tools. Filtered zone results are paginated at 25, 50, or 100 rows per page; exports
-continue to include every matching zone across all pages.
+This page displays private show analytics loaded from the authenticated Spreaker API. It uses the
+same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as the other admin
+tools. The date range controls filter daily performance, episode totals, sources, devices, countries,
+and imported monetization data.
 
 ## Episode Content
 

@@ -43,8 +43,14 @@ const SPOTIFY_LANDING_PAGE_ENDPOINT = "/landing-page";
 const SPOTIFY_LANDING_CLICK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/click`;
 const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/playback`;
 const SPREAKER_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/spreaker-play`;
+const EPISODE_LINK_CLICK_ENDPOINT = "/episodes/link-click";
 const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
-const LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
+const STATS_ENDPOINT = "/stats";
+const LEGACY_LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
+const APPLE_PODCASTS_SHOW_URL =
+  podcast.links.find((link) => link.label === "Apple Podcasts")?.href || "#";
+const APPLE_PODCASTS_SHOW_ID = APPLE_PODCASTS_SHOW_URL.match(/\/id(\d+)/)?.[1] || "";
+const APPLE_PODCASTS_CACHE_SECONDS = 15 * 60;
 const COLD_AUDIENCE_EPISODE_LIMIT = 8;
 const IMA_SDK_URL = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
 const BOT_USER_AGENT_PATTERN =
@@ -196,6 +202,52 @@ const rssEpisodeFallbackId = (itemXml, title) => {
   return xmlElement(itemXml, "guid").replace(/[^A-Za-z0-9]/g, "") || slugify(title);
 };
 
+const safeApplePodcastsUrl = (value) => {
+  try {
+    const url = new URL(String(value ?? ""));
+    return url.protocol === "https:" && url.hostname === "podcasts.apple.com" ? url.href : "";
+  } catch {
+    return "";
+  }
+};
+
+const fetchApplePodcastEpisodeUrls = async () => {
+  const byGuid = new Map();
+  const byTitle = new Map();
+  if (!APPLE_PODCASTS_SHOW_ID) return { byGuid, byTitle };
+
+  const url = new URL("https://itunes.apple.com/lookup");
+  url.searchParams.set("id", APPLE_PODCASTS_SHOW_ID);
+  url.searchParams.set("entity", "podcastEpisode");
+  url.searchParams.set("limit", "200");
+  url.searchParams.set("country", "us");
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      "user-agent": "The Last Known Podcast Website"
+    },
+    cf: {
+      cacheTtl: APPLE_PODCASTS_CACHE_SECONDS,
+      cacheEverything: true
+    }
+  });
+
+  if (!response.ok) return { byGuid, byTitle };
+  const payload = await response.json();
+
+  for (const result of Array.isArray(payload?.results) ? payload.results : []) {
+    if (result?.wrapperType !== "podcastEpisode") continue;
+    const episodeUrl = safeApplePodcastsUrl(result.trackViewUrl);
+    if (!episodeUrl) continue;
+    const guid = String(result.episodeGuid ?? "").trim();
+    const title = normalizeSearchText(result.trackName);
+    if (guid) byGuid.set(guid, episodeUrl);
+    if (title) byTitle.set(title, episodeUrl);
+  }
+
+  return { byGuid, byTitle };
+};
+
 const fetchPodcastRssEpisodes = async () => {
   const cacheSeconds = Math.max(30, podcast.spotify.cacheSeconds ?? 60);
   const cacheKey = String(Math.floor(Date.now() / (cacheSeconds * 1000)));
@@ -213,9 +265,10 @@ const fetchPodcastRssEpisodes = async () => {
       cacheEverything: true
     }
   };
-  const [rssResponse, creatorsResponse] = await Promise.all([
+  const [rssResponse, creatorsResponse, appleEpisodeUrls] = await Promise.all([
     fetch(rssUrl, requestOptions),
-    fetch(creatorsUrl, requestOptions).catch(() => null)
+    fetch(creatorsUrl, requestOptions).catch(() => null),
+    fetchApplePodcastEpisodeUrls().catch(() => ({ byGuid: new Map(), byTitle: new Map() }))
   ]);
 
   if (!rssResponse.ok) {
@@ -252,6 +305,7 @@ const fetchPodcastRssEpisodes = async () => {
         rssItemUrl.match(/--(\d+)(?:[/?#]|$)/)?.[1] ||
         audioUrl.match(/\/episode\/(\d+)(?:[/?#]|$)/)?.[1] ||
         "";
+      const episodeGuid = xmlElement(itemXml, "guid").trim();
       const spotifyEpisodeId = spotifyIdsByTitle.get(normalizeSearchText(title)) || "";
       const spotifyUrl = spotifyEpisodeId
         ? `https://open.spotify.com/episode/${spotifyEpisodeId}`
@@ -262,6 +316,10 @@ const fetchPodcastRssEpisodes = async () => {
           id: legacyEpisodeId(title) || spotifyEpisodeId || fallbackId,
           spotifyEpisodeId,
           spreakerEpisodeId,
+          appleEpisodeUrl:
+            appleEpisodeUrls.byGuid.get(episodeGuid) ||
+            appleEpisodeUrls.byTitle.get(normalizeSearchText(title)) ||
+            "",
           slug: slugify(title),
           status: "Episode",
           title,
@@ -1044,6 +1102,103 @@ const sanitizeAnalyticsReferrer = (value) => {
   }
 };
 
+const forwardEpisodeLinkClick = async (env, request, input) => {
+  const webhookUrl = env.IFTTT_EPISODE_LINK_CLICKED_WEBHOOK_URL;
+  if (!webhookUrl) return;
+
+  const platform = String(input.platform ?? "").toLowerCase();
+  const allowedHosts = {
+    spotify: "open.spotify.com",
+    apple: "podcasts.apple.com",
+    amazon: "music.amazon.com"
+  };
+  let destinationUrl;
+
+  try {
+    destinationUrl = new URL(String(input.destinationUrl ?? ""));
+  } catch {
+    return;
+  }
+
+  if (
+    !allowedHosts[platform] ||
+    destinationUrl.protocol !== "https:" ||
+    destinationUrl.hostname !== allowedHosts[platform]
+  ) {
+    return;
+  }
+
+  const payload = {
+    event: "episode_link_clicked",
+    platform,
+    episode_id: String(input.episodeId ?? "").slice(0, 200),
+    episode_slug: String(input.episodeSlug ?? "").slice(0, 200),
+    episode_title: String(input.episodeTitle ?? "").slice(0, 500),
+    destination_url: destinationUrl.href.slice(0, 1000),
+    page_url: String(request.headers.get("referer") ?? "").slice(0, 1000),
+    referrer: sanitizeAnalyticsReferrer(input.referrer),
+    country: getCountryCode(request),
+    region: String(request.cf?.region ?? "").slice(0, 200),
+    city: String(request.cf?.city ?? "").slice(0, 200),
+    timezone: String(request.cf?.timezone ?? "").slice(0, 100),
+    user_agent: String(request.headers.get("user-agent") ?? "").slice(0, 500),
+    language: String(request.headers.get("accept-language") ?? "").slice(0, 200),
+    occurred_at: new Date().toISOString()
+  };
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    throw new Error(`IFTTT episode link webhook returned ${response.status}`);
+  }
+};
+
+const handleEpisodeLinkClick = async (request, env, ctx) => {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST", "cache-control": "no-store" }
+    });
+  }
+  if (!sameOriginRequest(request) || Number(request.headers.get("content-length") ?? 0) > 4096) {
+    return new Response("Invalid request", { status: 403, headers: { "cache-control": "no-store" } });
+  }
+
+  let referrer;
+  try {
+    referrer = new URL(request.headers.get("referer") ?? "");
+  } catch {
+    return new Response("Invalid referrer", { status: 400, headers: { "cache-control": "no-store" } });
+  }
+  if (
+    referrer.origin !== new URL(request.url).origin ||
+    !/^\/episodes\/[^/]+\/listen\/?$/.test(referrer.pathname)
+  ) {
+    return new Response("Invalid referrer", { status: 400, headers: { "cache-control": "no-store" } });
+  }
+
+  let input;
+  try {
+    input = await request.json();
+  } catch {
+    return new Response("Invalid event", { status: 400, headers: { "cache-control": "no-store" } });
+  }
+  const referrerSlug = decodeURIComponent(referrer.pathname.split("/")[2] ?? "");
+  if (String(input?.episodeSlug ?? "") !== referrerSlug) {
+    return new Response("Invalid episode", { status: 400, headers: { "cache-control": "no-store" } });
+  }
+
+  ctx.waitUntil(
+    forwardEpisodeLinkClick(env, request, input ?? {}).catch((error) => {
+      console.error("Episode link click webhook failed", error);
+    })
+  );
+  return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+};
+
 const saveLandingPageVisit = async (
   env,
   request,
@@ -1083,7 +1238,11 @@ const saveLandingPageEvent = async (env, request, episodeId, episodeSlug, eventT
   if (
     !/^[A-Za-z0-9]+$/.test(episodeId) ||
     !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(episodeSlug) ||
-    !new Set(["spotify_web_player_start", "spotify_episode_click"]).has(eventType)
+    !new Set([
+      "spotify_web_player_start",
+      "spotify_episode_click",
+      "apple_episode_redirect"
+    ]).has(eventType)
   ) {
     return;
   }
@@ -1239,7 +1398,7 @@ const handleSpotifyLandingClick = (request, env, ctx) => {
   const episodeId = String(url.searchParams.get("episode") ?? "").trim();
   const episodeSlug = String(url.searchParams.get("slug") ?? "").trim();
 
-  if (!new Set(["spotify", "app", "browser", "player"]).has(destination)) {
+  if (!new Set(["spotify", "app", "browser", "player", "apple"]).has(destination)) {
     return new Response("Invalid destination", {
       status: 400,
       headers: { "cache-control": "no-store" }
@@ -1255,7 +1414,8 @@ const handleSpotifyLandingClick = (request, env, ctx) => {
 
   const landingEventType = {
     app: "spotify_episode_click",
-    player: "spotify_web_player_start"
+    player: "spotify_web_player_start",
+    apple: "apple_episode_redirect"
   }[destination];
   let matchesLandingPage = false;
 
@@ -1306,6 +1466,28 @@ const notifySpotifyEpisodeRedirect = async (env, request, episode) => {
 
   if (!response.ok) {
     throw new Error(`IFTTT redirect webhook returned ${response.status}`);
+  }
+};
+
+const notifyApplePodcastEpisodeRedirect = async (env, request, episode) => {
+  const webhookUrl = env.IFTTT_APPLE_PODCAST_REDIRECT_WEBHOOK_URL;
+
+  if (!webhookUrl || !episode.appleEpisodeUrl) {
+    return;
+  }
+
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      value1: String(episode.title).slice(0, 1000),
+      value2: String(request.url).slice(0, 1000),
+      value3: String(episode.appleEpisodeUrl).slice(0, 1000)
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`IFTTT Apple redirect webhook returned ${response.status}`);
   }
 };
 
@@ -1399,7 +1581,15 @@ const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) =
 
   if (
     !/^[A-Za-z0-9-]{8,80}$/.test(sessionId) ||
-    !new Set(["visit", "engaged", "acast_play", "acast_progress", "spreaker_play", "spreaker_progress"]).has(eventType) ||
+    !new Set([
+      "visit",
+      "engaged",
+      "acast_play",
+      "acast_progress",
+      "spreaker_play",
+      "spreaker_progress",
+      "apple_redirect"
+    ]).has(eventType) ||
     (episodeId && !/^[A-Za-z0-9._:-]{1,200}$/.test(episodeId)) ||
     (eventType.endsWith("_progress") &&
       ![10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100].includes(percentPlayed))
@@ -1482,317 +1672,15 @@ const handleLandingPageTrack = async (request, env, ctx) => {
   });
 };
 
-const landingStatsDateRange = (url) => {
-  const isValidDate = (value) => {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value ?? "")) return false;
-    const parsed = new Date(`${value}T00:00:00Z`);
-    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
-  };
-  const today = new Date();
-  const defaultFrom = new Date(today);
-  defaultFrom.setUTCDate(today.getUTCDate() - 29);
-  let from = isValidDate(url.searchParams.get("from"))
-    ? url.searchParams.get("from")
-    : defaultFrom.toISOString().slice(0, 10);
-  let to = isValidDate(url.searchParams.get("to"))
-    ? url.searchParams.get("to")
-    : today.toISOString().slice(0, 10);
-
-  if (from > to) [from, to] = [to, from];
-  const earliest = new Date(`${to}T00:00:00Z`);
-  earliest.setUTCDate(earliest.getUTCDate() - 89);
-  if (from < earliest.toISOString().slice(0, 10)) {
-    from = earliest.toISOString().slice(0, 10);
-  }
-
-  return { from, to };
-};
-
-const listLandingPageDirectoryEvents = async (bucket, from, to) => {
-  const events = [];
-  let cursor;
-  let finished = false;
-
-  do {
-    const result = await bucket.list({
-      prefix: LANDING_PAGE_DIRECTORY_EVENT_PREFIX,
-      startAfter: cursor ? undefined : `${LANDING_PAGE_DIRECTORY_EVENT_PREFIX}${from}`,
-      cursor,
-      include: ["customMetadata"],
-      limit: 1000
-    });
-
-    for (const object of result.objects) {
-      const eventDate = object.key.slice(LANDING_PAGE_DIRECTORY_EVENT_PREFIX.length).split("/")[0];
-      if (eventDate > to) {
-        finished = true;
-        break;
-      }
-      if (eventDate >= from && object.customMetadata) events.push(object.customMetadata);
-    }
-
-    cursor = !finished && result.truncated ? result.cursor : undefined;
-  } while (cursor);
-
-  return events;
-};
-
-const landingPageStatsSummary = (events) => {
-  const sessions = new Map();
-
-  for (const event of events) {
-    const sessionId = String(event.sessionId ?? "");
-    if (!sessionId) continue;
-    const session = sessions.get(sessionId) ?? {
-      zoneId: String(event.zoneId || "unattributed"),
-      visited: false,
-      engaged: false,
-      played: false,
-      highestPlaybackPercent: 0
-    };
-
-    if (event.eventType === "visit") session.visited = true;
-    if (event.eventType === "engaged") session.engaged = true;
-    if (event.eventType === "acast_play" || event.eventType === "spreaker_play") {
-      session.played = true;
-      session.engaged = true;
-    }
-    if (event.eventType === "acast_progress" || event.eventType === "spreaker_progress") {
-      session.played = true;
-      session.engaged = true;
-      session.highestPlaybackPercent = Math.max(
-        session.highestPlaybackPercent,
-        Math.min(100, Math.max(0, Number(event.percentPlayed) || 0))
-      );
-    }
-    sessions.set(sessionId, session);
-  }
-
-  const rows = new Map();
-  for (const session of sessions.values()) {
-    if (!session.visited) continue;
-    const row = rows.get(session.zoneId) ?? {
-      zoneId: session.zoneId,
-      visits: 0,
-      plays: 0,
-      engaged: 0,
-      playbackPercentTotal: 0
-    };
-    row.visits += 1;
-    if (session.played) {
-      row.plays += 1;
-      row.playbackPercentTotal += session.highestPlaybackPercent;
-    }
-    if (session.engaged) row.engaged += 1;
-    rows.set(session.zoneId, row);
-  }
-
-  return [...rows.values()]
-    .map((row) => ({
-      ...row,
-      bounces: row.visits - row.engaged,
-      playbackRate: row.visits ? (row.plays / row.visits) * 100 : 0,
-      averagePlaybackPercent: row.plays ? row.playbackPercentTotal / row.plays : 0,
-      bounceRate: row.visits ? ((row.visits - row.engaged) / row.visits) * 100 : 0
-    }))
-    .sort((left, right) => right.visits - left.visits || left.zoneId.localeCompare(right.zoneId));
-};
-
-const landingStatsRateFilter = (url, name, fallback) => {
-  const value = url.searchParams.get(name);
-  if (value === null || String(value).trim() === "") return fallback;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : fallback;
-};
-
 const handleLandingPageStats = async (request, env, url) => {
   if (!isAdmin(request, env)) return adminUnauthorized();
-  if (!env.EPISODE_CONTENT) {
-    return new Response("EPISODE_CONTENT is not configured", { status: 503 });
-  }
   if (!new Set(["GET", "HEAD"]).has(request.method)) {
     return new Response("Method not allowed", {
       status: 405,
       headers: { allow: "GET, HEAD", "cache-control": "no-store" }
     });
   }
-
-  const { from, to } = landingStatsDateRange(url);
-  const minPlaybackRate = landingStatsRateFilter(url, "minPlaybackRate", 0);
-  const maxPlaybackRate = landingStatsRateFilter(url, "maxPlaybackRate", 100);
-  const minBounceRate = landingStatsRateFilter(url, "minBounceRate", 0);
-  const maxBounceRate = landingStatsRateFilter(url, "maxBounceRate", 100);
-  const minPlaybackPercent = landingStatsRateFilter(url, "minPlaybackPercent", 0);
-  const maxPlaybackPercent = landingStatsRateFilter(url, "maxPlaybackPercent", 100);
-  const rows = landingPageStatsSummary(
-    await listLandingPageDirectoryEvents(env.EPISODE_CONTENT, from, to)
-  ).filter(
-    (row) =>
-      row.playbackRate >= Math.min(minPlaybackRate, maxPlaybackRate) &&
-      row.playbackRate <= Math.max(minPlaybackRate, maxPlaybackRate) &&
-      row.averagePlaybackPercent >= Math.min(minPlaybackPercent, maxPlaybackPercent) &&
-      row.averagePlaybackPercent <= Math.max(minPlaybackPercent, maxPlaybackPercent) &&
-      row.bounceRate >= Math.min(minBounceRate, maxBounceRate) &&
-      row.bounceRate <= Math.max(minBounceRate, maxBounceRate)
-  );
-
-  if (url.searchParams.get("export") === "zoneids") {
-    const zoneIds = rows
-      .map((row) => row.zoneId)
-      .filter((zoneId) => zoneId !== "unattributed")
-      .join("\n");
-
-    return new Response(request.method === "HEAD" ? null : `${zoneIds}${zoneIds ? "\n" : ""}`, {
-      headers: {
-        "content-type": "text/plain;charset=UTF-8",
-        "content-disposition": 'attachment; filename="propellerads-excluded-zoneids.txt"',
-        "cache-control": "no-store",
-        "x-content-type-options": "nosniff"
-      }
-    });
-  }
-
-  const requestedPageSize = Number.parseInt(url.searchParams.get("pageSize") ?? "25", 10);
-  const pageSize = [25, 50, 100].includes(requestedPageSize) ? requestedPageSize : 25;
-  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
-  const requestedPage = Number.parseInt(url.searchParams.get("page") ?? "1", 10);
-  const currentPage = Math.min(
-    pageCount,
-    Math.max(1, Number.isFinite(requestedPage) ? requestedPage : 1)
-  );
-  const pageRows = rows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-  const statsPageHref = (page) => {
-    const params = new URLSearchParams(url.searchParams);
-    params.delete("export");
-    params.set("page", String(page));
-    params.set("pageSize", String(pageSize));
-    return `?${params.toString()}`;
-  };
-
-  const total = rows.reduce(
-    (summary, row) => ({
-      visits: summary.visits + row.visits,
-      plays: summary.plays + row.plays,
-      engaged: summary.engaged + row.engaged,
-      playbackPercentTotal: summary.playbackPercentTotal + row.playbackPercentTotal
-    }),
-    { visits: 0, plays: 0, engaged: 0, playbackPercentTotal: 0 }
-  );
-  const totalPlaybackRate = total.visits ? (total.plays / total.visits) * 100 : 0;
-  const totalAveragePlaybackPercent = total.plays
-    ? total.playbackPercentTotal / total.plays
-    : 0;
-  const totalBounces = total.visits - total.engaged;
-  const totalBounceRate = total.visits ? (totalBounces / total.visits) * 100 : 0;
-  const tableRows = pageRows.length
-    ? pageRows
-        .map(
-          (row) => `<tr>
-            <th scope="row">${escapeHtml(row.zoneId === "unattributed" ? "Unattributed" : row.zoneId)}</th>
-            <td>${row.visits.toLocaleString("en-US")}</td>
-            <td>${row.plays.toLocaleString("en-US")}</td>
-            <td>${row.playbackRate.toFixed(1)}%</td>
-            <td>${row.averagePlaybackPercent.toFixed(1)}%</td>
-            <td>${row.bounces.toLocaleString("en-US")}</td>
-            <td>${row.bounceRate.toFixed(1)}%</td>
-          </tr>`
-        )
-        .join("")
-    : '<tr><td colspan="7" class="empty">No tracked visits match these filters.</td></tr>';
-  const pagination = rows.length
-    ? `<nav class="pagination" aria-label="Stats pages">
-        ${currentPage > 1 ? `<a href="${escapeHtml(statsPageHref(currentPage - 1))}">Previous</a>` : '<span aria-disabled="true">Previous</span>'}
-        <strong>Page ${currentPage.toLocaleString("en-US")} of ${pageCount.toLocaleString("en-US")}</strong>
-        ${currentPage < pageCount ? `<a href="${escapeHtml(statsPageHref(currentPage + 1))}">Next</a>` : '<span aria-disabled="true">Next</span>'}
-      </nav>`
-    : "";
-  const body = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="robots" content="noindex, nofollow">
-    <title>Landing Page Stats | ${escapeHtml(podcast.name)}</title>
-    <style>
-      :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      * { box-sizing: border-box; }
-      body { margin: 0; padding: 32px 20px 64px; background: #111; color: #fff; }
-      main { width: min(100%, 1080px); margin: 0 auto; }
-      h1 { margin: 0 0 6px; font-size: clamp(1.8rem, 5vw, 2.6rem); }
-      .subtitle, .definition { color: #aaa; line-height: 1.5; }
-      form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 28px 0; padding: 18px; border: 1px solid #333; border-radius: 14px; background: #191919; }
-      label { display: grid; gap: 6px; color: #bbb; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
-      input, select, button { min-height: 44px; border-radius: 8px; font: inherit; }
-      input, select { width: 150px; border: 1px solid #555; padding: 8px 10px; background: #111; color: #fff; }
-      button { border: 0; padding: 9px 18px; background: #1ed760; color: #000; font-weight: 800; cursor: pointer; }
-      .export { background: #fff; }
-      .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 24px; }
-      .card { padding: 20px; border: 1px solid #333; border-radius: 14px; background: #191919; }
-      .card span { display: block; color: #aaa; font-size: .8rem; font-weight: 700; text-transform: uppercase; }
-      .card strong { display: block; margin-top: 6px; font-size: 1.8rem; }
-      .table-wrap { overflow-x: auto; border: 1px solid #333; border-radius: 14px; }
-      .pagination { display: flex; align-items: center; justify-content: center; gap: 18px; margin: 20px 0; }
-      .pagination a, .pagination span { padding: 10px 14px; border-radius: 8px; }
-      .pagination a { background: #1ed760; color: #000; font-weight: 800; text-decoration: none; }
-      .pagination span { color: #666; background: #191919; }
-      table { width: 100%; border-collapse: collapse; background: #191919; }
-      th, td { padding: 14px 16px; border-bottom: 1px solid #333; text-align: right; white-space: nowrap; }
-      th:first-child { text-align: left; }
-      thead th { color: #aaa; font-size: .76rem; text-transform: uppercase; }
-      tbody tr:last-child th, tbody tr:last-child td { border-bottom: 0; }
-      .empty { padding: 32px; color: #aaa; text-align: center; }
-      .definition { margin-top: 18px; font-size: .9rem; }
-      @media (max-width: 640px) { .cards { grid-template-columns: 1fr; } }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>Landing Page Stats</h1>
-      <p class="subtitle">Spreaker playback and bounce performance by PropellerAds zone.</p>
-      <form method="get">
-        <label>From <input type="date" name="from" value="${escapeHtml(from)}"></label>
-        <label>To <input type="date" name="to" value="${escapeHtml(to)}"></label>
-        <label>Playback min % <input type="number" name="minPlaybackRate" min="0" max="100" step="0.1" value="${minPlaybackRate}"></label>
-        <label>Playback max % <input type="number" name="maxPlaybackRate" min="0" max="100" step="0.1" value="${maxPlaybackRate}"></label>
-        <label>Played min % <input type="number" name="minPlaybackPercent" min="0" max="100" step="0.1" value="${minPlaybackPercent}"></label>
-        <label>Played max % <input type="number" name="maxPlaybackPercent" min="0" max="100" step="0.1" value="${maxPlaybackPercent}"></label>
-        <label>Bounce min % <input type="number" name="minBounceRate" min="0" max="100" step="0.1" value="${minBounceRate}"></label>
-        <label>Bounce max % <input type="number" name="maxBounceRate" min="0" max="100" step="0.1" value="${maxBounceRate}"></label>
-        <label>Rows per page
-          <select name="pageSize">
-            ${[25, 50, 100].map((size) => `<option value="${size}"${size === pageSize ? " selected" : ""}>${size}</option>`).join("")}
-          </select>
-        </label>
-        <button type="submit">Update</button>
-        <button class="export" type="submit" name="export" value="zoneids">Export zone IDs</button>
-      </form>
-      <section class="cards" aria-label="Summary">
-        <div class="card"><span>Visits</span><strong>${total.visits.toLocaleString("en-US")}</strong></div>
-        <div class="card"><span>Spreaker playback rate</span><strong>${totalPlaybackRate.toFixed(1)}%</strong></div>
-        <div class="card"><span>Average played</span><strong>${totalAveragePlaybackPercent.toFixed(1)}%</strong></div>
-        <div class="card"><span>Bounce rate</span><strong>${totalBounceRate.toFixed(1)}%</strong></div>
-      </section>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Zone</th><th>Visits</th><th>Spreaker plays</th><th>Playback rate</th><th>Average played</th><th>Bounces</th><th>Bounce rate</th></tr></thead>
-          <tbody>${tableRows}</tbody>
-        </table>
-      </div>
-      ${rows.length ? `<p class="definition">Showing ${((currentPage - 1) * pageSize + 1).toLocaleString("en-US")}–${Math.min(currentPage * pageSize, rows.length).toLocaleString("en-US")} of ${rows.length.toLocaleString("en-US")} matching zones.</p>` : ""}
-      ${pagination}
-      <p class="definition">Playback rate is the percentage of visits with at least one embedded-player play. Average played is the average highest progress milestone reached among playing sessions, measured every 10% plus 25% and 75%. Historical Acast events and new Spreaker events are combined. A bounce is a visit with no player play, 100-pixel scroll, or 10 seconds of active page time. Filters apply to both the table and export. The export contains one attributed PropellerAds zone ID per line; unattributed traffic is omitted. Date ranges are limited to 90 days.</p>
-    </main>
-  </body>
-</html>`;
-
-  return new Response(request.method === "HEAD" ? null : body, {
-    headers: {
-      "content-type": "text/html;charset=UTF-8",
-      "cache-control": "no-store",
-      "x-robots-tag": "noindex, nofollow",
-      "x-content-type-options": "nosniff"
-    }
-  });
+  return handleSpreakerDashboard(request, env, url);
 };
 
 const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}) => {
@@ -1811,6 +1699,23 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
     episode.spotifyEpisodeUrl || `https://open.spotify.com/episode/${episodeId}`;
   const trackedSpotifyUrl = `${spotifyLandingPagePath(episode)}/spotify`;
   const autoRedirect = options.autoRedirect === true;
+  const isAppleRedirect = options.platform === "apple";
+  const appleEpisodeUrl = safeApplePodcastsUrl(episode.appleEpisodeUrl);
+
+  if (isAppleRedirect && !appleEpisodeUrl) {
+    return new Response("This episode is not available on Apple Podcasts yet.", {
+      status: 503,
+      headers: {
+        "content-type": "text/plain;charset=UTF-8",
+        "cache-control": "no-store",
+        "x-robots-tag": "noindex, nofollow"
+      }
+    });
+  }
+
+  const platformName = isAppleRedirect ? "Apple Podcasts" : "Spotify";
+  const destination = isAppleRedirect ? "apple" : "app";
+  const destinationUrl = isAppleRedirect ? appleEpisodeUrl : spotifyEpisodeUrl;
   const countryCode = analytics.countryCode || "XX";
   const body = `<!doctype html>
 <html lang="en">
@@ -1818,7 +1723,7 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex, nofollow">
-    <title>${escapeHtml(episode.title)} | Spotify</title>
+    <title>${escapeHtml(episode.title)} | ${escapeHtml(platformName)}</title>
     ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
     ${renderFacebookPixel(analytics.facebookPixelId)}
     <style>
@@ -1845,12 +1750,12 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
       <h1>${escapeHtml(episode.title)}</h1>
       <p class="intro">${
         autoRedirect
-          ? "Opening this episode in Spotify&hellip;"
+          ? `Opening this episode in ${escapeHtml(platformName)}&hellip;`
           : "Open this episode in Spotify."
       }</p>
-      <a class="app" data-destination="app" href="${escapeHtml(
-        autoRedirect ? spotifyEpisodeUrl : trackedSpotifyUrl
-      )}">${autoRedirect ? "Continue to Spotify" : "Listen on Spotify"}</a>
+      <a class="app" data-destination="${escapeHtml(destination)}" href="${escapeHtml(
+        autoRedirect ? destinationUrl : trackedSpotifyUrl
+      )}">${autoRedirect ? `Continue to ${escapeHtml(platformName)}` : "Listen on Spotify"}</a>
     </main>
     <script>
       (function () {
@@ -1883,9 +1788,10 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
           }
         };
 
-        document.querySelector("[data-destination='app']").addEventListener("click", () => {
-          track("app");
+        document.querySelector("[data-destination='${escapeHtml(destination)}']").addEventListener("click", () => {
+          track("${escapeHtml(destination)}");
         });
+        ${autoRedirect ? `track("${escapeHtml(destination)}");` : ""}
       })();
     </script>
     ${
@@ -1893,7 +1799,7 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
         ? `<script>
       window.addEventListener("load", function () {
         window.setTimeout(function () {
-          window.location.replace(${safeJson(spotifyEpisodeUrl)});
+          window.location.replace(${safeJson(destinationUrl)});
         }, 2000);
       }, { once: true });
     </script>`
@@ -1937,9 +1843,17 @@ const handleSpotifyEpisodeLandingPage = async (
       request.method === "GET" &&
       !isLikelyBotRequest(request, "GET")
     ) {
+      const isAppleRedirect = options.platform === "apple";
+      const notification = isAppleRedirect
+        ? notifyApplePodcastEpisodeRedirect(env, request, episode)
+        : notifySpotifyEpisodeRedirect(env, request, episode);
+
       ctx.waitUntil(
-        notifySpotifyEpisodeRedirect(env, request, episode).catch((error) => {
-          console.error("Spotify episode redirect webhook failed", error);
+        notification.catch((error) => {
+          console.error(
+            `${isAppleRedirect ? "Apple Podcasts" : "Spotify"} episode redirect webhook failed`,
+            error
+          );
         })
       );
     }
@@ -2002,6 +1916,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
     const isColdAudience = pageUrl.searchParams.get("audience")?.toLowerCase() === "cold";
     const attributionSource =
       pageUrl.searchParams.get("source") === "facebook_ad" ? "facebook_ad" : "";
+    const zoneId = landingPageZoneId(pageUrl);
     const countryCode = analytics.countryCode || "XX";
 
     if (!episodes.length) {
@@ -2038,11 +1953,14 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       .map(
         (episode, episodeIndex) => {
           const isFeaturedColdEpisode = isColdAudience && episodeIndex === 0;
+          const outboundParams = new URLSearchParams();
+          if (attributionSource) outboundParams.set("source", attributionSource);
+          if (zoneId !== "unattributed") outboundParams.set("zoneid", zoneId);
+          const outboundQuery = outboundParams.size ? `?${outboundParams}` : "";
           const episodeHref = isColdAudience
-            ? `${spotifyLandingPagePath(episode)}/spotify${
-                attributionSource ? `?source=${encodeURIComponent(attributionSource)}` : ""
-              }`
+            ? `${spotifyLandingPagePath(episode)}/spotify${outboundQuery}`
             : spotifyLandingPagePath(episode);
+          const appleHref = `${spotifyLandingPagePath(episode)}/apple${outboundQuery}`;
           const spreakerEmbedUrl = episode.spreakerEpisodeId
               ? `https://widget.spreaker.com/player?episode_id=${encodeURIComponent(
                   episode.spreakerEpisodeId
@@ -2069,6 +1987,10 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             : `<a class="episode-link" href="${escapeHtml(episodeHref)}">${
                 isColdAudience ? "Listen on Spotify" : "Open episode"
               }</a>`;
+          const appleAction = `<a class="episode-link apple-link" data-apple-link data-episode-id="${escapeHtml(
+            episode.spotifyEpisodeId || episode.id
+          )}" href="${escapeHtml(appleHref)}">Listen on Apple Podcasts</a>`;
+          const episodeActions = `${episodeAction}${appleAction}`;
 
           return `
           <article class="episode">
@@ -2080,9 +2002,9 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
             >
             <p class="published">${escapeHtml(episode.publishedAt)}</p>
             <h2>${escapeHtml(episode.title)}</h2>
-            ${isFeaturedColdEpisode ? episodeAction : ""}
+            ${isFeaturedColdEpisode ? episodeActions : ""}
             <p class="intro">${escapeHtml(episode.summary)}</p>
-            ${isFeaturedColdEpisode ? "" : episodeAction}
+            ${isFeaturedColdEpisode ? "" : episodeActions}
           </article>`;
         }
       )
@@ -2122,6 +2044,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       .intro { margin: 0 0 28px; }
       a { text-decoration: none; }
       .episode-link { display: block; width: 100%; padding: 18px 24px; border-radius: 999px; background: #1ed760; color: #000; font-size: 1.125rem; font-weight: 800; }
+      .apple-link { margin-top: 14px; background: #fff; color: #111; }
       a:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
       body.cold-audience { padding-top: 20px; }
       .cold-audience .page-intro { margin-bottom: 12px; }
@@ -2164,7 +2087,10 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
         let activeSeconds = 0;
 
         const trackLandingEvent = (eventType, episodeId, percentPlayed) => {
-          const eventKey = eventType.startsWith("spreaker_")
+          const eventKey =
+            eventType.startsWith("acast_") ||
+            eventType.startsWith("spreaker_") ||
+            eventType === "apple_redirect"
             ? [eventType, String(episodeId || ""), String(percentPlayed || "")].join(":")
             : eventType;
           if (trackedLandingEvents.has(eventKey)) return;
@@ -2182,8 +2108,12 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           }).catch(() => {});
         };
 
-        const trackLandingEngagement = () => trackLandingEvent("engaged");
         trackLandingEvent("visit");
+        document.querySelectorAll("[data-apple-link]").forEach((link) => {
+          link.addEventListener("click", () => {
+            trackLandingEvent("apple_redirect", link.dataset.episodeId || "");
+          });
+        });
 
         const trackViewContent = (engagementSource) => {
           if (
@@ -2246,7 +2176,11 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           const parameters = playerEventParameters(state, action, percent);
 
           if (typeof window.gtag === "function") {
-            window.gtag("event", eventName, parameters);
+            window.gtag("event", eventName, {
+              ...parameters,
+              send_to: ${safeJson(podcast.googleAnalyticsId)},
+              debug_mode: true
+            });
           }
 
           if (typeof window.fbq === "function") {
@@ -2397,12 +2331,13 @@ const renderEpisodeImage = (episode, className = "episode-art") => `
   >`;
 
 const episodePath = (episode) => `/episodes/${episode.slug}`;
+const episodeListenPath = (episode) => `${episodePath(episode)}/listen`;
 const spotifyLandingPagePath = (episode) =>
   `${SPOTIFY_LANDING_PAGE_ENDPOINT}/${encodeURIComponent(episode.slug)}`;
 const episodeAnchor = (episode) => `episode-${episode.slug}`;
 
 const spotifyLandingPageSlugFromPath = (pathname) => {
-  const match = pathname.match(/^\/landing-page\/([^/]+)(?:\/spotify)?\/?$/);
+  const match = pathname.match(/^\/landing-page\/([^/]+)(?:\/(?:spotify|apple))?\/?$/);
 
   if (!match || match[1] === "click") {
     return null;
@@ -2417,6 +2352,12 @@ const spotifyLandingPageSlugFromPath = (pathname) => {
 
 const episodeSlugFromPath = (pathname) => {
   const match = pathname.match(/^\/episodes\/([^/]+)\/?$/);
+
+  return match?.[1] ?? null;
+};
+
+const episodeListenSlugFromPath = (pathname) => {
+  const match = pathname.match(/^\/episodes\/([^/]+)\/listen\/?$/);
 
   return match?.[1] ?? null;
 };
@@ -2484,7 +2425,9 @@ const serializeEpisode = (episode, origin) => ({
   publishedAtDisplay: episode.publishedAt,
   detailPageUrl: absoluteUrl(episodePath(episode), origin),
   spotifyLandingPageUrl: absoluteUrl(spotifyLandingPagePath(episode), origin),
+  appleLandingPageUrl: absoluteUrl(`${spotifyLandingPagePath(episode)}/apple`, origin),
   spotifyUrl: episode.spotifyUrl,
+  appleUrl: episode.appleEpisodeUrl || null,
   audioUrl: episode.audioUrl,
   artworkUrl: absoluteUrl(episode.image, origin),
   player: {
@@ -6282,6 +6225,280 @@ const renderPage = (
 </html>`;
 };
 
+const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
+  const platformUrl = (label) =>
+    podcast.links.find((link) => link.label === label)?.href || "";
+  const countryCode = analytics.countryCode || "XX";
+  const spreakerEmbedUrl = episode.spreakerEpisodeId
+    ? `https://widget.spreaker.com/player?episode_id=${encodeURIComponent(
+        episode.spreakerEpisodeId
+      )}&theme=dark&playlist=false&autoplay=false`
+    : "";
+  const additionalEpisodes = episodes
+    .filter((candidate) => candidate.slug !== episode.slug && candidate.spreakerEpisodeId)
+    .slice(0, 3);
+  const spreakerPlayer = (playerEpisode, id = "") => {
+    const embedUrl = `https://widget.spreaker.com/player?episode_id=${encodeURIComponent(
+      playerEpisode.spreakerEpisodeId
+    )}&theme=dark&playlist=false&autoplay=false`;
+    return `<div class="player-card">
+      ${id ? "" : `<h2>${escapeHtml(playerEpisode.title)}</h2>`}
+      <iframe
+        ${id ? `id="${id}"` : ""}
+        class="spreaker-player"
+        data-spreaker-player
+        data-episode-id="${escapeHtml(playerEpisode.spreakerEpisodeId)}"
+        data-episode-slug="${escapeHtml(playerEpisode.slug)}"
+        data-episode-title="${escapeHtml(playerEpisode.title)}"
+        src="${escapeHtml(embedUrl)}"
+        loading="lazy"
+        allow="autoplay"
+        title="${escapeHtml(`${playerEpisode.title} Spreaker player`)}"
+      ></iframe>
+    </div>`;
+  };
+  const links = [
+    {
+      label: "Listen on Spotify",
+      platform: "spotify",
+      className: "spotify",
+      href: episode.spotifyUrl || platformUrl("Spotify")
+    },
+    {
+      label: "Listen on Apple Podcasts",
+      platform: "apple",
+      className: "apple",
+      href: episode.appleEpisodeUrl || platformUrl("Apple Podcasts")
+    },
+    {
+      label: "Listen on Amazon Music",
+      platform: "amazon",
+      className: "amazon",
+      href: platformUrl("Amazon Music")
+    }
+  ].filter((link) => link.href);
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Listen to ${escapeHtml(episode.title)} on your preferred podcast platform.">
+    <title>Listen to ${escapeHtml(episode.title)} | ${escapeHtml(podcast.name)}</title>
+    ${renderGoogleAnalytics(podcast.googleAnalyticsId)}
+    ${renderFacebookPixel(analytics.facebookPixelId)}
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; padding: 32px 20px 48px; background: radial-gradient(circle at top, #252525 0, #111 48%); color: #fff; }
+      main { width: min(100%, 520px); margin: 0 auto; text-align: center; }
+      .art { display: block; width: min(78vw, 320px); aspect-ratio: 1; margin: 0 auto 26px; border-radius: 24px; object-fit: cover; box-shadow: 0 24px 70px rgba(0, 0, 0, .48); }
+      .eyebrow { margin: 0 0 8px; color: #1ed760; font-size: .78rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
+      h1 { margin: 0; font-size: clamp(1.65rem, 7vw, 2.45rem); line-height: 1.1; }
+      .show { margin: 12px 0 28px; color: #aaa; }
+      .spreaker-player { display: block; width: 100%; height: 200px; margin: 0 0 24px; border: 0; border-radius: 14px; }
+      .more-players { display: grid; gap: 26px; margin-top: 36px; padding-top: 30px; border-top: 1px solid #383838; }
+      .more-players > h2 { margin: 0; font-size: 1.35rem; }
+      .player-card h2 { margin: 0 0 12px; font-size: 1.05rem; line-height: 1.3; }
+      .player-card .spreaker-player { margin-bottom: 0; }
+      .links { display: grid; gap: 14px; }
+      .platform { display: flex; align-items: center; justify-content: center; min-height: 60px; padding: 16px 22px; border-radius: 999px; color: #fff; font-size: 1.05rem; font-weight: 850; text-decoration: none; transition: transform .15s ease, filter .15s ease; }
+      .platform:hover { transform: translateY(-2px); filter: brightness(1.08); }
+      .platform:focus-visible, .back:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+      .spotify { background: #1db954; color: #071b0e; }
+      .apple { background: #fff; color: #111; }
+      .amazon { background: #146eb4; }
+      .back { display: inline-block; margin-top: 28px; color: #bbb; text-underline-offset: 4px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img class="art" src="${escapeHtml(episode.image)}" alt="${escapeHtml(`${episode.title} episode artwork`)}">
+      <p class="eyebrow">Choose your player</p>
+      <h1>${escapeHtml(episode.title)}</h1>
+      <p class="show">${escapeHtml(podcast.name)}</p>
+      ${
+        spreakerEmbedUrl
+          ? spreakerPlayer(episode, "episode-spreaker-player")
+          : ""
+      }
+      <div class="links">
+        ${links.map((link) => `<a class="platform ${link.className}" data-platform="${link.platform}" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join("")}
+      </div>
+      ${
+        additionalEpisodes.length
+          ? `<section class="more-players" aria-labelledby="more-episodes-title">
+              <h2 id="more-episodes-title">More episodes</h2>
+              ${additionalEpisodes.map((candidate) => spreakerPlayer(candidate)).join("")}
+            </section>`
+          : ""
+      }
+      <a class="back" href="${escapeHtml(episodePath(episode))}">Back to episode details</a>
+    </main>
+    ${spreakerEmbedUrl || additionalEpisodes.length ? '<script src="https://cdn.embed.ly/player-0.1.0.min.js"></script>' : ""}
+    <script>
+      const episodeLinkAnalytics = {
+        episode_id: ${safeJson(episode.id)},
+        episode_slug: ${safeJson(episode.slug)},
+        episode_title: ${safeJson(episode.title)},
+        country_code: ${safeJson(analytics.countryCode || "XX")},
+        page_path: window.location.pathname,
+        referrer: document.referrer
+      };
+
+      document.querySelectorAll("[data-platform]").forEach((link) => {
+        link.addEventListener("click", () => {
+          const platform = link.dataset.platform;
+          const eventName = "episode_link_click_" + platform;
+          const parameters = {
+            ...episodeLinkAnalytics,
+            platform: platform,
+            destination_url: link.href
+          };
+
+          if (typeof window.gtag === "function") {
+            window.gtag("event", eventName, parameters);
+          }
+          if (typeof window.fbq === "function") {
+            window.fbq("trackCustom", eventName, parameters);
+          }
+
+          fetch("${EPISODE_LINK_CLICK_ENDPOINT}", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              platform: platform,
+              destinationUrl: link.href,
+              episodeId: ${safeJson(episode.id)},
+              episodeSlug: ${safeJson(episode.slug)},
+              episodeTitle: ${safeJson(episode.title)},
+              referrer: document.referrer
+            }),
+            keepalive: true
+          }).catch(() => {});
+        });
+      });
+
+      const spreakerFrames = Array.from(document.querySelectorAll("[data-spreaker-player]"));
+      if (spreakerFrames.length && window.playerjs?.Player) {
+        const milestones = [10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100];
+        const states = [];
+
+        const playerEventParameters = (state, action, percent) => {
+          const parameters = {
+            player: "spreaker",
+            player_action: action,
+            episode_id: state.frame.dataset.episodeId || "unknown",
+            episode_slug: state.frame.dataset.episodeSlug || "",
+            episode_title: state.frame.dataset.episodeTitle || "",
+            country_code: ${safeJson(countryCode)},
+            page_path: window.location.pathname
+          };
+          if (typeof percent === "number") parameters.percent_listened = percent;
+          return parameters;
+        };
+
+        const trackPlayerEvent = (state, action, percent) => {
+          const baseEventName = typeof percent === "number"
+            ? "spreaker_player_" + percent + "_percent"
+            : "spreaker_player_" + action;
+          const eventName = baseEventName + "_${escapeHtml(countryCode)}";
+          const parameters = playerEventParameters(state, action, percent);
+
+          if (typeof window.gtag === "function") {
+            window.gtag("event", eventName, {
+              ...parameters,
+              send_to: ${safeJson(podcast.googleAnalyticsId)},
+              debug_mode: true
+            });
+          }
+          if (typeof window.fbq === "function") {
+            window.fbq("trackCustom", eventName, parameters);
+          }
+        };
+
+        const checkMilestones = (state, progressPercent) => {
+          if (!Number.isFinite(progressPercent) || progressPercent < 0) return;
+          const percentComplete = Math.min(100, progressPercent);
+          milestones.forEach((milestone) => {
+            if (percentComplete >= milestone && !state.reachedMilestones.has(milestone)) {
+              state.reachedMilestones.add(milestone);
+              trackPlayerEvent(state, "progress", milestone);
+            }
+          });
+        };
+
+        const updateProgress = (state) => {
+          state.player.getDuration((value) => {
+            const numericDuration = Number(value);
+            if (Number.isFinite(numericDuration) && numericDuration > 0) state.duration = numericDuration;
+          });
+          state.player.getCurrentTime((value) => {
+            const position = Number(value);
+            if (state.duration > 0 && Number.isFinite(position)) {
+              checkMilestones(state, (position / state.duration) * 100);
+            }
+          });
+        };
+
+        const startProgressTracking = (state) => {
+          if (state.progressTimer) return;
+          updateProgress(state);
+          state.progressTimer = window.setInterval(() => updateProgress(state), 1000);
+        };
+
+        const stopProgressTracking = (state) => {
+          if (!state.progressTimer) return;
+          window.clearInterval(state.progressTimer);
+          state.progressTimer = null;
+        };
+
+        spreakerFrames.forEach((frame) => {
+          const state = {
+            frame: frame,
+            player: new window.playerjs.Player(frame),
+            reachedMilestones: new Set(),
+            duration: 0,
+            progressTimer: null,
+            isPlaying: false
+          };
+          states.push(state);
+
+          state.player.on("ready", () => {
+            state.player.on("play", () => {
+              states.forEach((otherState) => {
+                if (otherState !== state && otherState.isPlaying) otherState.player.pause();
+              });
+              if (!state.isPlaying) trackPlayerEvent(state, "play");
+              state.isPlaying = true;
+              startProgressTracking(state);
+            });
+            state.player.on("pause", () => {
+              if (state.isPlaying) trackPlayerEvent(state, "pause");
+              state.isPlaying = false;
+              stopProgressTracking(state);
+            });
+            state.player.on("ended", () => {
+              checkMilestones(state, 100);
+              trackPlayerEvent(state, "ended");
+              state.isPlaying = false;
+              stopProgressTracking(state);
+            });
+          });
+        });
+
+        window.addEventListener(
+          "pagehide",
+          () => states.forEach((state) => stopProgressTracking(state)),
+          { once: true }
+        );
+      }
+    </script>
+    ${renderPageViewNotification()}
+  </body>
+</html>`;
+};
+
 const renderEpisodePage = (episode, episodes, analytics = {}) => {
   const relatedEpisodes = selectRelatedEpisodes(episode, episodes);
   const videoOverview = renderVideoOverview(episode);
@@ -6320,6 +6537,7 @@ const renderEpisodePage = (episode, episodes, analytics = {}) => {
           ${renderEpisodeImage(episode, "episode-meta-image")}
           <p class="section-kicker">${escapeHtml(episode.publishedAt ?? "Episode")}</p>
           <a class="button" href="${escapeHtml(episode.href)}">Listen on Spotify</a>
+          <a class="button secondary" href="${escapeHtml(episodeListenPath(episode))}">Listen everywhere</a>
           ${
             episode.transcriptContent
               ? '<a class="button transcript-button" href="#transcript">Read episode transcript</a>'
@@ -7383,7 +7601,7 @@ export default {
     const cacheControl = `public, max-age=${podcast.spotify.cacheSeconds}`;
     const apiEpisodeMatch = url.pathname.match(/^\/api\/episodes\/([^/]+)\/?$/);
     const spotifyLandingPageMatch = url.pathname.match(
-      /^\/landing-page\/([^/]+)(\/spotify)?\/?$/
+      /^\/landing-page\/([^/]+)(\/(?:spotify|apple))?\/?$/
     );
     const isApiRequest =
       url.pathname === "/api/podcast" ||
@@ -7395,6 +7613,10 @@ export default {
       countryCode: getCountryCode(request),
       facebookPixelId: env.FACEBOOK_PIXEL_ID || ""
     };
+
+    if (url.pathname === EPISODE_LINK_CLICK_ENDPOINT) {
+      return handleEpisodeLinkClick(request, env, ctx);
+    }
 
     if (SPOTIFY_SHOW_REDIRECT_ENDPOINTS.has(url.pathname)) {
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -7449,7 +7671,13 @@ export default {
       }
     }
 
-    if (url.pathname === LANDING_PAGE_STATS_ENDPOINT) {
+    if (url.pathname === LEGACY_LANDING_PAGE_STATS_ENDPOINT) {
+      const destination = new URL(request.url);
+      destination.pathname = STATS_ENDPOINT;
+      return Response.redirect(destination.toString(), 308);
+    }
+
+    if (url.pathname === STATS_ENDPOINT) {
       try {
         return await handleLandingPageStats(request, env, url);
       } catch (error) {
@@ -7475,7 +7703,8 @@ export default {
       }
 
       return handleSpotifyEpisodeLandingPage(request, episodeSlug, analytics, env, ctx, {
-        autoRedirect: Boolean(spotifyLandingPageMatch[2])
+        autoRedirect: Boolean(spotifyLandingPageMatch[2]),
+        platform: spotifyLandingPageMatch[2] === "/apple" ? "apple" : "spotify"
       });
     }
 
@@ -7711,6 +7940,28 @@ export default {
             "cache-control": cacheControl
           }
         });
+      }
+
+      const episodeListenSlug = episodeListenSlugFromPath(url.pathname);
+
+      if (episodeListenSlug && ["GET", "HEAD"].includes(request.method)) {
+        const pageData = await loadEpisodePageData(request, ctx, episodeListenSlug);
+
+        if (!pageData) {
+          return new Response("Not found", { status: 404 });
+        }
+
+        return new Response(
+          request.method === "HEAD"
+            ? null
+            : renderEpisodeListenPage(pageData.episode, pageData.episodes, analytics),
+          {
+            headers: {
+              "content-type": "text/html;charset=UTF-8",
+              "cache-control": cacheControl
+            }
+          }
+        );
       }
 
       const episodeSlug = episodeSlugFromPath(url.pathname);

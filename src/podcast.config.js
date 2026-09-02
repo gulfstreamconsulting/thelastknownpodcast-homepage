@@ -77,6 +77,10 @@ export const podcast = {
       href: "https://podcasts.apple.com/us/podcast/the-last-known/id1870682049"
     },
     {
+      label: "Amazon Music",
+      href: "https://music.amazon.com/podcasts/d547c8b4-4d2d-4bbe-a901-5975136a9a7f/the-last-known"
+    },
+    {
       label: "YouTube",
       href: "#"
     }

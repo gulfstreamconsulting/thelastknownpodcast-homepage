@@ -156,7 +156,9 @@ GET /stats
 This page combines first-party site analytics stored in the `SITE_ANALYTICS` D1 database with
 private show analytics loaded from the authenticated Spreaker API. It reports page views, anonymous
 browser-session visitors, on-site playback starts and listeners, estimated listening time, maximum
-playback progress, completions, platform clicks, top pages, episodes, countries, and referrers. D1
+playback progress, average play percentage, completions, platform clicks, link-click CTR, top pages,
+episodes, countries, and referrers. Link-click CTR is the share of unique episode listen-page visitors
+who click at least one platform link. D1
 records playback position, media duration, progress percentage, player provider, episode, page,
 country, sanitized referrer, and a session-scoped anonymous identifier; IP addresses are not stored.
 The page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as

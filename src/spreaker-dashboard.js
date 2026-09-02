@@ -131,7 +131,9 @@ const siteAnalyticsForRange = async (env, from, to) => {
         SUM(CASE WHEN event_type IN ('audio_play', 'video_play') THEN 1 ELSE 0 END) AS plays,
         COUNT(DISTINCT CASE WHEN event_type IN ('audio_play', 'video_play') THEN session_id END) AS listeners,
         SUM(CASE WHEN event_type IN ('audio_ended', 'video_ended') THEN 1 ELSE 0 END) AS completions,
-        SUM(CASE WHEN event_type = 'episode_link_click' THEN 1 ELSE 0 END) AS platform_clicks
+        SUM(CASE WHEN event_type = 'episode_link_click' THEN 1 ELSE 0 END) AS platform_clicks,
+        COUNT(DISTINCT CASE WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%' THEN session_id END) AS listen_page_visitors,
+        COUNT(DISTINCT CASE WHEN event_type = 'episode_link_click' THEN session_id END) AS platform_clickers
       FROM site_events WHERE date(occurred_at) BETWEEN ?1 AND ?2
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
@@ -572,6 +574,9 @@ const siteAnalyticsPanel = (analytics) => {
   }
   const summary = analytics.summary || {};
   const playback = analytics.playback || {};
+  const linkClickCtr = Number(summary.listen_page_visitors) > 0
+    ? (Number(summary.platform_clickers) / Number(summary.listen_page_visitors)) * 100
+    : 0;
   const pageRows = analytics.pages.map((row) => `<tr><td>${escapeHtml(row.page_path)}</td><td>${number(row.views)}</td><td>${number(row.visitors)}</td></tr>`).join("");
   const episodeRows = analytics.episodes.map((row) => `<tr><td>${escapeHtml(row.episode)}</td><td>${number(row.plays)}</td><td>${number(row.listeners)}</td><td>${percent(row.max_percent)}</td><td>${number(row.completions)}</td></tr>`).join("");
   const platformRows = analytics.platforms.map((row) => `<tr><td>${escapeHtml(row.platform || "Unknown")}</td><td>${number(row.clicks)}</td></tr>`).join("");
@@ -587,10 +592,12 @@ const siteAnalyticsPanel = (analytics) => {
       <div class="metric"><span>Playback starts</span><strong>${number(summary.plays)}</strong></div>
       <div class="metric"><span>Listeners</span><strong>${number(summary.listeners)}</strong></div>
       <div class="metric"><span>Listening time</span><strong>${duration(playback.listening_ms)}</strong></div>
-      <div class="metric"><span>Average max played</span><strong>${percent(playback.average_percent)}</strong></div>
+      <div class="metric"><span>Average play %</span><strong>${percent(playback.average_percent)}</strong></div>
       <div class="metric"><span>Completions</span><strong>${number(summary.completions)}</strong></div>
       <div class="metric"><span>Platform clicks</span><strong>${number(summary.platform_clicks)}</strong></div>
+      <div class="metric"><span>Link click CTR</span><strong>${percent(linkClickCtr)}</strong></div>
     </div>
+    <p>Link click CTR is ${number(summary.platform_clickers)} unique platform clickers divided by ${number(summary.listen_page_visitors)} unique episode listen-page visitors.</p>
     <h2>Top pages</h2><div class="table-wrap"><table><thead><tr><th>Page</th><th>Views</th><th>Visitors</th></tr></thead><tbody>${pageRows || '<tr><td colspan="3">No page views in this range.</td></tr>'}</tbody></table></div>
     <h2>On-site playback by episode</h2><div class="table-wrap"><table><thead><tr><th>Episode</th><th>Starts</th><th>Listeners</th><th>Max played</th><th>Completions</th></tr></thead><tbody>${episodeRows || '<tr><td colspan="5">No on-site playback in this range.</td></tr>'}</tbody></table></div>
     <h2>Platform link clicks</h2><div class="table-wrap"><table><thead><tr><th>Platform</th><th>Clicks</th></tr></thead><tbody>${platformRows || '<tr><td colspan="2">No platform clicks in this range.</td></tr>'}</tbody></table></div>

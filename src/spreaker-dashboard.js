@@ -120,12 +120,94 @@ const dashboardDates = (url) => {
   return { from, to };
 };
 
+const siteAnalyticsForRange = async (env, from, to) => {
+  if (!env.SITE_ANALYTICS) return null;
+  const range = [from, to];
+  const results = await env.SITE_ANALYTICS.batch([
+    env.SITE_ANALYTICS.prepare(`
+      SELECT
+        SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS page_views,
+        COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN session_id END) AS visitors,
+        SUM(CASE WHEN event_type IN ('audio_play', 'video_play') THEN 1 ELSE 0 END) AS plays,
+        COUNT(DISTINCT CASE WHEN event_type IN ('audio_play', 'video_play') THEN session_id END) AS listeners,
+        SUM(CASE WHEN event_type IN ('audio_ended', 'video_ended') THEN 1 ELSE 0 END) AS completions,
+        SUM(CASE WHEN event_type = 'episode_link_click' THEN 1 ELSE 0 END) AS platform_clicks
+      FROM site_events WHERE date(occurred_at) BETWEEN ?1 AND ?2
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT COALESCE(SUM(max_position_ms), 0) AS listening_ms,
+             COALESCE(AVG(max_percent), 0) AS average_percent
+      FROM (
+        SELECT session_id, episode_id,
+               MAX(playback_position_ms) AS max_position_ms,
+               MAX(playback_percent) AS max_percent
+        FROM site_events
+        WHERE date(occurred_at) BETWEEN ?1 AND ?2
+          AND media_type IN ('audio', 'video')
+        GROUP BY session_id, episode_id
+      )
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT page_path, COUNT(*) AS views,
+             COUNT(DISTINCT session_id) AS visitors
+      FROM site_events
+      WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+      GROUP BY page_path ORDER BY views DESC LIMIT 15
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT COALESCE(NULLIF(episode_title, ''), NULLIF(episode_id, ''), 'Unknown episode') AS episode,
+             SUM(CASE WHEN event_type IN ('audio_play', 'video_play') THEN 1 ELSE 0 END) AS plays,
+             COUNT(DISTINCT CASE WHEN event_type IN ('audio_play', 'video_play') THEN session_id END) AS listeners,
+             MAX(playback_percent) AS max_percent,
+             SUM(CASE WHEN event_type IN ('audio_ended', 'video_ended') THEN 1 ELSE 0 END) AS completions
+      FROM site_events
+      WHERE date(occurred_at) BETWEEN ?1 AND ?2 AND episode_id <> ''
+      GROUP BY episode_id, episode_title ORDER BY plays DESC, listeners DESC LIMIT 20
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT platform, COUNT(*) AS clicks
+      FROM site_events
+      WHERE event_type = 'episode_link_click' AND date(occurred_at) BETWEEN ?1 AND ?2
+      GROUP BY platform ORDER BY clicks DESC
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT country_code, COUNT(DISTINCT session_id) AS visitors
+      FROM site_events
+      WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+      GROUP BY country_code ORDER BY visitors DESC LIMIT 20
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT CASE WHEN referrer = '' THEN 'Direct / unknown' ELSE referrer END AS referrer,
+             COUNT(DISTINCT session_id) AS visitors
+      FROM site_events
+      WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+      GROUP BY referrer ORDER BY visitors DESC LIMIT 15
+    `).bind(...range)
+  ]);
+
+  return {
+    summary: results[0]?.results?.[0] || {},
+    playback: results[1]?.results?.[0] || {},
+    pages: results[2]?.results || [],
+    episodes: results[3]?.results || [],
+    platforms: results[4]?.results || [],
+    countries: results[5]?.results || [],
+    referrers: results[6]?.results || []
+  };
+};
+
 const number = (value) => new Intl.NumberFormat("en-US").format(Number(value) || 0);
 const percent = (value) => `${Number(value || 0).toFixed(1)}%`;
 const currency = (value, currencyCode = "USD") =>
   new Intl.NumberFormat("en-US", { style: "currency", currency: currencyCode }).format(
     Number(value) || 0
   );
+const duration = (milliseconds) => {
+  const totalMinutes = Math.round((Number(milliseconds) || 0) / 60_000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
+};
 
 const parseCsv = (text) => {
   const rows = [];
@@ -484,7 +566,40 @@ const monetizationPanel = (monetization, uploadMessage = "") => {
   </section>`;
 };
 
-const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, from, to, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
+const siteAnalyticsPanel = (analytics) => {
+  if (!analytics) {
+    return '<section class="panel wide"><p class="kicker">Site analytics</p><h2>D1 analytics unavailable</h2><p class="notice">The SITE_ANALYTICS database binding is not configured.</p></section>';
+  }
+  const summary = analytics.summary || {};
+  const playback = analytics.playback || {};
+  const pageRows = analytics.pages.map((row) => `<tr><td>${escapeHtml(row.page_path)}</td><td>${number(row.views)}</td><td>${number(row.visitors)}</td></tr>`).join("");
+  const episodeRows = analytics.episodes.map((row) => `<tr><td>${escapeHtml(row.episode)}</td><td>${number(row.plays)}</td><td>${number(row.listeners)}</td><td>${percent(row.max_percent)}</td><td>${number(row.completions)}</td></tr>`).join("");
+  const platformRows = analytics.platforms.map((row) => `<tr><td>${escapeHtml(row.platform || "Unknown")}</td><td>${number(row.clicks)}</td></tr>`).join("");
+  const countryRows = analytics.countries.map((row) => `<tr><td>${escapeHtml(row.country_code || "XX")}</td><td>${number(row.visitors)}</td></tr>`).join("");
+  const referrerRows = analytics.referrers.map((row) => `<tr><td>${escapeHtml(row.referrer)}</td><td>${number(row.visitors)}</td></tr>`).join("");
+
+  return `<section class="panel wide">
+    <p class="kicker">First-party site analytics</p><h2>Website engagement</h2>
+    <p>Anonymous browser-session activity recorded in D1 for the selected date range.</p>
+    <div class="metrics">
+      <div class="metric"><span>Page views</span><strong>${number(summary.page_views)}</strong></div>
+      <div class="metric"><span>Visitors</span><strong>${number(summary.visitors)}</strong></div>
+      <div class="metric"><span>Playback starts</span><strong>${number(summary.plays)}</strong></div>
+      <div class="metric"><span>Listeners</span><strong>${number(summary.listeners)}</strong></div>
+      <div class="metric"><span>Listening time</span><strong>${duration(playback.listening_ms)}</strong></div>
+      <div class="metric"><span>Average max played</span><strong>${percent(playback.average_percent)}</strong></div>
+      <div class="metric"><span>Completions</span><strong>${number(summary.completions)}</strong></div>
+      <div class="metric"><span>Platform clicks</span><strong>${number(summary.platform_clicks)}</strong></div>
+    </div>
+    <h2>Top pages</h2><div class="table-wrap"><table><thead><tr><th>Page</th><th>Views</th><th>Visitors</th></tr></thead><tbody>${pageRows || '<tr><td colspan="3">No page views in this range.</td></tr>'}</tbody></table></div>
+    <h2>On-site playback by episode</h2><div class="table-wrap"><table><thead><tr><th>Episode</th><th>Starts</th><th>Listeners</th><th>Max played</th><th>Completions</th></tr></thead><tbody>${episodeRows || '<tr><td colspan="5">No on-site playback in this range.</td></tr>'}</tbody></table></div>
+    <h2>Platform link clicks</h2><div class="table-wrap"><table><thead><tr><th>Platform</th><th>Clicks</th></tr></thead><tbody>${platformRows || '<tr><td colspan="2">No platform clicks in this range.</td></tr>'}</tbody></table></div>
+    <h2>Visitor countries</h2><div class="table-wrap"><table><thead><tr><th>Country</th><th>Visitors</th></tr></thead><tbody>${countryRows || '<tr><td colspan="2">No country data in this range.</td></tr>'}</tbody></table></div>
+    <h2>Top referrers</h2><div class="table-wrap"><table><thead><tr><th>Referrer</th><th>Visitors</th></tr></thead><tbody>${referrerRows || '<tr><td colspan="2">No referrer data in this range.</td></tr>'}</tbody></table></div>
+  </section>`;
+};
+
+const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, siteAnalytics, from, to, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
   const totals = overall?.statistics || {};
   const last30Totals = sumPlayStats(last30Plays?.statistics);
   const last30Value = (key) => (last30Plays ? number(last30Totals[key]) : "—");
@@ -500,6 +615,7 @@ const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes,
     <section class="hero"><div class="hero-row"><div class="show">${showData.image_url ? `<img class="cover" src="${escapeHtml(showData.image_url)}" alt="">` : ""}<div><p class="kicker">Spreaker analytics</p><h1>${escapeHtml(showData.title || "The Last Known")}</h1><p>Show ${SHOW_ID} · ${escapeHtml(from)} through ${escapeHtml(to)}</p></div></div><div class="nav"><a class="button secondary" href="${escapeHtml(showData.site_url || `https://www.spreaker.com/show/${SHOW_ID}`)}">Open in Spreaker</a><a class="button secondary" href="${DASHBOARD_PATH}/connect">Reconnect</a></div></div></section>
     ${warning ? `<p class="notice error">${escapeHtml(warning)}</p>` : ""}
     <section class="panel"><form class="filter" method="get" action="${escapeHtml(statsPath)}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label><label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label><button class="button" type="submit">Update range</button></form></section>
+    ${siteAnalyticsPanel(siteAnalytics)}
     <section class="panel"><p class="kicker">At a glance</p><div class="metrics"><div class="metric"><span>All-time plays</span><strong>${number(totals.plays_count)}</strong></div><div class="metric"><span>All-time downloads</span><strong>${number(totals.downloads_count)}</strong></div><div class="metric"><span>Episodes</span><strong>${number(totals.episodes_count)}</strong></div><div class="metric"><span>Daily listeners total</span><strong>${number(totalListeners)}</strong></div></div><h2>Podcast statistics</h2><div class="table-wrap"><table><thead><tr><th>Metric</th><th>All time</th><th>Last 30 days</th></tr></thead><tbody><tr><td>Total plays</td><td>${number(totals.plays_count)}</td><td>${last30Value("plays_count")}</td></tr><tr><td>On-demand plays</td><td>${number(totals.plays_ondemand_count)}</td><td>${last30Value("plays_ondemand_count")}</td></tr><tr><td>Live plays</td><td>${number(totals.plays_live_count)}</td><td>${last30Value("plays_live_count")}</td></tr><tr><td>Downloads</td><td>${number(totals.downloads_count)}</td><td>${last30Value("downloads_count")}</td></tr></tbody></table></div></section>
     <div class="grid">
       ${monetizationPanel(monetization, uploadMessage)}
@@ -647,7 +763,7 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     }
   };
 
-  const [show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetizationReport] = await Promise.all([
+  const [show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetizationReport, siteAnalytics] = await Promise.all([
     safe(`/shows/${SHOW_ID}`),
     safe(`/shows/${SHOW_ID}/statistics`),
     safe(`/shows/${SHOW_ID}/statistics/plays?${query}&group=day`),
@@ -657,7 +773,11 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     safe(`/shows/${SHOW_ID}/statistics/sources?${query}&group=day`),
     safe(`/shows/${SHOW_ID}/statistics/devices?${query}&precision=1`),
     safe(`/shows/${SHOW_ID}/statistics/geographics?${query}&precision=1`),
-    jsonFromR2(env, MONETIZATION_KEY).catch(() => null)
+    jsonFromR2(env, MONETIZATION_KEY).catch(() => null),
+    siteAnalyticsForRange(env, from, to).catch((error) => {
+      console.error("Unable to load D1 site analytics", error);
+      return null;
+    })
   ]);
 
   const warning = !overall
@@ -674,6 +794,7 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     devices,
     countries,
     monetization: monetizationSummary(monetizationReport, from, to),
+    siteAnalytics,
     from,
     to,
     warning,

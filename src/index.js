@@ -45,6 +45,7 @@ const SPOTIFY_LANDING_PLAYBACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/play
 const SPREAKER_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/spreaker-play`;
 const EPISODE_LINK_CLICK_ENDPOINT = "/episodes/link-click";
 const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
+const SITE_ANALYTICS_EVENT_ENDPOINT = "/analytics/event";
 const STATS_ENDPOINT = "/stats";
 const LEGACY_LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
 const APPLE_PODCASTS_SHOW_URL =
@@ -1102,6 +1103,80 @@ const sanitizeAnalyticsReferrer = (value) => {
   }
 };
 
+const boundedAnalyticsNumber = (value, minimum, maximum) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : minimum;
+};
+
+const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
+  if (!env.SITE_ANALYTICS || isLikelyBotRequest(request, "POST")) return;
+
+  const sessionId = String(input.sessionId ?? "").trim();
+  const eventType = String(input.eventType ?? "").trim().toLowerCase();
+  const pagePath = String(input.pagePath ?? "").trim().slice(0, 900);
+  if (
+    !/^[A-Za-z0-9-]{8,80}$/.test(sessionId) ||
+    !/^[a-z][a-z0-9_]{1,63}$/.test(eventType) ||
+    !pagePath.startsWith("/")
+  ) return;
+
+  const requestUrl = new URL(request.url);
+  const normalizedPage = new URL(pagePath, requestUrl.origin);
+  if (normalizedPage.origin !== requestUrl.origin) return;
+
+  const occurredAt = new Date().toISOString();
+  const episodeId = String(input.episodeId ?? "").trim().slice(0, 200);
+  const episodeSlug = String(input.episodeSlug ?? "").trim().slice(0, 200);
+  const episodeTitle = String(input.episodeTitle ?? "").trim().slice(0, 500);
+  const mediaType = String(input.mediaType ?? "").trim().toLowerCase().slice(0, 30);
+  const playerProvider = String(input.playerProvider ?? "").trim().toLowerCase().slice(0, 50);
+  const platform = String(input.platform ?? "").trim().toLowerCase().slice(0, 50);
+  const zoneId = String(input.zoneId ?? normalizedPage.searchParams.get("zoneid") ?? "").trim();
+
+  await env.SITE_ANALYTICS.prepare(`
+    INSERT INTO site_events (
+      event_id, occurred_at, session_id, event_type, page_path,
+      episode_id, episode_slug, episode_title, media_type, player_provider,
+      playback_position_ms, playback_duration_ms, playback_percent,
+      platform, referrer, country_code, zone_id, user_agent
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+  `).bind(
+    crypto.randomUUID(), occurredAt, sessionId, eventType,
+    `${normalizedPage.pathname}${normalizedPage.search}`.slice(0, 900),
+    episodeId, episodeSlug, episodeTitle, mediaType, playerProvider,
+    Math.round(boundedAnalyticsNumber(input.playbackPositionMs, 0, 86_400_000)),
+    Math.round(boundedAnalyticsNumber(input.playbackDurationMs, 0, 86_400_000)),
+    boundedAnalyticsNumber(input.playbackPercent, 0, 100), platform,
+    sanitizeAnalyticsReferrer(input.referrer), getCountryCode(request),
+    /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "unattributed",
+    String(request.headers.get("user-agent") ?? "").slice(0, 500)
+  ).run();
+};
+
+const handleSiteAnalyticsEvent = async (request, env, ctx) => {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "POST", "cache-control": "no-store" }
+    });
+  }
+  if (!sameOriginRequest(request) || Number(request.headers.get("content-length") ?? 0) > 8192) {
+    return new Response("Invalid request", { status: 403, headers: { "cache-control": "no-store" } });
+  }
+
+  let input;
+  try {
+    input = await request.json();
+  } catch {
+    return new Response("Invalid event", { status: 400, headers: { "cache-control": "no-store" } });
+  }
+
+  ctx.waitUntil(saveSiteAnalyticsEvent(env, request, input).catch((error) => {
+    console.error("Unable to save site analytics event", error);
+  }));
+  return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+};
+
 const forwardEpisodeLinkClick = async (env, request, input) => {
   const webhookUrl = env.IFTTT_EPISODE_LINK_CLICKED_WEBHOOK_URL;
   if (!webhookUrl) return;
@@ -1196,6 +1271,18 @@ const handleEpisodeLinkClick = async (request, env, ctx) => {
       console.error("Episode link click webhook failed", error);
     })
   );
+  ctx.waitUntil(saveSiteAnalyticsEvent(env, request, {
+    sessionId: input.sessionId,
+    eventType: "episode_link_click",
+    pagePath: referrer.pathname + referrer.search,
+    episodeId: input.episodeId,
+    episodeSlug: input.episodeSlug,
+    episodeTitle: input.episodeTitle,
+    platform: input.platform,
+    referrer: input.referrer
+  }).catch((error) => {
+    console.error("Unable to save episode link analytics", error);
+  }));
   return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 };
 
@@ -1660,11 +1747,27 @@ const handleLandingPageTrack = async (request, env, ctx) => {
     });
   }
 
-  ctx.waitUntil(
-    saveLandingPageDirectoryEvent(env, request, input ?? {}, referrerUrl).catch((error) => {
-      console.error("Unable to save landing-page directory event", error);
+  const siteEventType = input?.eventType === "spreaker_play"
+    ? "audio_play"
+    : input?.eventType === "spreaker_progress"
+      ? "audio_progress"
+      : String(input?.eventType ?? "");
+  ctx.waitUntil(Promise.all([
+    saveLandingPageDirectoryEvent(env, request, input ?? {}, referrerUrl),
+    saveSiteAnalyticsEvent(env, request, {
+      sessionId: input?.sessionId,
+      eventType: siteEventType,
+      pagePath: referrerUrl.pathname + referrerUrl.search,
+      episodeId: input?.episodeId,
+      mediaType: siteEventType.startsWith("audio_") ? "audio" : "",
+      playerProvider: siteEventType.startsWith("audio_") ? "spreaker" : "",
+      playbackPercent: input?.percentPlayed,
+      zoneId: landingPageZoneId(referrerUrl),
+      referrer: request.headers.get("referer")
     })
-  );
+  ]).catch((error) => {
+    console.error("Unable to save landing-page analytics", error);
+  }));
 
   return new Response(null, {
     status: 204,
@@ -3352,6 +3455,17 @@ const renderPlaybackTracking = (episodes, countryCode) => {
         var adLanguage = 'en';
         var milestones = [20, 50, 75];
 
+        function analyticsSessionId() {
+          var key = 'tlk_analytics_session';
+          var existing = sessionStorage.getItem(key);
+          if (existing) return existing;
+          var created = window.crypto && window.crypto.randomUUID
+            ? window.crypto.randomUUID()
+            : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+          sessionStorage.setItem(key, created);
+          return created;
+        }
+
         function sendPlaybackEvent(type, episode, position, duration, mediaType, extraParameters) {
           var numericPosition = Number(position) || 0;
           var numericDuration = Number(duration) || 0;
@@ -3384,6 +3498,26 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           if (typeof window.fbq === 'function') {
             window.fbq('trackCustom', eventName, parameters);
           }
+
+          fetch(${safeJson(SITE_ANALYTICS_EVENT_ENDPOINT)}, {
+            method: 'POST',
+            credentials: 'same-origin',
+            keepalive: true,
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              sessionId: analyticsSessionId(),
+              eventType: mediaType + '_' + type,
+              pagePath: window.location.pathname + window.location.search,
+              episodeId: episode.episodeId,
+              episodeTitle: episode.episodeTitle,
+              mediaType: mediaType,
+              playerProvider: parameters.player_provider || '',
+              playbackPositionMs: Math.round(numericPosition),
+              playbackDurationMs: Math.round(numericDuration),
+              playbackPercent: playbackPercent,
+              referrer: document.referrer
+            })
+          }).catch(function () {});
         }
         function initializeNativeAudioTracking() {
           audioPlayers.forEach(function (episode) {
@@ -3986,8 +4120,17 @@ const renderPageViewNotification = (delayMs = 3000) => `
 
         var viewedPath = (window.location.pathname + window.location.search).slice(0, 900);
         var referrer = String(document.referrer || '').slice(0, 900);
+        var sessionKey = 'tlk_analytics_session';
+        var sessionId = sessionStorage.getItem(sessionKey);
+        if (!sessionId) {
+          sessionId = window.crypto && window.crypto.randomUUID
+            ? window.crypto.randomUUID()
+            : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+          sessionStorage.setItem(sessionKey, sessionId);
+        }
         var endpoint = '/analytics/page-view?path=' + encodeURIComponent(viewedPath) +
-          '&referrer=' + encodeURIComponent(referrer);
+          '&referrer=' + encodeURIComponent(referrer) +
+          '&session=' + encodeURIComponent(sessionId);
 
         fetch(endpoint, {
           method: 'POST',
@@ -6345,6 +6488,14 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
         page_path: window.location.pathname,
         referrer: document.referrer
       };
+      const analyticsSessionId = (() => {
+        const key = "tlk_analytics_session";
+        const existing = sessionStorage.getItem(key);
+        if (existing) return existing;
+        const created = window.crypto?.randomUUID?.() || Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+        sessionStorage.setItem(key, created);
+        return created;
+      })();
 
       document.querySelectorAll("[data-platform]").forEach((link) => {
         link.addEventListener("click", () => {
@@ -6367,6 +6518,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
+              sessionId: analyticsSessionId,
               platform: platform,
               destinationUrl: link.href,
               episodeId: ${safeJson(episode.id)},
@@ -6415,6 +6567,26 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
           if (typeof window.fbq === "function") {
             window.fbq("trackCustom", eventName, parameters);
           }
+          fetch(${safeJson(SITE_ANALYTICS_EVENT_ENDPOINT)}, {
+            method: "POST",
+            credentials: "same-origin",
+            keepalive: true,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              sessionId: analyticsSessionId,
+              eventType: "audio_" + action,
+              pagePath: window.location.pathname + window.location.search,
+              episodeId: parameters.episode_id,
+              episodeSlug: parameters.episode_slug,
+              episodeTitle: parameters.episode_title,
+              mediaType: "audio",
+              playerProvider: "spreaker",
+              playbackPositionMs: Math.round((state.position || 0) * 1000),
+              playbackDurationMs: Math.round((state.duration || 0) * 1000),
+              playbackPercent: typeof percent === "number" ? percent : (state.duration > 0 ? (state.position || 0) / state.duration * 100 : 0),
+              referrer: document.referrer
+            })
+          }).catch(() => {});
         };
 
         const checkMilestones = (state, progressPercent) => {
@@ -6436,6 +6608,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
           state.player.getCurrentTime((value) => {
             const position = Number(value);
             if (state.duration > 0 && Number.isFinite(position)) {
+              state.position = position;
               checkMilestones(state, (position / state.duration) * 100);
             }
           });
@@ -6459,6 +6632,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
             player: new window.playerjs.Player(frame),
             reachedMilestones: new Set(),
             duration: 0,
+            position: 0,
             progressTimer: null,
             isPlaying: false
           };
@@ -7717,6 +7891,10 @@ export default {
     }
 
     try {
+      if (url.pathname === SITE_ANALYTICS_EVENT_ENDPOINT) {
+        return handleSiteAnalyticsEvent(request, env, ctx);
+      }
+
       if (url.pathname === "/analytics/page-view") {
         if (request.method !== "POST") {
           return new Response("Method not allowed", {
@@ -7741,6 +7919,17 @@ export default {
           return new Response("Invalid page origin", { status: 400 });
         }
 
+        const analyticsSessionId = String(url.searchParams.get("session") ?? "");
+        const analyticsReferrer = String(url.searchParams.get("referrer") ?? "");
+        ctx.waitUntil(saveSiteAnalyticsEvent(env, request, {
+          sessionId: analyticsSessionId,
+          eventType: "page_view",
+          pagePath: viewedPath,
+          referrer: analyticsReferrer
+        }).catch((error) => {
+          console.error("Unable to save page-view analytics", error);
+        }));
+
         const landingEpisodeSlug = spotifyLandingPageSlugFromPath(pageUrl.pathname);
 
         if (landingEpisodeSlug) {
@@ -7748,7 +7937,7 @@ export default {
           const landingEpisode = episodes.find((episode) => episode.slug === landingEpisodeSlug);
 
           if (landingEpisode) {
-            const referrer = String(url.searchParams.get("referrer") ?? "");
+            const referrer = analyticsReferrer;
             const attributionSource =
               pageUrl.searchParams.get("source") === "facebook_ad" ? "facebook_ad" : "";
             ctx.waitUntil(

@@ -7,6 +7,8 @@
     "dev": "WRANGLER_WRITE_LOGS=false wrangler dev",
     "deploy": "WRANGLER_WRITE_LOGS=false wrangler deploy",
     "check": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run",
+    "db:migrate:local": "WRANGLER_WRITE_LOGS=false wrangler d1 migrations apply the-last-known-podcast-analytics --local",
+    "db:migrate:remote": "WRANGLER_WRITE_LOGS=false wrangler d1 migrations apply the-last-known-podcast-analytics --remote",
     "migrate:youtube-videos": "node scripts/migrate_youtube_videos_to_r2.mjs"
   },
   "devDependencies": {

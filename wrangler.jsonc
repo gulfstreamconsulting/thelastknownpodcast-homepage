@@ -22,6 +22,14 @@
 			"remote": true
 		}
 	],
+	"d1_databases": [
+		{
+			"binding": "SITE_ANALYTICS",
+			"database_name": "the-last-known-podcast-analytics",
+			"database_id": "ca7c3787-6c6f-4244-9fbb-bd04361917c5",
+			"migrations_dir": "migrations"
+		}
+	],
 	"observability": {
 		"enabled": true
 	}

@@ -153,10 +153,21 @@ is available at:
 GET /stats
 ```
 
-This page displays private show analytics loaded from the authenticated Spreaker API. It uses the
-same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as the other admin
-tools. The date range controls filter daily performance, episode totals, sources, devices, countries,
-and imported monetization data.
+This page combines first-party site analytics stored in the `SITE_ANALYTICS` D1 database with
+private show analytics loaded from the authenticated Spreaker API. It reports page views, anonymous
+browser-session visitors, on-site playback starts and listeners, estimated listening time, maximum
+playback progress, completions, platform clicks, top pages, episodes, countries, and referrers. D1
+records playback position, media duration, progress percentage, player provider, episode, page,
+country, sanitized referrer, and a session-scoped anonymous identifier; IP addresses are not stored.
+The page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
+the other admin tools. Its date controls filter both D1 and Spreaker results.
+
+The D1 binding and migration live in `wrangler.jsonc` and `migrations/`. Apply migrations with:
+
+```bash
+npm run db:migrate:local
+npm run db:migrate:remote
+```
 
 ## Episode Content
 

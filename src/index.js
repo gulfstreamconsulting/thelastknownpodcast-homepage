@@ -1132,6 +1132,9 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
   const playerProvider = String(input.playerProvider ?? "").trim().toLowerCase().slice(0, 50);
   const platform = String(input.platform ?? "").trim().toLowerCase().slice(0, 50);
   const zoneId = String(input.zoneId ?? normalizedPage.searchParams.get("zoneid") ?? "").trim();
+  const normalizedZoneId = /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId)
+    ? zoneId
+    : "unattributed";
 
   await env.SITE_ANALYTICS.prepare(`
     INSERT INTO site_events (
@@ -1139,7 +1142,21 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
       episode_id, episode_slug, episode_title, media_type, player_provider,
       playback_position_ms, playback_duration_ms, playback_percent,
       platform, referrer, country_code, zone_id, user_agent
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+    ) VALUES (
+      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+      COALESCE(
+        NULLIF(?17, 'unattributed'),
+        (
+          SELECT NULLIF(zone_id, 'unattributed')
+          FROM site_events
+          WHERE session_id = ?3
+          ORDER BY occurred_at DESC
+          LIMIT 1
+        ),
+        'unattributed'
+      ),
+      ?18
+    )
   `).bind(
     crypto.randomUUID(), occurredAt, sessionId, eventType,
     `${normalizedPage.pathname}${normalizedPage.search}`.slice(0, 900),
@@ -1148,7 +1165,7 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
     Math.round(boundedAnalyticsNumber(input.playbackDurationMs, 0, 86_400_000)),
     boundedAnalyticsNumber(input.playbackPercent, 0, 100), platform,
     sanitizeAnalyticsReferrer(input.referrer), getCountryCode(request),
-    /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "unattributed",
+    normalizedZoneId,
     String(request.headers.get("user-agent") ?? "").slice(0, 500)
   ).run();
 };
@@ -1279,6 +1296,7 @@ const handleEpisodeLinkClick = async (request, env, ctx) => {
     episodeSlug: input.episodeSlug,
     episodeTitle: input.episodeTitle,
     platform: input.platform,
+    zoneId: input.zoneId,
     referrer: input.referrer
   }).catch((error) => {
     console.error("Unable to save episode link analytics", error);
@@ -4128,9 +4146,20 @@ const renderPageViewNotification = (delayMs = 3000) => `
             : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
           sessionStorage.setItem(sessionKey, sessionId);
         }
+        var zoneKey = 'tlk_analytics_zone';
+        var queryZoneId = new URLSearchParams(window.location.search).get('zoneid') || '';
+        var zoneId = /^[A-Za-z0-9._:-]{1,100}$/.test(queryZoneId)
+          ? queryZoneId
+          : (sessionStorage.getItem(zoneKey) || '');
+        if (/^[A-Za-z0-9._:-]{1,100}$/.test(zoneId)) {
+          sessionStorage.setItem(zoneKey, zoneId);
+        } else {
+          zoneId = 'unattributed';
+        }
         var endpoint = '/analytics/page-view?path=' + encodeURIComponent(viewedPath) +
           '&referrer=' + encodeURIComponent(referrer) +
-          '&session=' + encodeURIComponent(sessionId);
+          '&session=' + encodeURIComponent(sessionId) +
+          '&zone=' + encodeURIComponent(zoneId);
 
         fetch(endpoint, {
           method: 'POST',
@@ -4572,9 +4601,9 @@ const renderGoogleAnalytics = (measurementId) => {
     <script async src="https://www.googletagmanager.com/gtag/js?id=${safeMeasurementId}"></script>
     <script>
       window.dataLayer = window.dataLayer || [];
-      function gtag(){dataLayer.push(arguments);}
-      gtag('js', new Date());
-      gtag('config', '${safeMeasurementId}');
+      window.gtag = window.gtag || function(){window.dataLayer.push(arguments);};
+      window.gtag('js', new Date());
+      window.gtag('config', '${safeMeasurementId}');
     </script>`;
 };
 
@@ -6368,7 +6397,8 @@ const renderPage = (
 </html>`;
 };
 
-const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
+const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}) => {
+  const showLinks = options.links !== "none";
   const platformUrl = (label) =>
     podcast.links.find((link) => link.label === label)?.href || "";
   const countryCode = analytics.countryCode || "XX";
@@ -6465,9 +6495,13 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
           ? spreakerPlayer(episode, "episode-spreaker-player")
           : ""
       }
-      <div class="links">
-        ${links.map((link) => `<a class="platform ${link.className}" data-platform="${link.platform}" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join("")}
-      </div>
+      ${
+        showLinks
+          ? `<div class="links">
+              ${links.map((link) => `<a class="platform ${link.className}" data-platform="${link.platform}" href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`).join("")}
+            </div>`
+          : ""
+      }
       ${
         additionalEpisodes.length
           ? `<section class="more-players" aria-labelledby="more-episodes-title">
@@ -6476,7 +6510,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
             </section>`
           : ""
       }
-      <a class="back" href="${escapeHtml(episodePath(episode))}">Back to episode details</a>
+      ${showLinks ? `<a class="back" href="${escapeHtml(episodePath(episode))}">Back to episode details</a>` : ""}
     </main>
     ${spreakerEmbedUrl || additionalEpisodes.length ? '<script src="https://cdn.embed.ly/player-0.1.0.min.js"></script>' : ""}
     <script>
@@ -6495,6 +6529,18 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
         const created = window.crypto?.randomUUID?.() || Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
         sessionStorage.setItem(key, created);
         return created;
+      })();
+      const analyticsZoneId = (() => {
+        const key = "tlk_analytics_zone";
+        const queryZoneId = new URLSearchParams(window.location.search).get("zoneid") || "";
+        const zoneId = /^[A-Za-z0-9._:-]{1,100}$/.test(queryZoneId)
+          ? queryZoneId
+          : (sessionStorage.getItem(key) || "");
+        if (/^[A-Za-z0-9._:-]{1,100}$/.test(zoneId)) {
+          sessionStorage.setItem(key, zoneId);
+          return zoneId;
+        }
+        return "unattributed";
       })();
 
       document.querySelectorAll("[data-platform]").forEach((link) => {
@@ -6524,6 +6570,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
               episodeId: ${safeJson(episode.id)},
               episodeSlug: ${safeJson(episode.slug)},
               episodeTitle: ${safeJson(episode.title)},
+              zoneId: analyticsZoneId,
               referrer: document.referrer
             }),
             keepalive: true
@@ -6544,6 +6591,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
             episode_slug: state.frame.dataset.episodeSlug || "",
             episode_title: state.frame.dataset.episodeTitle || "",
             country_code: ${safeJson(countryCode)},
+            zone_id: analyticsZoneId,
             page_path: window.location.pathname
           };
           if (typeof percent === "number") parameters.percent_listened = percent;
@@ -6557,13 +6605,14 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
           const eventName = baseEventName + "_${escapeHtml(countryCode)}";
           const parameters = playerEventParameters(state, action, percent);
 
-          if (typeof window.gtag === "function") {
-            window.gtag("event", eventName, {
-              ...parameters,
-              send_to: ${safeJson(podcast.googleAnalyticsId)},
-              debug_mode: true
-            });
-          }
+          window.dataLayer = window.dataLayer || [];
+          window.gtag = window.gtag || function(){window.dataLayer.push(arguments);};
+          window.gtag("event", eventName, {
+            ...parameters,
+            send_to: ${safeJson(podcast.googleAnalyticsId)},
+            debug_mode: true,
+            transport_type: "beacon"
+          });
           if (typeof window.fbq === "function") {
             window.fbq("trackCustom", eventName, parameters);
           }
@@ -6584,6 +6633,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
               playbackPositionMs: Math.round((state.position || 0) * 1000),
               playbackDurationMs: Math.round((state.duration || 0) * 1000),
               playbackPercent: typeof percent === "number" ? percent : (state.duration > 0 ? (state.position || 0) / state.duration * 100 : 0),
+              zoneId: analyticsZoneId,
               referrer: document.referrer
             })
           }).catch(() => {});
@@ -6668,7 +6718,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
         );
       }
     </script>
-    ${renderPageViewNotification()}
+    ${renderPageViewNotification(0)}
   </body>
 </html>`;
 };
@@ -7925,6 +7975,7 @@ export default {
           sessionId: analyticsSessionId,
           eventType: "page_view",
           pagePath: viewedPath,
+          zoneId: url.searchParams.get("zone"),
           referrer: analyticsReferrer
         }).catch((error) => {
           console.error("Unable to save page-view analytics", error);
@@ -8143,7 +8194,9 @@ export default {
         return new Response(
           request.method === "HEAD"
             ? null
-            : renderEpisodeListenPage(pageData.episode, pageData.episodes, analytics),
+            : renderEpisodeListenPage(pageData.episode, pageData.episodes, analytics, {
+                links: url.searchParams.get("links")
+              }),
           {
             headers: {
               "content-type": "text/html;charset=UTF-8",

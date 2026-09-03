@@ -164,6 +164,15 @@ country, sanitized referrer, and a session-scoped anonymous identifier; IP addre
 The page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
 the other admin tools. Its date controls filter both D1 and Spreaker results.
 
+Episode listen pages accept a validated `zoneid` query parameter. Zone attribution is retained for
+the browser session and attached to page-view, playback, progress, and platform-link events. The
+Zones tab at `/stats?tab=zones` reports play starts, playback rate (plays divided by sessions),
+playback-milestone counts, and bounce rate by zone; supports date, zone, play-count, playback-rate,
+and bounce-rate filters; and exports the current filtered
+result set as CSV. The on-screen results are paginated with aggregate totals across all zones that
+match the filters. A bounce is a
+recorded listen-page session without an audio playback start during the selected date range.
+
 The D1 binding and migration live in `wrangler.jsonc` and `migrations/`. Apply migrations with:
 
 ```bash

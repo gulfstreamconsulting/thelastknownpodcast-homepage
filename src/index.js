@@ -1823,6 +1823,7 @@ const handleSpotifyLandingPage = (request, episode, analytics = {}, options = {}
   const body = `<!doctype html>
 <html lang="en">
   <head>
+    ${renderMonetagAds()}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex, nofollow">
@@ -2115,6 +2116,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
     const body = `<!doctype html>
 <html lang="en">
   <head>
+    ${renderMonetagAds()}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex, nofollow">
@@ -4578,6 +4580,10 @@ const renderGoogleAnalytics = (measurementId) => {
     </script>`;
 };
 
+const renderMonetagAds = () => `
+    <script>(function(s){s.dataset.zone='10542810',s.src='https://n6wxm.com/vignette.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>
+    <script>(function(s){s.dataset.zone='10542805',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>`;
+
 const renderFacebookPixel = (pixelId) => {
   if (!pixelId) {
     return "";
@@ -4605,6 +4611,7 @@ const renderHead = ({
   extraHead = ""
 }) => `
   <head>
+    ${renderMonetagAds()}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer-when-downgrade" />
@@ -6424,6 +6431,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}) => {
   return `<!doctype html>
 <html lang="en">
   <head>
+    ${renderMonetagAds()}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Listen to ${escapeHtml(episode.title)} on your preferred podcast platform.">

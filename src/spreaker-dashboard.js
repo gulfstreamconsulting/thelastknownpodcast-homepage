@@ -9,6 +9,8 @@ const TOKEN_KEY = "private/spreaker/oauth-token.json";
 const MONETIZATION_KEY = "private/spreaker/monetization.json";
 const STATE_PREFIX = "private/spreaker/oauth-state/";
 const MAX_MONETIZATION_CSV_BYTES = 5 * 1024 * 1024;
+const PLAYBACK_MILESTONES = [10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100];
+const ZONE_RESULTS_PER_PAGE = 25;
 
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -196,6 +198,166 @@ const siteAnalyticsForRange = async (env, from, to) => {
     countries: results[5]?.results || [],
     referrers: results[6]?.results || []
   };
+};
+
+const validZoneFilter = (value) => {
+  const zoneId = String(value ?? "").trim();
+  return /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "";
+};
+
+const validMetricFilter = (value, maximum, integer = false) => {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const bounded = Math.min(maximum, Math.max(0, parsed));
+  return integer ? Math.floor(bounded) : Math.round(bounded * 10) / 10;
+};
+
+const zoneMetricFilters = (values = {}) => {
+  let minPlays = validMetricFilter(values.minPlays, 1_000_000_000, true);
+  let maxPlays = validMetricFilter(values.maxPlays, 1_000_000_000, true);
+  let minBounce = validMetricFilter(values.minBounce, 100);
+  let maxBounce = validMetricFilter(values.maxBounce, 100);
+  let minPlayback = validMetricFilter(values.minPlayback, 100);
+  let maxPlayback = validMetricFilter(values.maxPlayback, 100);
+  if (minPlays !== null && maxPlays !== null && minPlays > maxPlays) {
+    [minPlays, maxPlays] = [maxPlays, minPlays];
+  }
+  if (minBounce !== null && maxBounce !== null && minBounce > maxBounce) {
+    [minBounce, maxBounce] = [maxBounce, minBounce];
+  }
+  if (minPlayback !== null && maxPlayback !== null && minPlayback > maxPlayback) {
+    [minPlayback, maxPlayback] = [maxPlayback, minPlayback];
+  }
+  return { minPlays, maxPlays, minBounce, maxBounce, minPlayback, maxPlayback };
+};
+
+const zoneAnalyticsForRange = async (
+  env,
+  from,
+  to,
+  requestedZone = "",
+  requestedFilters = {}
+) => {
+  if (!env.SITE_ANALYTICS) return null;
+
+  const zoneFilter = validZoneFilter(requestedZone);
+  const filters = zoneMetricFilters(requestedFilters);
+  const milestoneColumns = PLAYBACK_MILESTONES.map(
+    (milestone) =>
+      `SUM(CASE WHEN event_type = 'audio_progress' AND ROUND(playback_percent) = ${milestone} THEN 1 ELSE 0 END) AS milestone_${milestone}`
+  ).join(",\n             ");
+  const [zoneOptionsResult, zoneRowsResult] = await env.SITE_ANALYTICS.batch([
+    env.SITE_ANALYTICS.prepare(`
+      SELECT zone_id,
+             COUNT(DISTINCT CASE
+               WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%'
+               THEN session_id
+             END) AS sessions
+      FROM site_events
+      WHERE date(occurred_at) BETWEEN ?1 AND ?2
+      GROUP BY zone_id
+      ORDER BY CASE WHEN zone_id = 'unattributed' THEN 1 ELSE 0 END, zone_id
+    `).bind(from, to),
+    env.SITE_ANALYTICS.prepare(`
+      WITH filtered AS (
+        SELECT zone_id, session_id, episode_id, event_type, page_path, playback_percent
+        FROM site_events
+        WHERE date(occurred_at) BETWEEN ?1 AND ?2
+          AND (?3 = '' OR zone_id = ?3)
+      ),
+      zones AS (
+        SELECT DISTINCT zone_id FROM filtered
+      ),
+      session_rollup AS (
+        SELECT
+          zone_id,
+          session_id,
+          MAX(CASE WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%' THEN 1 ELSE 0 END) AS visited_listen_page,
+          MAX(CASE WHEN event_type = 'audio_play' THEN 1 ELSE 0 END) AS played_audio
+        FROM filtered
+        GROUP BY zone_id, session_id
+      ),
+      session_summary AS (
+        SELECT
+          zone_id,
+          SUM(visited_listen_page) AS sessions,
+          SUM(CASE WHEN visited_listen_page = 1 AND played_audio = 0 THEN 1 ELSE 0 END) AS bounces
+        FROM session_rollup
+        GROUP BY zone_id
+      ),
+      playback_summary AS (
+        SELECT
+          zone_id,
+          SUM(CASE WHEN event_type = 'audio_play' THEN 1 ELSE 0 END) AS plays,
+          ${milestoneColumns}
+        FROM filtered
+        GROUP BY zone_id
+      )
+      SELECT
+        zones.zone_id,
+        COALESCE(session_summary.sessions, 0) AS sessions,
+        COALESCE(session_summary.bounces, 0) AS bounces,
+        COALESCE(playback_summary.plays, 0) AS plays,
+        ${PLAYBACK_MILESTONES.map(
+          (milestone) => `COALESCE(playback_summary.milestone_${milestone}, 0) AS milestone_${milestone}`
+        ).join(",\n        ")}
+      FROM zones
+      LEFT JOIN session_summary USING (zone_id)
+      LEFT JOIN playback_summary USING (zone_id)
+      ORDER BY plays DESC, sessions DESC, zones.zone_id
+    `).bind(from, to, zoneFilter)
+  ]);
+
+  const rows = (zoneRowsResult?.results || []).filter((row) => {
+    const plays = Number(row.plays) || 0;
+    const sessions = Number(row.sessions) || 0;
+    const bounceRate = sessions > 0 ? ((Number(row.bounces) || 0) / sessions) * 100 : 0;
+    const playbackPercent = sessions > 0 ? (plays / sessions) * 100 : 0;
+    return (
+      (filters.minPlays === null || plays >= filters.minPlays) &&
+      (filters.maxPlays === null || plays <= filters.maxPlays) &&
+      (filters.minBounce === null || bounceRate >= filters.minBounce) &&
+      (filters.maxBounce === null || bounceRate <= filters.maxBounce) &&
+      (filters.minPlayback === null || playbackPercent >= filters.minPlayback) &&
+      (filters.maxPlayback === null || playbackPercent <= filters.maxPlayback)
+    );
+  });
+
+  return {
+    zoneFilter,
+    filters,
+    options: zoneOptionsResult?.results || [],
+    rows
+  };
+};
+
+const csvCell = (value) => {
+  let text = String(value ?? "");
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+};
+
+const zoneAnalyticsCsv = (analytics, from, to) => {
+  const milestoneHeaders = PLAYBACK_MILESTONES.map((milestone) => `${milestone}% plays`);
+  const header = ["From", "To", "Zone ID", "Sessions", "Plays", "Playback rate %", ...milestoneHeaders, "Bounces", "Bounce rate"];
+  const rows = (analytics?.rows || []).map((row) => {
+    const bounceRate = Number(row.sessions) > 0
+      ? (Number(row.bounces) / Number(row.sessions)) * 100
+      : 0;
+    return [
+      from,
+      to,
+      row.zone_id,
+      row.sessions,
+      row.plays,
+      (Number(row.sessions) > 0 ? (Number(row.plays) / Number(row.sessions)) * 100 : 0).toFixed(1),
+      ...PLAYBACK_MILESTONES.map((milestone) => row[`milestone_${milestone}`]),
+      row.bounces,
+      bounceRate.toFixed(1)
+    ];
+  });
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
 };
 
 const number = (value) => new Intl.NumberFormat("en-US").format(Number(value) || 0);
@@ -413,7 +575,10 @@ const layout = (title, body) => `<!doctype html>
     .button.secondary { background:transparent; color:var(--rust); }
     .filter { display:flex; flex-wrap:wrap; align-items:end; gap:12px; }
     .filter label { display:grid; gap:6px; color:var(--muted); font-size:.82rem; font-weight:800; }
-    .filter input { min-height:42px; padding:0 10px; border:1px solid var(--line); border-radius:6px; background:white; font:inherit; }
+    .filter input,.filter select { min-height:42px; padding:0 10px; border:1px solid var(--line); border-radius:6px; background:white; font:inherit; }
+    .tabs { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 20px; padding:6px; border:1px solid var(--line); border-radius:10px; background:var(--paper); }
+    .tabs a { padding:10px 16px; border-radius:7px; color:var(--muted); text-decoration:none; }
+    .tabs a[aria-current="page"] { background:var(--teal); color:white; }
     .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px; }
     .metric { padding:19px; border:1px solid var(--line); border-radius:9px; background:#fff; }
     .metric span { color:var(--muted); font-size:.82rem; font-weight:750; }
@@ -424,6 +589,9 @@ const layout = (title, body) => `<!doctype html>
     table { width:100%; border-collapse:collapse; text-align:left; }
     th,td { padding:11px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
     th { color:var(--muted); font-size:.76rem; letter-spacing:.05em; text-transform:uppercase; white-space:nowrap; }
+    tfoot th,tfoot td { border-top:2px solid var(--ink); border-bottom:0; background:#f6f1e9; color:var(--ink); font-weight:850; }
+    .pagination { display:flex; align-items:center; justify-content:center; gap:14px; margin-top:18px; }
+    .pagination span { color:var(--muted); font-weight:750; }
     .chart { display:block; width:100%; min-width:680px; height:auto; }
     .gridline { stroke:var(--line); stroke-width:1; }
     .axis { fill:var(--muted); font-size:12px; }
@@ -606,6 +774,147 @@ const siteAnalyticsPanel = (analytics) => {
   </section>`;
 };
 
+const statsTabs = (from, to, activeTab) => {
+  const overviewQuery = new URLSearchParams({ from, to });
+  const zonesQuery = new URLSearchParams({ tab: "zones", from, to });
+  return `<nav class="tabs" aria-label="Statistics sections">
+    <a href="/stats?${escapeHtml(overviewQuery)}"${activeTab === "overview" ? ' aria-current="page"' : ""}>Overview</a>
+    <a href="/stats?${escapeHtml(zonesQuery)}"${activeTab === "zones" ? ' aria-current="page"' : ""}>Zones</a>
+  </nav>`;
+};
+
+const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
+  if (!analytics) {
+    return '<section class="panel wide"><p class="kicker">Zone analytics</p><h2>D1 analytics unavailable</h2><p class="notice">The SITE_ANALYTICS database binding is not configured.</p></section>';
+  }
+
+  const exportQuery = new URLSearchParams({ tab: "zones", format: "csv", from, to });
+  if (analytics.zoneFilter) exportQuery.set("zoneid", analytics.zoneFilter);
+  const metricFilterParams = {
+    minplays: analytics.filters?.minPlays,
+    maxplays: analytics.filters?.maxPlays,
+    minbounce: analytics.filters?.minBounce,
+    maxbounce: analytics.filters?.maxBounce,
+    minplayback: analytics.filters?.minPlayback,
+    maxplayback: analytics.filters?.maxPlayback
+  };
+  for (const [name, value] of Object.entries(metricFilterParams)) {
+    if (value !== null && value !== undefined) exportQuery.set(name, String(value));
+  }
+  const paginationQuery = new URLSearchParams(exportQuery);
+  paginationQuery.delete("format");
+  const requestedPageNumber = Number.parseInt(String(requestedPage), 10);
+  const totalRows = analytics.rows.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / ZONE_RESULTS_PER_PAGE));
+  const currentPage = Math.min(
+    totalPages,
+    Math.max(1, Number.isFinite(requestedPageNumber) ? requestedPageNumber : 1)
+  );
+  const pageStart = (currentPage - 1) * ZONE_RESULTS_PER_PAGE;
+  const pageRows = analytics.rows.slice(pageStart, pageStart + ZONE_RESULTS_PER_PAGE);
+  const totals = analytics.rows.reduce((summary, row) => {
+    summary.sessions += Number(row.sessions) || 0;
+    summary.plays += Number(row.plays) || 0;
+    summary.bounces += Number(row.bounces) || 0;
+    for (const milestone of PLAYBACK_MILESTONES) {
+      summary.milestones[milestone] += Number(row[`milestone_${milestone}`]) || 0;
+    }
+    return summary;
+  }, {
+    sessions: 0,
+    plays: 0,
+    bounces: 0,
+    milestones: Object.fromEntries(PLAYBACK_MILESTONES.map((milestone) => [milestone, 0]))
+  });
+  const totalPlaybackRate = totals.sessions > 0 ? (totals.plays / totals.sessions) * 100 : 0;
+  const totalBounceRate = totals.sessions > 0 ? (totals.bounces / totals.sessions) * 100 : 0;
+  const filterValue = (value) => value === null || value === undefined ? "" : String(value);
+  const optionRows = analytics.options.map((row) => {
+    const zoneId = String(row.zone_id || "unattributed");
+    return `<option value="${escapeHtml(zoneId)}"${zoneId === analytics.zoneFilter ? " selected" : ""}>${escapeHtml(zoneId)} (${number(row.sessions)} sessions)</option>`;
+  }).join("");
+  const milestoneHeaders = PLAYBACK_MILESTONES.map(
+    (milestone) => `<th>${milestone}%</th>`
+  ).join("");
+  const zoneRows = pageRows.map((row) => {
+    const sessions = Number(row.sessions) || 0;
+    const bounces = Number(row.bounces) || 0;
+    const bounceRate = sessions > 0 ? (bounces / sessions) * 100 : 0;
+    const playbackRate = sessions > 0 ? ((Number(row.plays) || 0) / sessions) * 100 : 0;
+    const milestoneCells = PLAYBACK_MILESTONES.map(
+      (milestone) => `<td>${number(row[`milestone_${milestone}`])}</td>`
+    ).join("");
+    return `<tr>
+      <td><strong>${escapeHtml(row.zone_id || "unattributed")}</strong></td>
+      <td>${number(sessions)}</td>
+      <td>${number(row.plays)}</td>
+      <td>${percent(playbackRate)}</td>
+      ${milestoneCells}
+      <td>${number(bounces)}</td>
+      <td>${percent(bounceRate)}</td>
+    </tr>`;
+  }).join("");
+  const totalMilestoneCells = PLAYBACK_MILESTONES.map(
+    (milestone) => `<td>${number(totals.milestones[milestone])}</td>`
+  ).join("");
+  const totalsRow = totalRows > 0 ? `<tfoot><tr>
+    <th>Filtered totals (${number(totalRows)} zones)</th>
+    <td>${number(totals.sessions)}</td>
+    <td>${number(totals.plays)}</td>
+    <td>${percent(totalPlaybackRate)}</td>
+    ${totalMilestoneCells}
+    <td>${number(totals.bounces)}</td>
+    <td>${percent(totalBounceRate)}</td>
+  </tr></tfoot>` : "";
+  const pageQuery = (page) => {
+    const query = new URLSearchParams(paginationQuery);
+    query.set("page", String(page));
+    return `/stats?${escapeHtml(query)}`;
+  };
+  const firstShown = totalRows > 0 ? pageStart + 1 : 0;
+  const lastShown = Math.min(pageStart + ZONE_RESULTS_PER_PAGE, totalRows);
+  const pagination = totalPages > 1 ? `<nav class="pagination" aria-label="Zone result pages">
+    ${currentPage > 1 ? `<a class="button secondary" href="${pageQuery(currentPage - 1)}">Previous</a>` : ""}
+    <span>Showing ${number(firstShown)}–${number(lastShown)} of ${number(totalRows)} zones · Page ${number(currentPage)} of ${number(totalPages)}</span>
+    ${currentPage < totalPages ? `<a class="button secondary" href="${pageQuery(currentPage + 1)}">Next</a>` : ""}
+  </nav>` : `<p>Showing ${number(totalRows)} filtered zone${totalRows === 1 ? "" : "s"}.</p>`;
+
+  return `<section class="panel wide">
+    <p class="kicker">Zone analytics</p><h2>Playback performance by zone</h2>
+    <p>Each valid <code>zoneid</code> query parameter is retained for the browser session. A bounce is a session with a recorded episode listen-page view and no audio playback start in the selected range.</p>
+    <form class="filter" method="get" action="/stats">
+      <input type="hidden" name="tab" value="zones">
+      <label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label>
+      <label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label>
+      <label>Zone<select name="zoneid"><option value="">All zones</option>${optionRows}</select></label>
+      <label>Minimum plays<input type="number" name="minplays" min="0" step="1" value="${escapeHtml(filterValue(analytics.filters?.minPlays))}" placeholder="0"></label>
+      <label>Maximum plays<input type="number" name="maxplays" min="0" step="1" value="${escapeHtml(filterValue(analytics.filters?.maxPlays))}" placeholder="Any"></label>
+      <label>Minimum bounce %<input type="number" name="minbounce" min="0" max="100" step="0.1" value="${escapeHtml(filterValue(analytics.filters?.minBounce))}" placeholder="0"></label>
+      <label>Maximum bounce %<input type="number" name="maxbounce" min="0" max="100" step="0.1" value="${escapeHtml(filterValue(analytics.filters?.maxBounce))}" placeholder="100"></label>
+      <label>Minimum playback rate %<input type="number" name="minplayback" min="0" max="100" step="0.1" value="${escapeHtml(filterValue(analytics.filters?.minPlayback))}" placeholder="0"></label>
+      <label>Maximum playback rate %<input type="number" name="maxplayback" min="0" max="100" step="0.1" value="${escapeHtml(filterValue(analytics.filters?.maxPlayback))}" placeholder="100"></label>
+      <button class="button" type="submit">Apply filters</button>
+      <a class="button secondary" href="/stats?${escapeHtml(new URLSearchParams({ tab: "zones", from, to }))}">Clear filters</a>
+      <a class="button secondary" href="/stats?${escapeHtml(exportQuery)}">Export CSV</a>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Zone ID</th><th>Sessions</th><th>Plays</th><th>Playback rate</th>${milestoneHeaders}<th>Bounces</th><th>Bounce rate</th></tr></thead>
+        <tbody>${zoneRows || `<tr><td colspan="${6 + PLAYBACK_MILESTONES.length}">No zone activity in this range.</td></tr>`}</tbody>
+        ${totalsRow}
+      </table>
+    </div>
+    ${pagination}
+  </section>`;
+};
+
+const zonesDashboardPage = ({ analytics, from, to, page }) => layout("Zone analytics | The Last Known", `
+  <nav class="nav" aria-label="Admin navigation"><a href="/">Site</a><a href="/admin/content">Episode content</a><a href="${DASHBOARD_PATH}">Spreaker admin</a></nav>
+  <section class="hero"><p class="kicker">First-party analytics</p><h1>Zone tracking</h1><p>${escapeHtml(from)} through ${escapeHtml(to)}</p></section>
+  ${statsTabs(from, to, "zones")}
+  ${zoneAnalyticsPanel(analytics, from, to, page)}
+`);
+
 const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, siteAnalytics, from, to, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
   const totals = overall?.statistics || {};
   const last30Totals = sumPlayStats(last30Plays?.statistics);
@@ -620,6 +929,7 @@ const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes,
   return layout(`Spreaker dashboard | ${showData.title || "The Last Known"}`, `
     <nav class="nav" aria-label="Admin navigation"><a href="/">Site</a><a href="/admin/content">Episode content</a><a href="${FEED_URL}">RSS feed</a></nav>
     <section class="hero"><div class="hero-row"><div class="show">${showData.image_url ? `<img class="cover" src="${escapeHtml(showData.image_url)}" alt="">` : ""}<div><p class="kicker">Spreaker analytics</p><h1>${escapeHtml(showData.title || "The Last Known")}</h1><p>Show ${SHOW_ID} · ${escapeHtml(from)} through ${escapeHtml(to)}</p></div></div><div class="nav"><a class="button secondary" href="${escapeHtml(showData.site_url || `https://www.spreaker.com/show/${SHOW_ID}`)}">Open in Spreaker</a><a class="button secondary" href="${DASHBOARD_PATH}/connect">Reconnect</a></div></div></section>
+    ${statsPath === "/stats" ? statsTabs(from, to, "overview") : ""}
     ${warning ? `<p class="notice error">${escapeHtml(warning)}</p>` : ""}
     <section class="panel"><form class="filter" method="get" action="${escapeHtml(statsPath)}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label><label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label><button class="button" type="submit">Update range</button></form></section>
     ${siteAnalyticsPanel(siteAnalytics)}
@@ -743,6 +1053,49 @@ export const handleSpreakerMonetizationUpload = async (request, env) => {
 };
 
 export const handleSpreakerDashboard = async (request, env, url) => {
+  const { from, to } = dashboardDates(url);
+  const isZonesTab = url.pathname === "/stats" && url.searchParams.get("tab") === "zones";
+  if (isZonesTab) {
+    const zoneAnalytics = await zoneAnalyticsForRange(
+      env,
+      from,
+      to,
+      url.searchParams.get("zoneid"),
+      {
+        minPlays: url.searchParams.get("minplays"),
+        maxPlays: url.searchParams.get("maxplays"),
+        minBounce: url.searchParams.get("minbounce"),
+        maxBounce: url.searchParams.get("maxbounce"),
+        minPlayback: url.searchParams.get("minplayback"),
+        maxPlayback: url.searchParams.get("maxplayback")
+      }
+    ).catch((error) => {
+      console.error("Unable to load D1 zone analytics", error);
+      return null;
+    });
+
+    if (url.searchParams.get("format") === "csv") {
+      return new Response(
+        request.method === "HEAD" ? null : zoneAnalyticsCsv(zoneAnalytics, from, to),
+        {
+          headers: {
+            "content-type": "text/csv;charset=UTF-8",
+            "content-disposition": `attachment; filename="zone-analytics-${from}-to-${to}.csv"`,
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff"
+          }
+        }
+      );
+    }
+
+    return responseHtml(request, zonesDashboardPage({
+      analytics: zoneAnalytics,
+      from,
+      to,
+      page: url.searchParams.get("page")
+    }));
+  }
+
   if (!configured(env)) return responseHtml(request, connectionPage(request, env), 503);
 
   let accessToken;
@@ -753,7 +1106,6 @@ export const handleSpreakerDashboard = async (request, env, url) => {
   }
   if (!accessToken) return responseHtml(request, connectionPage(request, env));
 
-  const { from, to } = dashboardDates(url);
   const query = new URLSearchParams({ from, to });
   const rollingToDate = new Date();
   const rollingFromDate = new Date(rollingToDate);

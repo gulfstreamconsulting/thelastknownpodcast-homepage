@@ -50,6 +50,8 @@ const STATS_ENDPOINT = "/stats";
 const LEGACY_LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
 const APPLE_PODCASTS_SHOW_URL =
   podcast.links.find((link) => link.label === "Apple Podcasts")?.href || "#";
+const DIRECT_SUPPORT_URL =
+  podcast.links.find((link) => link.label === "Support the Show")?.href || null;
 const APPLE_PODCASTS_SHOW_ID = APPLE_PODCASTS_SHOW_URL.match(/\/id(\d+)/)?.[1] || "";
 const APPLE_PODCASTS_CACHE_SECONDS = 15 * 60;
 const COLD_AUDIENCE_EPISODE_LIMIT = 8;
@@ -2513,7 +2515,7 @@ const serializeMapLocation = (location) => ({
   embedUrl: mapEmbedUrl(location) || null
 });
 
-const serializeVideo = (episode) => {
+const serializeVideo = (episode, origin) => {
   if (episode.spotifyVideoOverview) {
     return {
       provider: "spotify",
@@ -2570,7 +2572,7 @@ const serializeEpisode = (episode, origin) => ({
   videoUrl: episode.spotifyVideoOverview?.url ?? null,
   youtubeUrl: null,
   videoAsset: null,
-  video: serializeVideo(episode),
+  video: serializeVideo(episode, origin),
   mapLocations: normalizeMapLocations(episode.mapLocations).map(serializeMapLocation),
   attachments: (episode.attachments ?? []).map((attachment) =>
     serializeAttachment(attachment, episode, origin)
@@ -2736,12 +2738,14 @@ const renderHomeApi = (
               episodeSlug: featuredEpisode.slug
             }
           : null,
-        {
-          id: "support",
-          label: "Support the show",
-          type: "external",
-          url: DIRECT_SUPPORT_URL
-        }
+        DIRECT_SUPPORT_URL
+          ? {
+              id: "support",
+              label: "Support the show",
+              type: "external",
+              url: DIRECT_SUPPORT_URL
+            }
+          : null
       ].filter(Boolean)
     },
     featuredEpisode: featuredEpisode ? serializeEpisode(featuredEpisode, origin) : null,
@@ -2805,12 +2809,14 @@ const renderEpisodeDetailApi = (episode, episodes, origin) => {
           type: "external",
           url: episode.spotifyUrl
         },
-        {
-          id: "support",
-          label: "Support the show",
-          type: "external",
-          url: DIRECT_SUPPORT_URL
-        },
+        DIRECT_SUPPORT_URL
+          ? {
+              id: "support",
+              label: "Support the show",
+              type: "external",
+              url: DIRECT_SUPPORT_URL
+            }
+          : null,
         (episode.transcriptContent?.paragraphs ?? []).length
           ? {
               id: "read-transcript",
@@ -8257,6 +8263,12 @@ export default {
       );
     } catch (error) {
       if (isApiRequest) {
+        console.error("Podcast API request failed", {
+          method: request.method,
+          pathname: url.pathname,
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined
+        });
         return jsonResponse(
           {
             error: {

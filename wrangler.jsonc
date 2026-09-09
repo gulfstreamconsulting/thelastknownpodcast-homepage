@@ -3,6 +3,17 @@
 	"name": "the-last-known-podcast",
 	"main": "src/index.js",
 	"compatibility_date": "2026-06-03",
+	"workers_dev": false,
+	"routes": [
+		{
+			"pattern": "thelastknownpodcast.com/*",
+			"zone_name": "thelastknownpodcast.com"
+		},
+		{
+			"pattern": "www.thelastknownpodcast.com/*",
+			"zone_name": "thelastknownpodcast.com"
+		}
+	],
 	"vars": {
 		"ADMIN_USERNAME": "admin",
 		"SPREAKER_CLIENT_ID": "43320"

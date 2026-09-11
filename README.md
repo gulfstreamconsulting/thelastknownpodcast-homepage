@@ -139,11 +139,17 @@ pixels. It does not fire on page load. The event includes the engagement source,
 featured episode, and episode count as parameters. Spreaker play, pause, and progress events remain
 separate custom events.
 
-PropellerAds traffic must pass its zone ID to the directory using the `zoneid` query parameter:
+Paid traffic can pass its zone, campaign, and click IDs to the directory using the validated
+`zoneid`, `campaignid`, and `clickid` query parameters:
 
 ```text
-GET /landing-page?zoneid=123456
+GET /landing-page?zoneid=123456&campaignid=fall-launch&clickid=visitor-123
 ```
+
+Click attribution is retained for the browser session. Its first recorded audio play claims one
+PropellerAds conversion for that session and sends a server-to-server GET postback with the click ID
+as `visitor_id`. Successful postbacks are not repeated; failed or stale attempts can retry on a
+later audio play.
 
 Directory visits, meaningful engagement, Spreaker playback, historical Acast playback, and Apple
 episode redirects are stored as append-only session events in R2. The password-protected stats page
@@ -160,17 +166,20 @@ playback progress, average play percentage, completions, platform clicks, link-c
 episodes, countries, and referrers. Link-click CTR is the share of unique episode listen-page visitors
 who click at least one platform link. D1
 records playback position, media duration, progress percentage, player provider, episode, page,
-country, sanitized referrer, and a session-scoped anonymous identifier; IP addresses are not stored.
+country, sanitized referrer, zone, campaign, and click attribution, and a session-scoped anonymous
+identifier; IP addresses are not stored.
 The page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
-the other admin tools. Its date controls filter both D1 and Spreaker results.
+the other admin tools. Its date controls filter both D1 and Spreaker results. On `/stats`, UTC hour
+controls further narrow the D1 site analytics, zone/campaign results, and raw event CSV export;
+Spreaker and monetization statistics remain date-based.
 
-Episode listen pages accept a validated `zoneid` query parameter. Zone attribution is retained for
-the browser session and attached to page-view, playback, progress, and platform-link events. The
-Zones tab at `/stats?tab=zones` reports play starts, playback rate (plays divided by sessions),
-playback-milestone counts, and bounce rate by zone; supports date, zone, play-count, playback-rate,
-and bounce-rate filters; and exports the current filtered
-result set as CSV. The on-screen results are paginated with aggregate totals across all zones that
-match the filters. A bounce is a
+Episode listen pages accept validated `zoneid` and `campaignid` query parameters. Both attributions
+are retained for the browser session and attached to page-view, playback, progress, and
+platform-link events. The Zones & campaigns tab at `/stats?tab=zones` reports play starts, playback
+rate (plays divided by sessions), playback-milestone counts, and bounce rate by zone and campaign;
+supports date, zone, campaign, play-count, playback-rate, and bounce-rate filters; and exports the
+matching raw D1 events as CSV, with one row per event and its full UTC timestamp. The on-screen
+results are paginated with aggregate totals across all attribution rows that match the filters. A bounce is a
 recorded listen-page session without an audio playback start during the selected date range.
 
 The D1 binding and migration live in `wrangler.jsonc` and `migrations/`. Apply migrations with:

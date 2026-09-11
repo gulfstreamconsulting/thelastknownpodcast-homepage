@@ -100,6 +100,7 @@ const apiRequest = async (path, accessToken) => {
 };
 
 const dateString = (date) => date.toISOString().slice(0, 10);
+const hourString = (hour) => String(hour).padStart(2, "0");
 
 const dashboardDates = (url) => {
   const today = new Date();
@@ -112,19 +113,31 @@ const dashboardDates = (url) => {
   let to = validDate.test(url.searchParams.get("to") || "")
     ? url.searchParams.get("to")
     : dateString(today);
+  const validHour = (value, fallback) => {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    return Number.isInteger(parsed) && parsed >= 0 && parsed <= 23 ? parsed : fallback;
+  };
+  let fromHour = validHour(url.searchParams.get("fromhour"), 0);
+  let toHour = validHour(url.searchParams.get("tohour"), 23);
 
-  if (from > to) [from, to] = [to, from];
+  if (`${from}T${hourString(fromHour)}` > `${to}T${hourString(toHour)}`) {
+    [from, to] = [to, from];
+    [fromHour, toHour] = [toHour, fromHour];
+  }
 
   const earliest = new Date(`${to}T00:00:00Z`);
   earliest.setUTCDate(earliest.getUTCDate() - 365);
   if (from < dateString(earliest)) from = dateString(earliest);
 
-  return { from, to };
+  const fromTimestamp = `${from}T${hourString(fromHour)}:00:00.000Z`;
+  const toHourStart = new Date(`${to}T${hourString(toHour)}:00:00.000Z`);
+  const toTimestamp = new Date(toHourStart.getTime() + 60 * 60 * 1000).toISOString();
+  return { from, to, fromHour, toHour, fromTimestamp, toTimestamp };
 };
 
-const siteAnalyticsForRange = async (env, from, to) => {
+const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp) => {
   if (!env.SITE_ANALYTICS) return null;
-  const range = [from, to];
+  const range = [fromTimestamp, toTimestamp];
   const results = await env.SITE_ANALYTICS.batch([
     env.SITE_ANALYTICS.prepare(`
       SELECT
@@ -136,7 +149,7 @@ const siteAnalyticsForRange = async (env, from, to) => {
         SUM(CASE WHEN event_type = 'episode_link_click' THEN 1 ELSE 0 END) AS platform_clicks,
         COUNT(DISTINCT CASE WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%' THEN session_id END) AS listen_page_visitors,
         COUNT(DISTINCT CASE WHEN event_type = 'episode_link_click' THEN session_id END) AS platform_clickers
-      FROM site_events WHERE date(occurred_at) BETWEEN ?1 AND ?2
+      FROM site_events WHERE occurred_at >= ?1 AND occurred_at < ?2
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT COALESCE(SUM(max_position_ms), 0) AS listening_ms,
@@ -146,7 +159,7 @@ const siteAnalyticsForRange = async (env, from, to) => {
                MAX(playback_position_ms) AS max_position_ms,
                MAX(playback_percent) AS max_percent
         FROM site_events
-        WHERE date(occurred_at) BETWEEN ?1 AND ?2
+        WHERE occurred_at >= ?1 AND occurred_at < ?2
           AND media_type IN ('audio', 'video')
         GROUP BY session_id, episode_id
       )
@@ -155,7 +168,7 @@ const siteAnalyticsForRange = async (env, from, to) => {
       SELECT page_path, COUNT(*) AS views,
              COUNT(DISTINCT session_id) AS visitors
       FROM site_events
-      WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+      WHERE event_type = 'page_view' AND occurred_at >= ?1 AND occurred_at < ?2
       GROUP BY page_path ORDER BY views DESC LIMIT 15
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
@@ -165,26 +178,26 @@ const siteAnalyticsForRange = async (env, from, to) => {
              MAX(playback_percent) AS max_percent,
              SUM(CASE WHEN event_type IN ('audio_ended', 'video_ended') THEN 1 ELSE 0 END) AS completions
       FROM site_events
-      WHERE date(occurred_at) BETWEEN ?1 AND ?2 AND episode_id <> ''
+      WHERE occurred_at >= ?1 AND occurred_at < ?2 AND episode_id <> ''
       GROUP BY episode_id, episode_title ORDER BY plays DESC, listeners DESC LIMIT 20
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT platform, COUNT(*) AS clicks
       FROM site_events
-      WHERE event_type = 'episode_link_click' AND date(occurred_at) BETWEEN ?1 AND ?2
+      WHERE event_type = 'episode_link_click' AND occurred_at >= ?1 AND occurred_at < ?2
       GROUP BY platform ORDER BY clicks DESC
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT country_code, COUNT(DISTINCT session_id) AS visitors
       FROM site_events
-      WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+      WHERE event_type = 'page_view' AND occurred_at >= ?1 AND occurred_at < ?2
       GROUP BY country_code ORDER BY visitors DESC LIMIT 20
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT CASE WHEN referrer = '' THEN 'Direct / unknown' ELSE referrer END AS referrer,
              COUNT(DISTINCT session_id) AS visitors
       FROM site_events
-      WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+      WHERE event_type = 'page_view' AND occurred_at >= ?1 AND occurred_at < ?2
       GROUP BY referrer ORDER BY visitors DESC LIMIT 15
     `).bind(...range)
   ]);
@@ -200,9 +213,9 @@ const siteAnalyticsForRange = async (env, from, to) => {
   };
 };
 
-const validZoneFilter = (value) => {
-  const zoneId = String(value ?? "").trim();
-  return /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "";
+const validAttributionFilter = (value) => {
+  const attributionId = String(value ?? "").trim();
+  return /^[A-Za-z0-9._:-]{1,100}$/.test(attributionId) ? attributionId : "";
 };
 
 const validMetricFilter = (value, maximum, integer = false) => {
@@ -234,20 +247,22 @@ const zoneMetricFilters = (values = {}) => {
 
 const zoneAnalyticsForRange = async (
   env,
-  from,
-  to,
+  fromTimestamp,
+  toTimestamp,
   requestedZone = "",
+  requestedCampaign = "",
   requestedFilters = {}
 ) => {
   if (!env.SITE_ANALYTICS) return null;
 
-  const zoneFilter = validZoneFilter(requestedZone);
+  const zoneFilter = validAttributionFilter(requestedZone);
+  const campaignFilter = validAttributionFilter(requestedCampaign);
   const filters = zoneMetricFilters(requestedFilters);
   const milestoneColumns = PLAYBACK_MILESTONES.map(
     (milestone) =>
       `SUM(CASE WHEN event_type = 'audio_progress' AND ROUND(playback_percent) = ${milestone} THEN 1 ELSE 0 END) AS milestone_${milestone}`
   ).join(",\n             ");
-  const [zoneOptionsResult, zoneRowsResult] = await env.SITE_ANALYTICS.batch([
+  const [zoneOptionsResult, campaignOptionsResult, zoneRowsResult] = await env.SITE_ANALYTICS.batch([
     env.SITE_ANALYTICS.prepare(`
       SELECT zone_id,
              COUNT(DISTINCT CASE
@@ -255,58 +270,74 @@ const zoneAnalyticsForRange = async (
                THEN session_id
              END) AS sessions
       FROM site_events
-      WHERE date(occurred_at) BETWEEN ?1 AND ?2
+      WHERE occurred_at >= ?1 AND occurred_at < ?2
       GROUP BY zone_id
       ORDER BY CASE WHEN zone_id = 'unattributed' THEN 1 ELSE 0 END, zone_id
-    `).bind(from, to),
+    `).bind(fromTimestamp, toTimestamp),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT campaign_id,
+             COUNT(DISTINCT CASE
+               WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%'
+               THEN session_id
+             END) AS sessions
+      FROM site_events
+      WHERE occurred_at >= ?1 AND occurred_at < ?2
+      GROUP BY campaign_id
+      ORDER BY CASE WHEN campaign_id = 'unattributed' THEN 1 ELSE 0 END, campaign_id
+    `).bind(fromTimestamp, toTimestamp),
     env.SITE_ANALYTICS.prepare(`
       WITH filtered AS (
-        SELECT zone_id, session_id, episode_id, event_type, page_path, playback_percent
+        SELECT zone_id, campaign_id, session_id, episode_id, event_type, page_path, playback_percent
         FROM site_events
-        WHERE date(occurred_at) BETWEEN ?1 AND ?2
+        WHERE occurred_at >= ?1 AND occurred_at < ?2
           AND (?3 = '' OR zone_id = ?3)
+          AND (?4 = '' OR campaign_id = ?4)
       ),
-      zones AS (
-        SELECT DISTINCT zone_id FROM filtered
+      attributions AS (
+        SELECT DISTINCT zone_id, campaign_id FROM filtered
       ),
       session_rollup AS (
         SELECT
           zone_id,
+          campaign_id,
           session_id,
           MAX(CASE WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%' THEN 1 ELSE 0 END) AS visited_listen_page,
           MAX(CASE WHEN event_type = 'audio_play' THEN 1 ELSE 0 END) AS played_audio
         FROM filtered
-        GROUP BY zone_id, session_id
+        GROUP BY zone_id, campaign_id, session_id
       ),
       session_summary AS (
         SELECT
           zone_id,
+          campaign_id,
           SUM(visited_listen_page) AS sessions,
           SUM(CASE WHEN visited_listen_page = 1 AND played_audio = 0 THEN 1 ELSE 0 END) AS bounces
         FROM session_rollup
-        GROUP BY zone_id
+        GROUP BY zone_id, campaign_id
       ),
       playback_summary AS (
         SELECT
           zone_id,
+          campaign_id,
           SUM(CASE WHEN event_type = 'audio_play' THEN 1 ELSE 0 END) AS plays,
           ${milestoneColumns}
         FROM filtered
-        GROUP BY zone_id
+        GROUP BY zone_id, campaign_id
       )
       SELECT
-        zones.zone_id,
+        attributions.zone_id,
+        attributions.campaign_id,
         COALESCE(session_summary.sessions, 0) AS sessions,
         COALESCE(session_summary.bounces, 0) AS bounces,
         COALESCE(playback_summary.plays, 0) AS plays,
         ${PLAYBACK_MILESTONES.map(
           (milestone) => `COALESCE(playback_summary.milestone_${milestone}, 0) AS milestone_${milestone}`
         ).join(",\n        ")}
-      FROM zones
-      LEFT JOIN session_summary USING (zone_id)
-      LEFT JOIN playback_summary USING (zone_id)
-      ORDER BY plays DESC, sessions DESC, zones.zone_id
-    `).bind(from, to, zoneFilter)
+      FROM attributions
+      LEFT JOIN session_summary USING (zone_id, campaign_id)
+      LEFT JOIN playback_summary USING (zone_id, campaign_id)
+      ORDER BY plays DESC, sessions DESC, attributions.zone_id, attributions.campaign_id
+    `).bind(fromTimestamp, toTimestamp, zoneFilter, campaignFilter)
   ]);
 
   const rows = (zoneRowsResult?.results || []).filter((row) => {
@@ -326,8 +357,10 @@ const zoneAnalyticsForRange = async (
 
   return {
     zoneFilter,
+    campaignFilter,
     filters,
-    options: zoneOptionsResult?.results || [],
+    zoneOptions: zoneOptionsResult?.results || [],
+    campaignOptions: campaignOptionsResult?.results || [],
     rows
   };
 };
@@ -338,26 +371,86 @@ const csvCell = (value) => {
   return `"${text.replaceAll('"', '""')}"`;
 };
 
-const zoneAnalyticsCsv = (analytics, from, to) => {
-  const milestoneHeaders = PLAYBACK_MILESTONES.map((milestone) => `${milestone}% plays`);
-  const header = ["From", "To", "Zone ID", "Sessions", "Plays", "Playback rate %", ...milestoneHeaders, "Bounces", "Bounce rate"];
-  const rows = (analytics?.rows || []).map((row) => {
-    const bounceRate = Number(row.sessions) > 0
-      ? (Number(row.bounces) / Number(row.sessions)) * 100
-      : 0;
-    return [
-      from,
-      to,
-      row.zone_id,
-      row.sessions,
-      row.plays,
-      (Number(row.sessions) > 0 ? (Number(row.plays) / Number(row.sessions)) * 100 : 0).toFixed(1),
-      ...PLAYBACK_MILESTONES.map((milestone) => row[`milestone_${milestone}`]),
-      row.bounces,
-      bounceRate.toFixed(1)
-    ];
+const RAW_EVENT_COLUMNS = [
+  "id",
+  "event_id",
+  "occurred_at",
+  "session_id",
+  "event_type",
+  "page_path",
+  "episode_id",
+  "episode_slug",
+  "episode_title",
+  "media_type",
+  "player_provider",
+  "playback_position_ms",
+  "playback_duration_ms",
+  "playback_percent",
+  "platform",
+  "referrer",
+  "country_code",
+  "zone_id",
+  "campaign_id",
+  "click_id",
+  "user_agent"
+];
+
+const rawEventsCsvResponse = (
+  request,
+  env,
+  { from, to, fromHour, toHour, fromTimestamp, toTimestamp },
+  requestedZone,
+  requestedCampaign
+) => {
+  const headers = {
+    "content-type": "text/csv;charset=UTF-8",
+    "content-disposition": `attachment; filename="site-events-${from}-${hourString(fromHour)}00-to-${to}-${hourString(toHour)}59.csv"`,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff"
+  };
+  if (request.method === "HEAD") return new Response(null, { headers });
+  if (!env.SITE_ANALYTICS) return new Response("SITE_ANALYTICS is unavailable.\r\n", { status: 503, headers });
+
+  const zoneFilter = validAttributionFilter(requestedZone);
+  const campaignFilter = validAttributionFilter(requestedCampaign);
+  const encoder = new TextEncoder();
+  let lastId = 0;
+  let headerPending = true;
+
+  const body = new ReadableStream({
+    async pull(controller) {
+      try {
+        const result = await env.SITE_ANALYTICS.prepare(`
+          SELECT ${RAW_EVENT_COLUMNS.join(", ")}
+          FROM site_events
+          WHERE occurred_at >= ?1 AND occurred_at < ?2
+            AND (?3 = '' OR zone_id = ?3)
+            AND (?4 = '' OR campaign_id = ?4)
+            AND id > ?5
+          ORDER BY id
+          LIMIT 1000
+        `).bind(fromTimestamp, toTimestamp, zoneFilter, campaignFilter, lastId).all();
+        const rows = result?.results || [];
+        const records = [];
+        if (headerPending) {
+          records.push(RAW_EVENT_COLUMNS.map(csvCell).join(","));
+          headerPending = false;
+        }
+        records.push(...rows.map((row) => RAW_EVENT_COLUMNS.map((column) => csvCell(row[column])).join(",")));
+        if (records.length) controller.enqueue(encoder.encode(`${records.join("\r\n")}\r\n`));
+        if (rows.length < 1000) {
+          controller.close();
+          return;
+        }
+        lastId = Number(rows.at(-1).id);
+      } catch (error) {
+        console.error("Unable to stream raw site analytics CSV", error);
+        controller.error(error);
+      }
+    }
   });
-  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+
+  return new Response(body, { headers });
 };
 
 const number = (value) => new Intl.NumberFormat("en-US").format(Number(value) || 0);
@@ -774,22 +867,42 @@ const siteAnalyticsPanel = (analytics) => {
   </section>`;
 };
 
-const statsTabs = (from, to, activeTab) => {
-  const overviewQuery = new URLSearchParams({ from, to });
-  const zonesQuery = new URLSearchParams({ tab: "zones", from, to });
+const statsRangeQuery = (from, to, fromHour, toHour, extra = {}) => new URLSearchParams({
+  ...extra,
+  from,
+  to,
+  fromhour: String(fromHour),
+  tohour: String(toHour)
+});
+
+const hourOptions = (selectedHour) => Array.from({ length: 24 }, (_, hour) => {
+  const label = `${hourString(hour)}:00 UTC`;
+  return `<option value="${hour}"${hour === selectedHour ? " selected" : ""}>${label}</option>`;
+}).join("");
+
+const statsRangeLabel = (from, to, fromHour, toHour) =>
+  `${from} ${hourString(fromHour)}:00 UTC through ${to} ${hourString(toHour)}:59 UTC`;
+
+const statsTabs = (from, to, fromHour, toHour, activeTab) => {
+  const overviewQuery = statsRangeQuery(from, to, fromHour, toHour);
+  const zonesQuery = statsRangeQuery(from, to, fromHour, toHour, { tab: "zones" });
   return `<nav class="tabs" aria-label="Statistics sections">
     <a href="/stats?${escapeHtml(overviewQuery)}"${activeTab === "overview" ? ' aria-current="page"' : ""}>Overview</a>
-    <a href="/stats?${escapeHtml(zonesQuery)}"${activeTab === "zones" ? ' aria-current="page"' : ""}>Zones</a>
+    <a href="/stats?${escapeHtml(zonesQuery)}"${activeTab === "zones" ? ' aria-current="page"' : ""}>Zones &amp; campaigns</a>
   </nav>`;
 };
 
-const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
+const zoneAnalyticsPanel = (analytics, from, to, fromHour, toHour, requestedPage = 1) => {
   if (!analytics) {
-    return '<section class="panel wide"><p class="kicker">Zone analytics</p><h2>D1 analytics unavailable</h2><p class="notice">The SITE_ANALYTICS database binding is not configured.</p></section>';
+    return '<section class="panel wide"><p class="kicker">Campaign analytics</p><h2>D1 analytics unavailable</h2><p class="notice">The SITE_ANALYTICS database binding is not configured.</p></section>';
   }
 
-  const exportQuery = new URLSearchParams({ tab: "zones", format: "csv", from, to });
+  const exportQuery = statsRangeQuery(from, to, fromHour, toHour, {
+    tab: "zones",
+    format: "csv"
+  });
   if (analytics.zoneFilter) exportQuery.set("zoneid", analytics.zoneFilter);
+  if (analytics.campaignFilter) exportQuery.set("campaignid", analytics.campaignFilter);
   const metricFilterParams = {
     minplays: analytics.filters?.minPlays,
     maxplays: analytics.filters?.maxPlays,
@@ -829,9 +942,13 @@ const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
   const totalPlaybackRate = totals.sessions > 0 ? (totals.plays / totals.sessions) * 100 : 0;
   const totalBounceRate = totals.sessions > 0 ? (totals.bounces / totals.sessions) * 100 : 0;
   const filterValue = (value) => value === null || value === undefined ? "" : String(value);
-  const optionRows = analytics.options.map((row) => {
+  const zoneOptionRows = analytics.zoneOptions.map((row) => {
     const zoneId = String(row.zone_id || "unattributed");
     return `<option value="${escapeHtml(zoneId)}"${zoneId === analytics.zoneFilter ? " selected" : ""}>${escapeHtml(zoneId)} (${number(row.sessions)} sessions)</option>`;
+  }).join("");
+  const campaignOptionRows = analytics.campaignOptions.map((row) => {
+    const campaignId = String(row.campaign_id || "unattributed");
+    return `<option value="${escapeHtml(campaignId)}"${campaignId === analytics.campaignFilter ? " selected" : ""}>${escapeHtml(campaignId)} (${number(row.sessions)} sessions)</option>`;
   }).join("");
   const milestoneHeaders = PLAYBACK_MILESTONES.map(
     (milestone) => `<th>${milestone}%</th>`
@@ -846,6 +963,7 @@ const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
     ).join("");
     return `<tr>
       <td><strong>${escapeHtml(row.zone_id || "unattributed")}</strong></td>
+      <td><strong>${escapeHtml(row.campaign_id || "unattributed")}</strong></td>
       <td>${number(sessions)}</td>
       <td>${number(row.plays)}</td>
       <td>${percent(playbackRate)}</td>
@@ -858,7 +976,7 @@ const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
     (milestone) => `<td>${number(totals.milestones[milestone])}</td>`
   ).join("");
   const totalsRow = totalRows > 0 ? `<tfoot><tr>
-    <th>Filtered totals (${number(totalRows)} zones)</th>
+    <th colspan="2">Filtered totals (${number(totalRows)} attribution rows)</th>
     <td>${number(totals.sessions)}</td>
     <td>${number(totals.plays)}</td>
     <td>${percent(totalPlaybackRate)}</td>
@@ -875,18 +993,21 @@ const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
   const lastShown = Math.min(pageStart + ZONE_RESULTS_PER_PAGE, totalRows);
   const pagination = totalPages > 1 ? `<nav class="pagination" aria-label="Zone result pages">
     ${currentPage > 1 ? `<a class="button secondary" href="${pageQuery(currentPage - 1)}">Previous</a>` : ""}
-    <span>Showing ${number(firstShown)}–${number(lastShown)} of ${number(totalRows)} zones · Page ${number(currentPage)} of ${number(totalPages)}</span>
+    <span>Showing ${number(firstShown)}–${number(lastShown)} of ${number(totalRows)} attribution rows · Page ${number(currentPage)} of ${number(totalPages)}</span>
     ${currentPage < totalPages ? `<a class="button secondary" href="${pageQuery(currentPage + 1)}">Next</a>` : ""}
-  </nav>` : `<p>Showing ${number(totalRows)} filtered zone${totalRows === 1 ? "" : "s"}.</p>`;
+  </nav>` : `<p>Showing ${number(totalRows)} filtered attribution row${totalRows === 1 ? "" : "s"}.</p>`;
 
   return `<section class="panel wide">
-    <p class="kicker">Zone analytics</p><h2>Playback performance by zone</h2>
-    <p>Each valid <code>zoneid</code> query parameter is retained for the browser session. A bounce is a session with a recorded episode listen-page view and no audio playback start in the selected range.</p>
+    <p class="kicker">Campaign analytics</p><h2>Playback performance by zone and campaign</h2>
+    <p>Each valid <code>zoneid</code> and <code>campaignid</code> query parameter is retained for the browser session. A bounce is a session with a recorded episode listen-page view and no audio playback start in the selected range.</p>
     <form class="filter" method="get" action="/stats">
       <input type="hidden" name="tab" value="zones">
       <label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label>
+      <label>From hour<select name="fromhour">${hourOptions(fromHour)}</select></label>
       <label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label>
-      <label>Zone<select name="zoneid"><option value="">All zones</option>${optionRows}</select></label>
+      <label>To hour<select name="tohour">${hourOptions(toHour)}</select></label>
+      <label>Zone<select name="zoneid"><option value="">All zones</option>${zoneOptionRows}</select></label>
+      <label>Campaign<select name="campaignid"><option value="">All campaigns</option>${campaignOptionRows}</select></label>
       <label>Minimum plays<input type="number" name="minplays" min="0" step="1" value="${escapeHtml(filterValue(analytics.filters?.minPlays))}" placeholder="0"></label>
       <label>Maximum plays<input type="number" name="maxplays" min="0" step="1" value="${escapeHtml(filterValue(analytics.filters?.maxPlays))}" placeholder="Any"></label>
       <label>Minimum bounce %<input type="number" name="minbounce" min="0" max="100" step="0.1" value="${escapeHtml(filterValue(analytics.filters?.minBounce))}" placeholder="0"></label>
@@ -894,13 +1015,13 @@ const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
       <label>Minimum playback rate %<input type="number" name="minplayback" min="0" max="100" step="0.1" value="${escapeHtml(filterValue(analytics.filters?.minPlayback))}" placeholder="0"></label>
       <label>Maximum playback rate %<input type="number" name="maxplayback" min="0" max="100" step="0.1" value="${escapeHtml(filterValue(analytics.filters?.maxPlayback))}" placeholder="100"></label>
       <button class="button" type="submit">Apply filters</button>
-      <a class="button secondary" href="/stats?${escapeHtml(new URLSearchParams({ tab: "zones", from, to }))}">Clear filters</a>
-      <a class="button secondary" href="/stats?${escapeHtml(exportQuery)}">Export CSV</a>
+      <a class="button secondary" href="/stats?${escapeHtml(statsRangeQuery(from, to, fromHour, toHour, { tab: "zones" }))}">Clear filters</a>
+      <a class="button secondary" href="/stats?${escapeHtml(exportQuery)}">Export raw events CSV</a>
     </form>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Zone ID</th><th>Sessions</th><th>Plays</th><th>Playback rate</th>${milestoneHeaders}<th>Bounces</th><th>Bounce rate</th></tr></thead>
-        <tbody>${zoneRows || `<tr><td colspan="${6 + PLAYBACK_MILESTONES.length}">No zone activity in this range.</td></tr>`}</tbody>
+        <thead><tr><th>Zone ID</th><th>Campaign ID</th><th>Sessions</th><th>Plays</th><th>Playback rate</th>${milestoneHeaders}<th>Bounces</th><th>Bounce rate</th></tr></thead>
+        <tbody>${zoneRows || `<tr><td colspan="${7 + PLAYBACK_MILESTONES.length}">No campaign activity in this range.</td></tr>`}</tbody>
         ${totalsRow}
       </table>
     </div>
@@ -908,14 +1029,14 @@ const zoneAnalyticsPanel = (analytics, from, to, requestedPage = 1) => {
   </section>`;
 };
 
-const zonesDashboardPage = ({ analytics, from, to, page }) => layout("Zone analytics | The Last Known", `
+const zonesDashboardPage = ({ analytics, from, to, fromHour, toHour, page }) => layout("Zone and campaign analytics | The Last Known", `
   <nav class="nav" aria-label="Admin navigation"><a href="/">Site</a><a href="/admin/content">Episode content</a><a href="${DASHBOARD_PATH}">Spreaker admin</a></nav>
-  <section class="hero"><p class="kicker">First-party analytics</p><h1>Zone tracking</h1><p>${escapeHtml(from)} through ${escapeHtml(to)}</p></section>
-  ${statsTabs(from, to, "zones")}
-  ${zoneAnalyticsPanel(analytics, from, to, page)}
+  <section class="hero"><p class="kicker">First-party analytics</p><h1>Zone and campaign tracking</h1><p>${escapeHtml(statsRangeLabel(from, to, fromHour, toHour))}</p></section>
+  ${statsTabs(from, to, fromHour, toHour, "zones")}
+  ${zoneAnalyticsPanel(analytics, from, to, fromHour, toHour, page)}
 `);
 
-const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, siteAnalytics, from, to, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
+const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, siteAnalytics, from, to, fromHour, toHour, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
   const totals = overall?.statistics || {};
   const last30Totals = sumPlayStats(last30Plays?.statistics);
   const last30Value = (key) => (last30Plays ? number(last30Totals[key]) : "—");
@@ -928,10 +1049,10 @@ const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes,
 
   return layout(`Spreaker dashboard | ${showData.title || "The Last Known"}`, `
     <nav class="nav" aria-label="Admin navigation"><a href="/">Site</a><a href="/admin/content">Episode content</a><a href="${FEED_URL}">RSS feed</a></nav>
-    <section class="hero"><div class="hero-row"><div class="show">${showData.image_url ? `<img class="cover" src="${escapeHtml(showData.image_url)}" alt="">` : ""}<div><p class="kicker">Spreaker analytics</p><h1>${escapeHtml(showData.title || "The Last Known")}</h1><p>Show ${SHOW_ID} · ${escapeHtml(from)} through ${escapeHtml(to)}</p></div></div><div class="nav"><a class="button secondary" href="${escapeHtml(showData.site_url || `https://www.spreaker.com/show/${SHOW_ID}`)}">Open in Spreaker</a><a class="button secondary" href="${DASHBOARD_PATH}/connect">Reconnect</a></div></div></section>
-    ${statsPath === "/stats" ? statsTabs(from, to, "overview") : ""}
+    <section class="hero"><div class="hero-row"><div class="show">${showData.image_url ? `<img class="cover" src="${escapeHtml(showData.image_url)}" alt="">` : ""}<div><p class="kicker">Spreaker analytics</p><h1>${escapeHtml(showData.title || "The Last Known")}</h1><p>Show ${SHOW_ID} · ${escapeHtml(statsPath === "/stats" ? statsRangeLabel(from, to, fromHour, toHour) : `${from} through ${to}`)}</p></div></div><div class="nav"><a class="button secondary" href="${escapeHtml(showData.site_url || `https://www.spreaker.com/show/${SHOW_ID}`)}">Open in Spreaker</a><a class="button secondary" href="${DASHBOARD_PATH}/connect">Reconnect</a></div></div></section>
+    ${statsPath === "/stats" ? statsTabs(from, to, fromHour, toHour, "overview") : ""}
     ${warning ? `<p class="notice error">${escapeHtml(warning)}</p>` : ""}
-    <section class="panel"><form class="filter" method="get" action="${escapeHtml(statsPath)}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label><label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label><button class="button" type="submit">Update range</button></form></section>
+    <section class="panel"><form class="filter" method="get" action="${escapeHtml(statsPath)}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label>${statsPath === "/stats" ? `<label>From hour<select name="fromhour">${hourOptions(fromHour)}</select></label>` : ""}<label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label>${statsPath === "/stats" ? `<label>To hour<select name="tohour">${hourOptions(toHour)}</select></label>` : ""}<button class="button" type="submit">Update range</button></form>${statsPath === "/stats" ? "<p>Hour filters use UTC and apply to first-party site analytics. Spreaker and monetization statistics remain date-based.</p>" : ""}</section>
     ${siteAnalyticsPanel(siteAnalytics)}
     <section class="panel"><p class="kicker">At a glance</p><div class="metrics"><div class="metric"><span>All-time plays</span><strong>${number(totals.plays_count)}</strong></div><div class="metric"><span>All-time downloads</span><strong>${number(totals.downloads_count)}</strong></div><div class="metric"><span>Episodes</span><strong>${number(totals.episodes_count)}</strong></div><div class="metric"><span>Daily listeners total</span><strong>${number(totalListeners)}</strong></div></div><h2>Podcast statistics</h2><div class="table-wrap"><table><thead><tr><th>Metric</th><th>All time</th><th>Last 30 days</th></tr></thead><tbody><tr><td>Total plays</td><td>${number(totals.plays_count)}</td><td>${last30Value("plays_count")}</td></tr><tr><td>On-demand plays</td><td>${number(totals.plays_ondemand_count)}</td><td>${last30Value("plays_ondemand_count")}</td></tr><tr><td>Live plays</td><td>${number(totals.plays_live_count)}</td><td>${last30Value("plays_live_count")}</td></tr><tr><td>Downloads</td><td>${number(totals.downloads_count)}</td><td>${last30Value("downloads_count")}</td></tr></tbody></table></div></section>
     <div class="grid">
@@ -1053,14 +1174,26 @@ export const handleSpreakerMonetizationUpload = async (request, env) => {
 };
 
 export const handleSpreakerDashboard = async (request, env, url) => {
-  const { from, to } = dashboardDates(url);
+  const range = dashboardDates(url);
+  const { from, to, fromHour, toHour, fromTimestamp, toTimestamp } = range;
   const isZonesTab = url.pathname === "/stats" && url.searchParams.get("tab") === "zones";
   if (isZonesTab) {
+    const isCsvExport = url.searchParams.get("format") === "csv";
+    if (isCsvExport) {
+      return rawEventsCsvResponse(
+        request,
+        env,
+        range,
+        url.searchParams.get("zoneid"),
+        url.searchParams.get("campaignid")
+      );
+    }
     const zoneAnalytics = await zoneAnalyticsForRange(
       env,
-      from,
-      to,
+      fromTimestamp,
+      toTimestamp,
       url.searchParams.get("zoneid"),
+      url.searchParams.get("campaignid"),
       {
         minPlays: url.searchParams.get("minplays"),
         maxPlays: url.searchParams.get("maxplays"),
@@ -1074,24 +1207,12 @@ export const handleSpreakerDashboard = async (request, env, url) => {
       return null;
     });
 
-    if (url.searchParams.get("format") === "csv") {
-      return new Response(
-        request.method === "HEAD" ? null : zoneAnalyticsCsv(zoneAnalytics, from, to),
-        {
-          headers: {
-            "content-type": "text/csv;charset=UTF-8",
-            "content-disposition": `attachment; filename="zone-analytics-${from}-to-${to}.csv"`,
-            "cache-control": "no-store",
-            "x-content-type-options": "nosniff"
-          }
-        }
-      );
-    }
-
     return responseHtml(request, zonesDashboardPage({
       analytics: zoneAnalytics,
       from,
       to,
+      fromHour,
+      toHour,
       page: url.searchParams.get("page")
     }));
   }
@@ -1133,7 +1254,7 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     safe(`/shows/${SHOW_ID}/statistics/devices?${query}&precision=1`),
     safe(`/shows/${SHOW_ID}/statistics/geographics?${query}&precision=1`),
     jsonFromR2(env, MONETIZATION_KEY).catch(() => null),
-    siteAnalyticsForRange(env, from, to).catch((error) => {
+    siteAnalyticsForRange(env, fromTimestamp, toTimestamp).catch((error) => {
       console.error("Unable to load D1 site analytics", error);
       return null;
     })
@@ -1156,6 +1277,8 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     siteAnalytics,
     from,
     to,
+    fromHour,
+    toHour,
     warning,
     uploadMessage:
       url.searchParams.get("monetization") === "imported"

@@ -11,6 +11,7 @@ const STATE_PREFIX = "private/spreaker/oauth-state/";
 const MAX_MONETIZATION_CSV_BYTES = 5 * 1024 * 1024;
 const PLAYBACK_MILESTONES = [10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100];
 const ZONE_RESULTS_PER_PAGE = 25;
+const LIVE_CHART_MAX_POINTS = 72;
 
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -135,9 +136,100 @@ const dashboardDates = (url) => {
   return { from, to, fromHour, toHour, fromTimestamp, toTimestamp };
 };
 
-const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp) => {
+const liveBucketSeconds = (rangeSeconds) => {
+  const choices = [60, 5 * 60, 15 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60, 7 * 24 * 60 * 60];
+  return choices.find((seconds) => Math.ceil(rangeSeconds / seconds) <= LIVE_CHART_MAX_POINTS)
+    || choices.at(-1);
+};
+
+const liveAnalyticsForRange = async (
+  env,
+  fromTimestamp,
+  toTimestamp,
+  requestedZone = "",
+  requestedCampaign = ""
+) => {
   if (!env.SITE_ANALYTICS) return null;
-  const range = [fromTimestamp, toTimestamp];
+
+  const zoneFilter = validAttributionFilter(requestedZone);
+  const campaignFilter = validAttributionFilter(requestedCampaign);
+  const requestedFrom = Date.parse(fromTimestamp);
+  const requestedTo = Date.parse(toTimestamp);
+  const now = Date.now();
+  const effectiveTo = requestedFrom <= now && requestedTo > now ? now : requestedTo;
+  const rangeSeconds = Math.max(60, Math.ceil((effectiveTo - requestedFrom) / 1000));
+  const bucketSeconds = liveBucketSeconds(rangeSeconds);
+  const bucketStart = Math.floor(requestedFrom / 1000 / bucketSeconds) * bucketSeconds;
+  const bucketEnd = Math.floor(Math.max(requestedFrom, effectiveTo - 1) / 1000 / bucketSeconds) * bucketSeconds;
+  const effectiveToTimestamp = new Date(effectiveTo).toISOString();
+  const [result, summaryResult] = await env.SITE_ANALYTICS.batch([
+    env.SITE_ANALYTICS.prepare(`
+      SELECT
+        CAST(CAST(strftime('%s', occurred_at) AS INTEGER) / ?5 AS INTEGER) * ?5 AS bucket_unix,
+        COUNT(DISTINCT CASE
+          WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%'
+          THEN session_id
+        END) AS sessions,
+        SUM(CASE WHEN event_type IN ('audio_play', 'video_play') THEN 1 ELSE 0 END) AS plays
+      FROM site_events
+      WHERE occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR zone_id = ?3)
+        AND (?4 = '' OR campaign_id = ?4)
+      GROUP BY bucket_unix
+      ORDER BY bucket_unix
+    `).bind(fromTimestamp, effectiveToTimestamp, zoneFilter, campaignFilter, bucketSeconds),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT
+        COUNT(DISTINCT CASE
+          WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%'
+          THEN session_id
+        END) AS sessions,
+        SUM(CASE WHEN event_type IN ('audio_play', 'video_play') THEN 1 ELSE 0 END) AS plays
+      FROM site_events
+      WHERE occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR zone_id = ?3)
+        AND (?4 = '' OR campaign_id = ?4)
+    `).bind(fromTimestamp, effectiveToTimestamp, zoneFilter, campaignFilter)
+  ]);
+  const rowsByBucket = new Map(
+    (result.results || []).map((row) => [Number(row.bucket_unix), row])
+  );
+  const points = [];
+
+  for (let bucket = bucketStart; bucket <= bucketEnd; bucket += bucketSeconds) {
+    const row = rowsByBucket.get(bucket) || {};
+    const sessions = Number(row.sessions) || 0;
+    const plays = Number(row.plays) || 0;
+    points.push({
+      timestamp: new Date(bucket * 1000).toISOString(),
+      sessions,
+      plays,
+      playbackRate: sessions > 0 ? Math.round((plays / sessions) * 1000) / 10 : 0
+    });
+  }
+
+  const summary = summaryResult.results?.[0] || {};
+  const totalSessions = Number(summary.sessions) || 0;
+  const totalPlays = Number(summary.plays) || 0;
+  return {
+    updatedAt: new Date().toISOString(),
+    bucketSeconds,
+    zoneFilter,
+    campaignFilter,
+    points,
+    currentSessions: points.at(-1)?.sessions || 0,
+    totalSessions,
+    totalPlays,
+    overallPlaybackRate: totalSessions > 0
+      ? Math.round((totalPlays / totalSessions) * 1000) / 10
+      : 0
+  };
+};
+
+const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp, requestedCampaign = "") => {
+  if (!env.SITE_ANALYTICS) return null;
+  const campaignFilter = validAttributionFilter(requestedCampaign);
+  const range = [fromTimestamp, toTimestamp, campaignFilter];
   const results = await env.SITE_ANALYTICS.batch([
     env.SITE_ANALYTICS.prepare(`
       SELECT
@@ -149,7 +241,9 @@ const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp) => {
         SUM(CASE WHEN event_type = 'episode_link_click' THEN 1 ELSE 0 END) AS platform_clicks,
         COUNT(DISTINCT CASE WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%' THEN session_id END) AS listen_page_visitors,
         COUNT(DISTINCT CASE WHEN event_type = 'episode_link_click' THEN session_id END) AS platform_clickers
-      FROM site_events WHERE occurred_at >= ?1 AND occurred_at < ?2
+      FROM site_events
+      WHERE occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR campaign_id = ?3)
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT COALESCE(SUM(max_position_ms), 0) AS listening_ms,
@@ -160,6 +254,7 @@ const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp) => {
                MAX(playback_percent) AS max_percent
         FROM site_events
         WHERE occurred_at >= ?1 AND occurred_at < ?2
+          AND (?3 = '' OR campaign_id = ?3)
           AND media_type IN ('audio', 'video')
         GROUP BY session_id, episode_id
       )
@@ -169,6 +264,7 @@ const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp) => {
              COUNT(DISTINCT session_id) AS visitors
       FROM site_events
       WHERE event_type = 'page_view' AND occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY page_path ORDER BY views DESC LIMIT 15
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
@@ -178,19 +274,22 @@ const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp) => {
              MAX(playback_percent) AS max_percent,
              SUM(CASE WHEN event_type IN ('audio_ended', 'video_ended') THEN 1 ELSE 0 END) AS completions
       FROM site_events
-      WHERE occurred_at >= ?1 AND occurred_at < ?2 AND episode_id <> ''
+      WHERE occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR campaign_id = ?3) AND episode_id <> ''
       GROUP BY episode_id, episode_title ORDER BY plays DESC, listeners DESC LIMIT 20
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT platform, COUNT(*) AS clicks
       FROM site_events
       WHERE event_type = 'episode_link_click' AND occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY platform ORDER BY clicks DESC
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT country_code, COUNT(DISTINCT session_id) AS visitors
       FROM site_events
       WHERE event_type = 'page_view' AND occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY country_code ORDER BY visitors DESC LIMIT 20
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
@@ -198,11 +297,23 @@ const siteAnalyticsForRange = async (env, fromTimestamp, toTimestamp) => {
              COUNT(DISTINCT session_id) AS visitors
       FROM site_events
       WHERE event_type = 'page_view' AND occurred_at >= ?1 AND occurred_at < ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY referrer ORDER BY visitors DESC LIMIT 15
-    `).bind(...range)
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT campaign_id,
+             COUNT(DISTINCT CASE
+               WHEN event_type = 'page_view' THEN session_id
+             END) AS visitors
+      FROM site_events
+      GROUP BY campaign_id
+      ORDER BY CASE WHEN campaign_id = 'unattributed' THEN 1 ELSE 0 END, campaign_id
+    `)
   ]);
 
   return {
+    campaignFilter,
+    campaignOptions: results[7]?.results || [],
     summary: results[0]?.results?.[0] || {},
     playback: results[1]?.results?.[0] || {},
     pages: results[2]?.results || [],
@@ -281,10 +392,9 @@ const zoneAnalyticsForRange = async (
                THEN session_id
              END) AS sessions
       FROM site_events
-      WHERE occurred_at >= ?1 AND occurred_at < ?2
       GROUP BY campaign_id
       ORDER BY CASE WHEN campaign_id = 'unattributed' THEN 1 ELSE 0 END, campaign_id
-    `).bind(fromTimestamp, toTimestamp),
+    `),
     env.SITE_ANALYTICS.prepare(`
       WITH filtered AS (
         SELECT zone_id, campaign_id, session_id, episode_id, event_type, page_path, playback_percent
@@ -692,9 +802,35 @@ const layout = (title, body) => `<!doctype html>
     .downloads { fill:none; stroke:var(--rust); stroke-width:4; stroke-linecap:round; stroke-linejoin:round; }
     .legend { display:flex; flex-wrap:wrap; gap:18px; margin:14px 0; color:var(--muted); font-size:.86rem; font-weight:800; }
     .legend i { display:inline-block; width:24px; height:4px; margin-right:7px; vertical-align:middle; border-radius:4px; }
+    .live-panel { position:relative; overflow:hidden; border-color:#253b37; background:#071612; color:#eefcf5; box-shadow:0 20px 45px rgba(7,22,18,.18); }
+    .live-panel::after { position:absolute; inset:0; background:linear-gradient(rgba(93,255,179,.028) 1px,transparent 1px); background-size:100% 4px; content:""; pointer-events:none; }
+    .live-panel > * { position:relative; z-index:1; }
+    .live-head { display:flex; align-items:flex-start; justify-content:space-between; gap:20px; }
+    .live-panel .kicker { color:#5dffb3; }
+    .live-panel h2 { color:#f4fff9; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:1.55rem; letter-spacing:-.04em; }
+    .live-status { display:flex; align-items:center; gap:8px; color:#9ab8aa; font-size:.78rem; font-weight:850; letter-spacing:.08em; text-transform:uppercase; white-space:nowrap; }
+    .live-dot { width:8px; height:8px; border-radius:50%; background:#5dffb3; box-shadow:0 0 0 5px rgba(93,255,179,.11),0 0 18px rgba(93,255,179,.65); }
+    .live-summary { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; margin:22px 0 12px; border:1px solid #234139; background:#234139; }
+    .live-quote { padding:17px 19px; background:#0a1e18; }
+    .live-quote span { display:block; color:#88a99a; font:750 .76rem/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; letter-spacing:.08em; text-transform:uppercase; }
+    .live-quote strong { display:block; margin-top:7px; color:#f3fff9; font:800 clamp(1.9rem,5vw,3rem)/1 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; letter-spacing:-.07em; }
+    .live-quote small { margin-left:8px; color:#5dffb3; font-size:.72rem; letter-spacing:.04em; }
+    .market-chart { position:relative; min-height:360px; border:1px solid #1f3931; background:linear-gradient(180deg,rgba(20,57,45,.58),rgba(7,22,18,.22)); }
+    .market-chart svg { display:block; width:100%; height:360px; }
+    .market-chart .market-grid { stroke:#19372e; stroke-width:1; }
+    .market-chart .sessions-area { fill:url(#sessionsGlow); }
+    .market-chart .sessions-line { fill:none; stroke:#5dffb3; stroke-width:3; vector-effect:non-scaling-stroke; }
+    .market-chart .rate-line { fill:none; stroke:#ffb86b; stroke-width:2.5; vector-effect:non-scaling-stroke; }
+    .market-chart .market-axis { fill:#769487; font:11px ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+    .market-empty { display:grid; min-height:360px; place-items:center; padding:30px; color:#88a99a; text-align:center; }
+    .market-legend { display:flex; flex-wrap:wrap; justify-content:space-between; gap:12px 24px; margin-top:13px; color:#88a99a; font:700 .78rem/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+    .market-legend span { display:inline-flex; align-items:center; gap:8px; }
+    .market-swatch { width:22px; height:3px; border-radius:3px; background:#5dffb3; }
+    .market-swatch.rate { background:#ffb86b; }
+    .live-error .live-dot { background:#ff7d73; box-shadow:0 0 0 5px rgba(255,125,115,.1); }
     .notice { padding:14px 16px; border-left:4px solid var(--teal); background:#e6efed; color:var(--ink); }
     .error { border-left-color:var(--rust); background:#f5e5e2; }
-    @media (max-width:760px) { .grid { grid-template-columns:1fr; } .hero-row,.show { align-items:flex-start; flex-direction:column; } .cover { width:80px; height:80px; } }
+    @media (max-width:760px) { .grid { grid-template-columns:1fr; } .hero-row,.show,.live-head { align-items:flex-start; flex-direction:column; } .cover { width:80px; height:80px; } .live-summary { grid-template-columns:1fr; } .market-chart,.market-chart svg,.market-empty { min-height:300px; height:300px; } }
   </style>
 </head>
 <body><main class="shell">${body}</main></body>
@@ -709,6 +845,18 @@ const responseHtml = (request, body, status = 200) =>
       "x-robots-tag": "noindex, nofollow"
     }
   });
+
+const responseJson = (request, body, status = 200) =>
+  new Response(request.method === "HEAD" ? null : JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json;charset=UTF-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff"
+    }
+  });
+
+const jsonForScript = (value) => JSON.stringify(value).replaceAll("<", "\\u003c");
 
 const chart = (rows) => {
   if (!rows?.length) return '<p class="notice">No daily statistics were returned for this range.</p>';
@@ -729,6 +877,108 @@ const chart = (rows) => {
   const labels = labelIndexes.map((index) => `<text class="axis" x="${x(index).toFixed(1)}" y="${height - 16}" text-anchor="middle">${escapeHtml(rows[index].date)}</text>`).join("");
 
   return `<div class="legend"><span><i style="background:var(--teal)"></i>Plays</span><span><i style="background:var(--rust)"></i>Downloads</span></div><div class="chart-wrap"><svg class="chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Daily plays and downloads">${ticks}${labels}<path class="plays" d="${path("plays_count")}"/><path class="downloads" d="${path("downloads_count")}"/></svg></div>`;
+};
+
+const liveRangeLabel = (bucketSeconds) => {
+  if (bucketSeconds < 60 * 60) return `${bucketSeconds / 60}m intervals`;
+  if (bucketSeconds < 24 * 60 * 60) return `${bucketSeconds / 3600}h intervals`;
+  return `${bucketSeconds / 86400}d intervals`;
+};
+
+const liveTrackerPanel = (analytics, from, to, fromHour, toHour, filters = {}) => {
+  if (!analytics) {
+    return '<section class="panel wide"><p class="kicker">Live pulse</p><h2>Real-time analytics unavailable</h2><p class="notice">The SITE_ANALYTICS database binding is not configured.</p></section>';
+  }
+  const query = statsRangeQuery(from, to, fromHour, toHour);
+  if (filters.zoneFilter) query.set("zoneid", filters.zoneFilter);
+  if (filters.campaignFilter) query.set("campaignid", filters.campaignFilter);
+  const endpoint = `/stats/realtime?${query}`;
+  const filterLabels = [
+    filters.zoneFilter ? `Zone ${filters.zoneFilter}` : "All zones",
+    filters.campaignFilter ? `Campaign ${filters.campaignFilter}` : "All campaigns"
+  ];
+
+  return `<section class="panel wide live-panel" data-live-tracker data-endpoint="${escapeHtml(endpoint)}">
+    <div class="live-head"><div><p class="kicker">Live pulse</p><h2>Session &amp; playback ticker</h2></div><div class="live-status" data-live-status data-interval="${escapeHtml(liveRangeLabel(analytics.bucketSeconds))}"><span class="live-dot"></span><span>Live · ${escapeHtml(liveRangeLabel(analytics.bucketSeconds))}</span></div></div>
+    <div class="live-summary">
+      <div class="live-quote"><span>Current sessions</span><strong data-current-sessions>${number(analytics.currentSessions)}</strong></div>
+      <div class="live-quote"><span>Overall playback rate</span><strong data-playback-rate>${percent(analytics.overallPlaybackRate)}<small>PLAYS / SESSION</small></strong></div>
+    </div>
+    <div class="market-chart" data-market-chart aria-label="Sessions and playback rate over the selected range"></div>
+    <div class="market-legend"><span><i class="market-swatch"></i>Sessions</span><span><i class="market-swatch rate"></i>Playback rate</span><span>${escapeHtml(filterLabels.join(" · "))} · UTC · refreshes every 15s</span></div>
+    <script type="application/json" data-live-initial>${jsonForScript(analytics)}</script>
+    <script>
+      (() => {
+        const root = document.currentScript.closest('[data-live-tracker]');
+        if (!root || root.dataset.liveReady) return;
+        root.dataset.liveReady = 'true';
+        const chart = root.querySelector('[data-market-chart]');
+        const status = root.querySelector('[data-live-status]');
+        const sessionsValue = root.querySelector('[data-current-sessions]');
+        const rateValue = root.querySelector('[data-playback-rate]');
+        const initial = JSON.parse(root.querySelector('[data-live-initial]').textContent);
+        const formatNumber = new Intl.NumberFormat('en-US');
+        const escapeText = (value) => String(value).replace(/[&<>"']/g, (character) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[character]));
+        const labelFor = (timestamp, span) => new Intl.DateTimeFormat('en-US', span > 172800000
+          ? { month:'short', day:'numeric', timeZone:'UTC' }
+          : { hour:'numeric', minute:'2-digit', hour12:false, timeZone:'UTC' }).format(new Date(timestamp));
+        const linePath = (points, x, y, field) => points.map((point, index) => (index ? 'L' : 'M') + x(index).toFixed(1) + ' ' + y(point[field]).toFixed(1)).join(' ');
+
+        function render(data) {
+          const points = Array.isArray(data.points) ? data.points : [];
+          sessionsValue.textContent = formatNumber.format(Number(data.currentSessions) || 0);
+          rateValue.innerHTML = (Number(data.overallPlaybackRate) || 0).toFixed(1) + '%<small>PLAYS / SESSION</small>';
+          if (!points.length) {
+            chart.innerHTML = '<div class="market-empty">No session activity in this filtered range.</div>';
+            return;
+          }
+          const width = 1040;
+          const height = 360;
+          const pad = { top:24, right:58, bottom:48, left:50 };
+          const plotWidth = width - pad.left - pad.right;
+          const plotHeight = height - pad.top - pad.bottom;
+          const sessionsMax = Math.max(1, ...points.map((point) => Number(point.sessions) || 0));
+          const rateMax = Math.max(100, ...points.map((point) => Number(point.playbackRate) || 0));
+          const x = (index) => pad.left + (index / Math.max(1, points.length - 1)) * plotWidth;
+          const sessionY = (value) => pad.top + (1 - (Number(value) || 0) / sessionsMax) * plotHeight;
+          const rateY = (value) => pad.top + (1 - (Number(value) || 0) / rateMax) * plotHeight;
+          const sessionsPath = linePath(points, x, sessionY, 'sessions');
+          const ratePath = linePath(points, x, rateY, 'playbackRate');
+          const areaPath = sessionsPath + ' L' + x(points.length - 1).toFixed(1) + ' ' + (height - pad.bottom) + ' L' + x(0).toFixed(1) + ' ' + (height - pad.bottom) + ' Z';
+          const ticks = [0, .25, .5, .75, 1].map((ratio) => {
+            const y = pad.top + (1 - ratio) * plotHeight;
+            return '<line class="market-grid" x1="' + pad.left + '" y1="' + y + '" x2="' + (width - pad.right) + '" y2="' + y + '"/>'
+              + '<text class="market-axis" x="' + (pad.left - 9) + '" y="' + (y + 4) + '" text-anchor="end">' + Math.round(sessionsMax * ratio) + '</text>'
+              + '<text class="market-axis" x="' + (width - pad.right + 9) + '" y="' + (y + 4) + '">' + Math.round(rateMax * ratio) + '%</text>';
+          }).join('');
+          const indexes = [...new Set([0, Math.floor((points.length - 1) / 2), points.length - 1])];
+          const span = Date.parse(points.at(-1).timestamp) - Date.parse(points[0].timestamp);
+          const labels = indexes.map((index) => '<text class="market-axis" x="' + x(index) + '" y="' + (height - 17) + '" text-anchor="middle">' + escapeText(labelFor(points[index].timestamp, span)) + '</text>').join('');
+          chart.innerHTML = '<svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="Sessions in green and playback rate in orange">'
+            + '<defs><linearGradient id="sessionsGlow" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5dffb3" stop-opacity=".28"/><stop offset="1" stop-color="#5dffb3" stop-opacity="0"/></linearGradient></defs>'
+            + ticks + labels + '<path class="sessions-area" d="' + areaPath + '"/><path class="sessions-line" d="' + sessionsPath + '"/><path class="rate-line" d="' + ratePath + '"/></svg>';
+        }
+
+        async function refresh() {
+          if (document.hidden) return;
+          try {
+            const response = await fetch(root.dataset.endpoint, { headers:{ accept:'application/json' }, cache:'no-store' });
+            if (!response.ok) throw new Error('Live analytics request failed');
+            const data = await response.json();
+            render(data);
+            status.classList.remove('live-error');
+            status.innerHTML = '<span class="live-dot"></span><span>Live · ' + escapeText(status.dataset.interval) + ' · ' + escapeText(new Date(data.updatedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})) + '</span>';
+          } catch {
+            status.classList.add('live-error');
+            status.innerHTML = '<span class="live-dot"></span><span>Reconnecting</span>';
+          }
+        }
+
+        render(initial);
+        window.setInterval(refresh, 15000);
+      })();
+    </script>
+  </section>`;
 };
 
 const rankedTable = (items, valueKey, empty, formatter = number) =>
@@ -846,7 +1096,7 @@ const siteAnalyticsPanel = (analytics) => {
 
   return `<section class="panel wide">
     <p class="kicker">First-party site analytics</p><h2>Website engagement</h2>
-    <p>Anonymous browser-session activity recorded in D1 for the selected date range.</p>
+    <p>Anonymous browser-session activity recorded in D1 for the selected date range${analytics.campaignFilter ? ` and campaign <code>${escapeHtml(analytics.campaignFilter)}</code>` : ""}.</p>
     <div class="metrics">
       <div class="metric"><span>Page views</span><strong>${number(summary.page_views)}</strong></div>
       <div class="metric"><span>Visitors</span><strong>${number(summary.visitors)}</strong></div>
@@ -883,9 +1133,10 @@ const hourOptions = (selectedHour) => Array.from({ length: 24 }, (_, hour) => {
 const statsRangeLabel = (from, to, fromHour, toHour) =>
   `${from} ${hourString(fromHour)}:00 UTC through ${to} ${hourString(toHour)}:59 UTC`;
 
-const statsTabs = (from, to, fromHour, toHour, activeTab) => {
-  const overviewQuery = statsRangeQuery(from, to, fromHour, toHour);
-  const zonesQuery = statsRangeQuery(from, to, fromHour, toHour, { tab: "zones" });
+const statsTabs = (from, to, fromHour, toHour, activeTab, campaignFilter = "") => {
+  const shared = campaignFilter ? { campaignid: campaignFilter } : {};
+  const overviewQuery = statsRangeQuery(from, to, fromHour, toHour, shared);
+  const zonesQuery = statsRangeQuery(from, to, fromHour, toHour, { ...shared, tab: "zones" });
   return `<nav class="tabs" aria-label="Statistics sections">
     <a href="/stats?${escapeHtml(overviewQuery)}"${activeTab === "overview" ? ' aria-current="page"' : ""}>Overview</a>
     <a href="/stats?${escapeHtml(zonesQuery)}"${activeTab === "zones" ? ' aria-current="page"' : ""}>Zones &amp; campaigns</a>
@@ -948,7 +1199,7 @@ const zoneAnalyticsPanel = (analytics, from, to, fromHour, toHour, requestedPage
   }).join("");
   const campaignOptionRows = analytics.campaignOptions.map((row) => {
     const campaignId = String(row.campaign_id || "unattributed");
-    return `<option value="${escapeHtml(campaignId)}"${campaignId === analytics.campaignFilter ? " selected" : ""}>${escapeHtml(campaignId)} (${number(row.sessions)} sessions)</option>`;
+    return `<option value="${escapeHtml(campaignId)}"${campaignId === analytics.campaignFilter ? " selected" : ""}>${escapeHtml(campaignId)} (${number(row.sessions)} sessions total)</option>`;
   }).join("");
   const milestoneHeaders = PLAYBACK_MILESTONES.map(
     (milestone) => `<th>${milestone}%</th>`
@@ -1029,14 +1280,15 @@ const zoneAnalyticsPanel = (analytics, from, to, fromHour, toHour, requestedPage
   </section>`;
 };
 
-const zonesDashboardPage = ({ analytics, from, to, fromHour, toHour, page }) => layout("Zone and campaign analytics | The Last Known", `
+const zonesDashboardPage = ({ analytics, liveAnalytics, from, to, fromHour, toHour, page }) => layout("Zone and campaign analytics | The Last Known", `
   <nav class="nav" aria-label="Admin navigation"><a href="/">Site</a><a href="/admin/content">Episode content</a><a href="${DASHBOARD_PATH}">Spreaker admin</a></nav>
   <section class="hero"><p class="kicker">First-party analytics</p><h1>Zone and campaign tracking</h1><p>${escapeHtml(statsRangeLabel(from, to, fromHour, toHour))}</p></section>
-  ${statsTabs(from, to, fromHour, toHour, "zones")}
+  ${statsTabs(from, to, fromHour, toHour, "zones", analytics?.campaignFilter)}
+  ${liveTrackerPanel(liveAnalytics, from, to, fromHour, toHour, analytics || {})}
   ${zoneAnalyticsPanel(analytics, from, to, fromHour, toHour, page)}
 `);
 
-const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, siteAnalytics, from, to, fromHour, toHour, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
+const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetization, siteAnalytics, liveAnalytics, from, to, fromHour, toHour, warning, uploadMessage, statsPath = DASHBOARD_PATH }) => {
   const totals = overall?.statistics || {};
   const last30Totals = sumPlayStats(last30Plays?.statistics);
   const last30Value = (key) => (last30Plays ? number(last30Totals[key]) : "—");
@@ -1046,13 +1298,28 @@ const dashboardPage = ({ show, overall, plays, last30Plays, listeners, episodes,
   const deviceRows = Array.isArray(devices?.statistics) ? devices.statistics : [];
   const countryRows = countries?.statistics?.country || [];
   const episodeRows = episodes?.items || [];
+  const campaignOptions = siteAnalytics?.campaignOptions || [];
+  const selectedCampaign = siteAnalytics?.campaignFilter || "";
+  const selectedCampaignIsListed = campaignOptions.some(
+    (row) => String(row.campaign_id || "unattributed") === selectedCampaign
+  );
+  const campaignOptionRows = [
+    ...(selectedCampaign && !selectedCampaignIsListed
+      ? [{ campaign_id: selectedCampaign, visitors: 0 }]
+      : []),
+    ...campaignOptions
+  ].map((row) => {
+    const campaignId = String(row.campaign_id || "unattributed");
+    return `<option value="${escapeHtml(campaignId)}"${campaignId === selectedCampaign ? " selected" : ""}>${escapeHtml(campaignId)} (${number(row.visitors)} visitors total)</option>`;
+  }).join("");
 
   return layout(`Spreaker dashboard | ${showData.title || "The Last Known"}`, `
     <nav class="nav" aria-label="Admin navigation"><a href="/">Site</a><a href="/admin/content">Episode content</a><a href="${FEED_URL}">RSS feed</a></nav>
     <section class="hero"><div class="hero-row"><div class="show">${showData.image_url ? `<img class="cover" src="${escapeHtml(showData.image_url)}" alt="">` : ""}<div><p class="kicker">Spreaker analytics</p><h1>${escapeHtml(showData.title || "The Last Known")}</h1><p>Show ${SHOW_ID} · ${escapeHtml(statsPath === "/stats" ? statsRangeLabel(from, to, fromHour, toHour) : `${from} through ${to}`)}</p></div></div><div class="nav"><a class="button secondary" href="${escapeHtml(showData.site_url || `https://www.spreaker.com/show/${SHOW_ID}`)}">Open in Spreaker</a><a class="button secondary" href="${DASHBOARD_PATH}/connect">Reconnect</a></div></div></section>
-    ${statsPath === "/stats" ? statsTabs(from, to, fromHour, toHour, "overview") : ""}
+    ${statsPath === "/stats" ? statsTabs(from, to, fromHour, toHour, "overview", siteAnalytics?.campaignFilter) : ""}
     ${warning ? `<p class="notice error">${escapeHtml(warning)}</p>` : ""}
-    <section class="panel"><form class="filter" method="get" action="${escapeHtml(statsPath)}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label>${statsPath === "/stats" ? `<label>From hour<select name="fromhour">${hourOptions(fromHour)}</select></label>` : ""}<label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label>${statsPath === "/stats" ? `<label>To hour<select name="tohour">${hourOptions(toHour)}</select></label>` : ""}<button class="button" type="submit">Update range</button></form>${statsPath === "/stats" ? "<p>Hour filters use UTC and apply to first-party site analytics. Spreaker and monetization statistics remain date-based.</p>" : ""}</section>
+    <section class="panel"><form class="filter" method="get" action="${escapeHtml(statsPath)}"><label>From<input type="date" name="from" value="${escapeHtml(from)}" required></label>${statsPath === "/stats" ? `<label>From hour<select name="fromhour">${hourOptions(fromHour)}</select></label>` : ""}<label>To<input type="date" name="to" value="${escapeHtml(to)}" required></label>${statsPath === "/stats" ? `<label>To hour<select name="tohour">${hourOptions(toHour)}</select></label><label>Campaign ID<select name="campaignid"><option value="">All campaigns</option>${campaignOptionRows}</select></label>` : ""}<button class="button" type="submit">Update filters</button>${statsPath === "/stats" && selectedCampaign ? `<a class="button secondary" href="/stats?${escapeHtml(statsRangeQuery(from, to, fromHour, toHour))}">Clear campaign</a>` : ""}</form>${statsPath === "/stats" ? "<p>Hour and campaign filters apply to first-party site analytics. Spreaker and monetization statistics remain date-based.</p>" : ""}</section>
+    ${statsPath === "/stats" ? liveTrackerPanel(liveAnalytics, from, to, fromHour, toHour, siteAnalytics || {}) : ""}
     ${siteAnalyticsPanel(siteAnalytics)}
     <section class="panel"><p class="kicker">At a glance</p><div class="metrics"><div class="metric"><span>All-time plays</span><strong>${number(totals.plays_count)}</strong></div><div class="metric"><span>All-time downloads</span><strong>${number(totals.downloads_count)}</strong></div><div class="metric"><span>Episodes</span><strong>${number(totals.episodes_count)}</strong></div><div class="metric"><span>Daily listeners total</span><strong>${number(totalListeners)}</strong></div></div><h2>Podcast statistics</h2><div class="table-wrap"><table><thead><tr><th>Metric</th><th>All time</th><th>Last 30 days</th></tr></thead><tbody><tr><td>Total plays</td><td>${number(totals.plays_count)}</td><td>${last30Value("plays_count")}</td></tr><tr><td>On-demand plays</td><td>${number(totals.plays_ondemand_count)}</td><td>${last30Value("plays_ondemand_count")}</td></tr><tr><td>Live plays</td><td>${number(totals.plays_live_count)}</td><td>${last30Value("plays_live_count")}</td></tr><tr><td>Downloads</td><td>${number(totals.downloads_count)}</td><td>${last30Value("downloads_count")}</td></tr></tbody></table></div></section>
     <div class="grid">
@@ -1188,27 +1455,40 @@ export const handleSpreakerDashboard = async (request, env, url) => {
         url.searchParams.get("campaignid")
       );
     }
-    const zoneAnalytics = await zoneAnalyticsForRange(
-      env,
-      fromTimestamp,
-      toTimestamp,
-      url.searchParams.get("zoneid"),
-      url.searchParams.get("campaignid"),
-      {
-        minPlays: url.searchParams.get("minplays"),
-        maxPlays: url.searchParams.get("maxplays"),
-        minBounce: url.searchParams.get("minbounce"),
-        maxBounce: url.searchParams.get("maxbounce"),
-        minPlayback: url.searchParams.get("minplayback"),
-        maxPlayback: url.searchParams.get("maxplayback")
-      }
-    ).catch((error) => {
-      console.error("Unable to load D1 zone analytics", error);
-      return null;
-    });
+    const [zoneAnalytics, liveAnalytics] = await Promise.all([
+      zoneAnalyticsForRange(
+        env,
+        fromTimestamp,
+        toTimestamp,
+        url.searchParams.get("zoneid"),
+        url.searchParams.get("campaignid"),
+        {
+          minPlays: url.searchParams.get("minplays"),
+          maxPlays: url.searchParams.get("maxplays"),
+          minBounce: url.searchParams.get("minbounce"),
+          maxBounce: url.searchParams.get("maxbounce"),
+          minPlayback: url.searchParams.get("minplayback"),
+          maxPlayback: url.searchParams.get("maxplayback")
+        }
+      ).catch((error) => {
+        console.error("Unable to load D1 zone analytics", error);
+        return null;
+      }),
+      liveAnalyticsForRange(
+        env,
+        fromTimestamp,
+        toTimestamp,
+        url.searchParams.get("zoneid"),
+        url.searchParams.get("campaignid")
+      ).catch((error) => {
+        console.error("Unable to load live D1 analytics", error);
+        return null;
+      })
+    ]);
 
     return responseHtml(request, zonesDashboardPage({
       analytics: zoneAnalytics,
+      liveAnalytics,
       from,
       to,
       fromHour,
@@ -1243,7 +1523,7 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     }
   };
 
-  const [show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetizationReport, siteAnalytics] = await Promise.all([
+  const [show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetizationReport, siteAnalytics, liveAnalytics] = await Promise.all([
     safe(`/shows/${SHOW_ID}`),
     safe(`/shows/${SHOW_ID}/statistics`),
     safe(`/shows/${SHOW_ID}/statistics/plays?${query}&group=day`),
@@ -1254,8 +1534,23 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     safe(`/shows/${SHOW_ID}/statistics/devices?${query}&precision=1`),
     safe(`/shows/${SHOW_ID}/statistics/geographics?${query}&precision=1`),
     jsonFromR2(env, MONETIZATION_KEY).catch(() => null),
-    siteAnalyticsForRange(env, fromTimestamp, toTimestamp).catch((error) => {
+    siteAnalyticsForRange(
+      env,
+      fromTimestamp,
+      toTimestamp,
+      url.searchParams.get("campaignid")
+    ).catch((error) => {
       console.error("Unable to load D1 site analytics", error);
+      return null;
+    }),
+    liveAnalyticsForRange(
+      env,
+      fromTimestamp,
+      toTimestamp,
+      "",
+      url.searchParams.get("campaignid")
+    ).catch((error) => {
+      console.error("Unable to load live D1 analytics", error);
       return null;
     })
   ]);
@@ -1275,6 +1570,7 @@ export const handleSpreakerDashboard = async (request, env, url) => {
     countries,
     monetization: monetizationSummary(monetizationReport, from, to),
     siteAnalytics,
+    liveAnalytics,
     from,
     to,
     fromHour,
@@ -1286,4 +1582,21 @@ export const handleSpreakerDashboard = async (request, env, url) => {
         : "",
     statsPath: url.pathname === "/stats" ? "/stats" : DASHBOARD_PATH
   }));
+};
+
+export const handleSpreakerRealtime = async (request, env, url) => {
+  if (!new Set(["GET", "HEAD"]).has(request.method)) {
+    return responseJson(request, { error: "Method not allowed" }, 405);
+  }
+  const range = dashboardDates(url);
+  const analytics = await liveAnalyticsForRange(
+    env,
+    range.fromTimestamp,
+    range.toTimestamp,
+    url.searchParams.get("zoneid"),
+    url.searchParams.get("campaignid")
+  );
+  return analytics
+    ? responseJson(request, analytics)
+    : responseJson(request, { error: "Site analytics unavailable" }, 503);
 };

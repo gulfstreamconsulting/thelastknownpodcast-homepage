@@ -3,7 +3,8 @@ import {
   handleSpreakerCallback,
   handleSpreakerConnect,
   handleSpreakerDashboard,
-  handleSpreakerMonetizationUpload
+  handleSpreakerMonetizationUpload,
+  handleSpreakerRealtime
 } from "./spreaker-dashboard.js";
 
 const escapeHtml = (value) =>
@@ -48,6 +49,7 @@ const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
 const SITE_ANALYTICS_EVENT_ENDPOINT = "/analytics/event";
 const PROPELLER_AUDIO_CONVERSION_URL = "https://ad.propellerads.com/conversion.php";
 const STATS_ENDPOINT = "/stats";
+const STATS_REALTIME_ENDPOINT = `${STATS_ENDPOINT}/realtime`;
 const LEGACY_LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
 const APPLE_PODCASTS_SHOW_URL =
   podcast.links.find((link) => link.label === "Apple Podcasts")?.href || "#";
@@ -8144,6 +8146,19 @@ export default {
       } catch (error) {
         console.error("Landing-page stats failed", error);
         return new Response("Unable to load landing-page stats", {
+          status: 500,
+          headers: { "cache-control": "no-store" }
+        });
+      }
+    }
+
+    if (url.pathname === STATS_REALTIME_ENDPOINT) {
+      if (!isAdmin(request, env)) return adminUnauthorized();
+      try {
+        return await handleSpreakerRealtime(request, env, url);
+      } catch (error) {
+        console.error("Real-time stats failed", error);
+        return Response.json({ error: "Unable to load real-time stats" }, {
           status: 500,
           headers: { "cache-control": "no-store" }
         });

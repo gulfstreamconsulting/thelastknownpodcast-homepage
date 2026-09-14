@@ -170,8 +170,14 @@ country, sanitized referrer, zone, campaign, and click attribution, and a sessio
 identifier; IP addresses are not stored.
 The page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
 the other admin tools. Its date controls filter both D1 and Spreaker results. On `/stats`, UTC hour
-controls further narrow the D1 site analytics, zone/campaign results, and raw event CSV export;
-Spreaker and monetization statistics remain date-based.
+controls further narrow the D1 site analytics, zone/campaign results, and raw event CSV export. The
+Overview campaign selector filters all first-party engagement metrics and tables by `campaignid`;
+its options include every campaign recorded in D1, even when a campaign has no events in the
+selected range. A live market-style tracker plots listen-page sessions and playback rate for the
+same UTC date, hour, zone, and campaign filters, refreshing from `/stats/realtime` every 15 seconds.
+Its current-session quote is the latest chart interval, while overall playback rate is playback
+starts divided by unique listen-page sessions across the filtered range. Spreaker and monetization
+statistics remain date-based.
 
 Episode listen pages accept validated `zoneid` and `campaignid` query parameters. Both attributions
 are retained for the browser session and attached to page-view, playback, progress, and

@@ -3,6 +3,7 @@ import {
   handleSpreakerCallback,
   handleSpreakerConnect,
   handleSpreakerDashboard,
+  handleSpreakerStatsApi,
   handleSpreakerMonetizationUpload
 } from "./spreaker-dashboard.js";
 
@@ -47,6 +48,7 @@ const EPISODE_LINK_CLICK_ENDPOINT = "/episodes/link-click";
 const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
 const SITE_ANALYTICS_EVENT_ENDPOINT = "/analytics/event";
 const STATS_ENDPOINT = "/stats";
+const STATS_API_ENDPOINT = `${STATS_ENDPOINT}/api`;
 const LEGACY_LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
 const APPLE_PODCASTS_SHOW_URL =
   podcast.links.find((link) => link.label === "Apple Podcasts")?.href || "#";
@@ -1035,6 +1037,30 @@ const adminUnauthorized = (message = "Authentication required") =>
     }
   });
 
+const statsApiUnauthorized = (request) =>
+  new Response(
+    request.method === "HEAD"
+      ? null
+      : JSON.stringify({
+          error: {
+            code: "authentication_required",
+            message: "Valid stats API credentials are required."
+          }
+        }),
+    {
+      status: 401,
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, HEAD, OPTIONS",
+        "access-control-allow-headers": "Authorization, Content-Type",
+        "content-type": "application/json;charset=UTF-8",
+        "cache-control": "no-store",
+        "www-authenticate": 'Basic realm="Stats API", charset="UTF-8"',
+        "x-content-type-options": "nosniff"
+      }
+    }
+  );
+
 const adminRedirect = (request, params = "") =>
   Response.redirect(new URL(`/admin/content${params}`, request.url), 303);
 
@@ -1137,13 +1163,22 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
   const normalizedZoneId = /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId)
     ? zoneId
     : "unattributed";
+  const campaignId = String(
+    input.campaignId ??
+      normalizedPage.searchParams.get("campaignid") ??
+      normalizedPage.searchParams.get("utm_campaign") ??
+      ""
+  ).trim();
+  const normalizedCampaignId = /^[A-Za-z0-9._:-]{1,100}$/.test(campaignId)
+    ? campaignId
+    : "unattributed";
 
   await env.SITE_ANALYTICS.prepare(`
     INSERT INTO site_events (
       event_id, occurred_at, session_id, event_type, page_path,
       episode_id, episode_slug, episode_title, media_type, player_provider,
       playback_position_ms, playback_duration_ms, playback_percent,
-      platform, referrer, country_code, zone_id, user_agent
+      platform, referrer, country_code, zone_id, campaign_id, user_agent
     ) VALUES (
       ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
       COALESCE(
@@ -1157,7 +1192,18 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
         ),
         'unattributed'
       ),
-      ?18
+      COALESCE(
+        NULLIF(?18, 'unattributed'),
+        (
+          SELECT NULLIF(campaign_id, 'unattributed')
+          FROM site_events
+          WHERE session_id = ?3
+          ORDER BY occurred_at DESC
+          LIMIT 1
+        ),
+        'unattributed'
+      ),
+      ?19
     )
   `).bind(
     crypto.randomUUID(), occurredAt, sessionId, eventType,
@@ -1168,6 +1214,7 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
     boundedAnalyticsNumber(input.playbackPercent, 0, 100), platform,
     sanitizeAnalyticsReferrer(input.referrer), getCountryCode(request),
     normalizedZoneId,
+    normalizedCampaignId,
     String(request.headers.get("user-agent") ?? "").slice(0, 500)
   ).run();
 };
@@ -1299,6 +1346,7 @@ const handleEpisodeLinkClick = async (request, env, ctx) => {
     episodeTitle: input.episodeTitle,
     platform: input.platform,
     zoneId: input.zoneId,
+    campaignId: input.campaignId,
     referrer: input.referrer
   }).catch((error) => {
     console.error("Unable to save episode link analytics", error);
@@ -1678,6 +1726,13 @@ const landingPageZoneId = (url) => {
   return /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "unattributed";
 };
 
+const landingPageCampaignId = (url) => {
+  const rawCampaignId = url.searchParams.get("campaignid") ?? url.searchParams.get("utm_campaign");
+  const campaignId = String(rawCampaignId ?? "").trim();
+
+  return /^[A-Za-z0-9._:-]{1,100}$/.test(campaignId) ? campaignId : "unattributed";
+};
+
 const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) => {
   if (!env.EPISODE_CONTENT || isLikelyBotRequest(request, "POST")) return;
 
@@ -1709,6 +1764,7 @@ const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) =
     sessionId,
     eventType,
     zoneId: landingPageZoneId(referrerUrl),
+    campaignId: landingPageCampaignId(referrerUrl),
     episodeId,
     percentPlayed: eventType.endsWith("_progress") ? String(percentPlayed) : "",
     country: getCountryCode(request),
@@ -1783,6 +1839,7 @@ const handleLandingPageTrack = async (request, env, ctx) => {
       playerProvider: siteEventType.startsWith("audio_") ? "spreaker" : "",
       playbackPercent: input?.percentPlayed,
       zoneId: landingPageZoneId(referrerUrl),
+      campaignId: landingPageCampaignId(referrerUrl),
       referrer: request.headers.get("referer")
     })
   ]).catch((error) => {
@@ -2040,6 +2097,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
     const attributionSource =
       pageUrl.searchParams.get("source") === "facebook_ad" ? "facebook_ad" : "";
     const zoneId = landingPageZoneId(pageUrl);
+    const campaignId = landingPageCampaignId(pageUrl);
     const countryCode = analytics.countryCode || "XX";
 
     if (!episodes.length) {
@@ -2079,6 +2137,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           const outboundParams = new URLSearchParams();
           if (attributionSource) outboundParams.set("source", attributionSource);
           if (zoneId !== "unattributed") outboundParams.set("zoneid", zoneId);
+          if (campaignId !== "unattributed") outboundParams.set("campaignid", campaignId);
           const outboundQuery = outboundParams.size ? `?${outboundParams}` : "";
           const episodeHref = isColdAudience
             ? `${spotifyLandingPagePath(episode)}/spotify${outboundQuery}`
@@ -4162,10 +4221,22 @@ const renderPageViewNotification = (delayMs = 3000) => `
         } else {
           zoneId = 'unattributed';
         }
+        var campaignKey = 'tlk_analytics_campaign';
+        var pageParams = new URLSearchParams(window.location.search);
+        var queryCampaignId = pageParams.get('campaignid') || pageParams.get('utm_campaign') || '';
+        var campaignId = /^[A-Za-z0-9._:-]{1,100}$/.test(queryCampaignId)
+          ? queryCampaignId
+          : (sessionStorage.getItem(campaignKey) || '');
+        if (/^[A-Za-z0-9._:-]{1,100}$/.test(campaignId)) {
+          sessionStorage.setItem(campaignKey, campaignId);
+        } else {
+          campaignId = 'unattributed';
+        }
         var endpoint = '/analytics/page-view?path=' + encodeURIComponent(viewedPath) +
           '&referrer=' + encodeURIComponent(referrer) +
           '&session=' + encodeURIComponent(sessionId) +
-          '&zone=' + encodeURIComponent(zoneId);
+          '&zone=' + encodeURIComponent(zoneId) +
+          '&campaign=' + encodeURIComponent(campaignId);
 
         fetch(endpoint, {
           method: 'POST',
@@ -6548,6 +6619,19 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
         }
         return "unattributed";
       })();
+      const analyticsCampaignId = (() => {
+        const key = "tlk_analytics_campaign";
+        const params = new URLSearchParams(window.location.search);
+        const queryCampaignId = params.get("campaignid") || params.get("utm_campaign") || "";
+        const campaignId = /^[A-Za-z0-9._:-]{1,100}$/.test(queryCampaignId)
+          ? queryCampaignId
+          : (sessionStorage.getItem(key) || "");
+        if (/^[A-Za-z0-9._:-]{1,100}$/.test(campaignId)) {
+          sessionStorage.setItem(key, campaignId);
+          return campaignId;
+        }
+        return "unattributed";
+      })();
 
       document.querySelectorAll("[data-platform]").forEach((link) => {
         link.addEventListener("click", () => {
@@ -6577,6 +6661,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
               episodeSlug: ${safeJson(episode.slug)},
               episodeTitle: ${safeJson(episode.title)},
               zoneId: analyticsZoneId,
+              campaignId: analyticsCampaignId,
               referrer: document.referrer
             }),
             keepalive: true
@@ -6598,6 +6683,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
             episode_title: state.frame.dataset.episodeTitle || "",
             country_code: ${safeJson(countryCode)},
             zone_id: analyticsZoneId,
+            campaign_id: analyticsCampaignId,
             page_path: window.location.pathname
           };
           if (typeof percent === "number") parameters.percent_listened = percent;
@@ -6640,6 +6726,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
               playbackDurationMs: Math.round((state.duration || 0) * 1000),
               playbackPercent: typeof percent === "number" ? percent : (state.duration > 0 ? (state.position || 0) / state.duration * 100 : 0),
               zoneId: analyticsZoneId,
+              campaignId: analyticsCampaignId,
               referrer: document.referrer
             })
           }).catch(() => {});
@@ -7907,6 +7994,23 @@ export default {
       return Response.redirect(destination.toString(), 308);
     }
 
+    if (url.pathname === STATS_API_ENDPOINT || url.pathname === `${STATS_API_ENDPOINT}/`) {
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            allow: "GET, HEAD, OPTIONS",
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "GET, HEAD, OPTIONS",
+            "access-control-allow-headers": "Authorization, Content-Type",
+            "cache-control": "no-store"
+          }
+        });
+      }
+      if (!isAdmin(request, env)) return statsApiUnauthorized(request);
+      return handleSpreakerStatsApi(request, env, url);
+    }
+
     if (url.pathname === STATS_ENDPOINT) {
       try {
         return await handleLandingPageStats(request, env, url);
@@ -7982,6 +8086,7 @@ export default {
           eventType: "page_view",
           pagePath: viewedPath,
           zoneId: url.searchParams.get("zone"),
+          campaignId: url.searchParams.get("campaign"),
           referrer: analyticsReferrer
         }).catch((error) => {
           console.error("Unable to save page-view analytics", error);

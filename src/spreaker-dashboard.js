@@ -122,9 +122,15 @@ const dashboardDates = (url) => {
   return { from, to };
 };
 
-const siteAnalyticsForRange = async (env, from, to) => {
+const validAttributionFilter = (value) => {
+  const id = String(value ?? "").trim();
+  return /^[A-Za-z0-9._:-]{1,100}$/.test(id) ? id : "";
+};
+
+const siteAnalyticsForRange = async (env, from, to, requestedCampaign = "") => {
   if (!env.SITE_ANALYTICS) return null;
-  const range = [from, to];
+  const campaignFilter = validAttributionFilter(requestedCampaign);
+  const range = [from, to, campaignFilter];
   const results = await env.SITE_ANALYTICS.batch([
     env.SITE_ANALYTICS.prepare(`
       SELECT
@@ -136,7 +142,9 @@ const siteAnalyticsForRange = async (env, from, to) => {
         SUM(CASE WHEN event_type = 'episode_link_click' THEN 1 ELSE 0 END) AS platform_clicks,
         COUNT(DISTINCT CASE WHEN event_type = 'page_view' AND page_path LIKE '/episodes/%/listen%' THEN session_id END) AS listen_page_visitors,
         COUNT(DISTINCT CASE WHEN event_type = 'episode_link_click' THEN session_id END) AS platform_clickers
-      FROM site_events WHERE date(occurred_at) BETWEEN ?1 AND ?2
+      FROM site_events
+      WHERE date(occurred_at) BETWEEN ?1 AND ?2
+        AND (?3 = '' OR campaign_id = ?3)
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT COALESCE(SUM(max_position_ms), 0) AS listening_ms,
@@ -148,6 +156,7 @@ const siteAnalyticsForRange = async (env, from, to) => {
         FROM site_events
         WHERE date(occurred_at) BETWEEN ?1 AND ?2
           AND media_type IN ('audio', 'video')
+          AND (?3 = '' OR campaign_id = ?3)
         GROUP BY session_id, episode_id
       )
     `).bind(...range),
@@ -156,6 +165,7 @@ const siteAnalyticsForRange = async (env, from, to) => {
              COUNT(DISTINCT session_id) AS visitors
       FROM site_events
       WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY page_path ORDER BY views DESC LIMIT 15
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
@@ -166,18 +176,21 @@ const siteAnalyticsForRange = async (env, from, to) => {
              SUM(CASE WHEN event_type IN ('audio_ended', 'video_ended') THEN 1 ELSE 0 END) AS completions
       FROM site_events
       WHERE date(occurred_at) BETWEEN ?1 AND ?2 AND episode_id <> ''
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY episode_id, episode_title ORDER BY plays DESC, listeners DESC LIMIT 20
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT platform, COUNT(*) AS clicks
       FROM site_events
       WHERE event_type = 'episode_link_click' AND date(occurred_at) BETWEEN ?1 AND ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY platform ORDER BY clicks DESC
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
       SELECT country_code, COUNT(DISTINCT session_id) AS visitors
       FROM site_events
       WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY country_code ORDER BY visitors DESC LIMIT 20
     `).bind(...range),
     env.SITE_ANALYTICS.prepare(`
@@ -185,8 +198,16 @@ const siteAnalyticsForRange = async (env, from, to) => {
              COUNT(DISTINCT session_id) AS visitors
       FROM site_events
       WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY referrer ORDER BY visitors DESC LIMIT 15
-    `).bind(...range)
+    `).bind(...range),
+    env.SITE_ANALYTICS.prepare(`
+      SELECT campaign_id, COUNT(DISTINCT session_id) AS visitors
+      FROM site_events
+      WHERE event_type = 'page_view' AND date(occurred_at) BETWEEN ?1 AND ?2
+      GROUP BY campaign_id
+      ORDER BY visitors DESC, campaign_id
+    `).bind(from, to)
   ]);
 
   return {
@@ -196,13 +217,14 @@ const siteAnalyticsForRange = async (env, from, to) => {
     episodes: results[3]?.results || [],
     platforms: results[4]?.results || [],
     countries: results[5]?.results || [],
-    referrers: results[6]?.results || []
+    referrers: results[6]?.results || [],
+    campaigns: results[7]?.results || [],
+    campaignFilter
   };
 };
 
 const validZoneFilter = (value) => {
-  const zoneId = String(value ?? "").trim();
-  return /^[A-Za-z0-9._:-]{1,100}$/.test(zoneId) ? zoneId : "";
+  return validAttributionFilter(value);
 };
 
 const validMetricFilter = (value, maximum, integer = false) => {
@@ -237,11 +259,13 @@ const zoneAnalyticsForRange = async (
   from,
   to,
   requestedZone = "",
+  requestedCampaign = "",
   requestedFilters = {}
 ) => {
   if (!env.SITE_ANALYTICS) return null;
 
   const zoneFilter = validZoneFilter(requestedZone);
+  const campaignFilter = validAttributionFilter(requestedCampaign);
   const filters = zoneMetricFilters(requestedFilters);
   const milestoneColumns = PLAYBACK_MILESTONES.map(
     (milestone) =>
@@ -256,15 +280,17 @@ const zoneAnalyticsForRange = async (
              END) AS sessions
       FROM site_events
       WHERE date(occurred_at) BETWEEN ?1 AND ?2
+        AND (?3 = '' OR campaign_id = ?3)
       GROUP BY zone_id
       ORDER BY CASE WHEN zone_id = 'unattributed' THEN 1 ELSE 0 END, zone_id
-    `).bind(from, to),
+    `).bind(from, to, campaignFilter),
     env.SITE_ANALYTICS.prepare(`
       WITH filtered AS (
         SELECT zone_id, session_id, episode_id, event_type, page_path, playback_percent
         FROM site_events
         WHERE date(occurred_at) BETWEEN ?1 AND ?2
           AND (?3 = '' OR zone_id = ?3)
+          AND (?4 = '' OR campaign_id = ?4)
       ),
       zones AS (
         SELECT DISTINCT zone_id FROM filtered
@@ -306,7 +332,7 @@ const zoneAnalyticsForRange = async (
       LEFT JOIN session_summary USING (zone_id)
       LEFT JOIN playback_summary USING (zone_id)
       ORDER BY plays DESC, sessions DESC, zones.zone_id
-    `).bind(from, to, zoneFilter)
+    `).bind(from, to, zoneFilter, campaignFilter)
   ]);
 
   const rows = (zoneRowsResult?.results || []).filter((row) => {
@@ -326,6 +352,7 @@ const zoneAnalyticsForRange = async (
 
   return {
     zoneFilter,
+    campaignFilter,
     filters,
     options: zoneOptionsResult?.results || [],
     rows
@@ -617,6 +644,20 @@ const responseHtml = (request, body, status = 200) =>
     }
   });
 
+const statsJsonResponse = (request, data, status = 200, extraHeaders = {}) =>
+  new Response(request.method === "HEAD" ? null : JSON.stringify(data), {
+    status,
+    headers: {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET, HEAD, OPTIONS",
+      "access-control-allow-headers": "Authorization, Content-Type",
+      "content-type": "application/json;charset=UTF-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      ...extraHeaders
+    }
+  });
+
 const chart = (rows) => {
   if (!rows?.length) return '<p class="notice">No daily statistics were returned for this range.</p>';
 
@@ -661,6 +702,135 @@ const sumPlayStats = (rows = []) =>
       downloads_count: 0
     }
   );
+
+const numericRecord = (record = {}) =>
+  Object.fromEntries(
+    Object.entries(record).map(([key, value]) => [
+      key,
+      typeof value === "number" || /^-?\d+(?:\.\d+)?$/.test(String(value ?? ""))
+        ? Number(value)
+        : value
+    ])
+  );
+
+const siteAnalyticsApi = (analytics) => {
+  if (!analytics) return null;
+
+  const summary = numericRecord(analytics.summary);
+  const playback = numericRecord(analytics.playback);
+  const listenPageVisitors = Number(summary.listen_page_visitors) || 0;
+  const platformClickers = Number(summary.platform_clickers) || 0;
+
+  return {
+    summary: {
+      pageViews: Number(summary.page_views) || 0,
+      visitors: Number(summary.visitors) || 0,
+      playbackStarts: Number(summary.plays) || 0,
+      listeners: Number(summary.listeners) || 0,
+      listeningTimeMs: Number(playback.listening_ms) || 0,
+      averagePlaybackPercent: Number(playback.average_percent) || 0,
+      completions: Number(summary.completions) || 0,
+      platformClicks: Number(summary.platform_clicks) || 0,
+      listenPageVisitors,
+      platformClickers,
+      linkClickThroughRatePercent:
+        listenPageVisitors > 0 ? (platformClickers / listenPageVisitors) * 100 : 0
+    },
+    topPages: analytics.pages.map((row) => ({
+      path: String(row.page_path || ""),
+      views: Number(row.views) || 0,
+      visitors: Number(row.visitors) || 0
+    })),
+    episodes: analytics.episodes.map((row) => ({
+      episode: String(row.episode || "Unknown episode"),
+      playbackStarts: Number(row.plays) || 0,
+      listeners: Number(row.listeners) || 0,
+      maximumPlaybackPercent: Number(row.max_percent) || 0,
+      completions: Number(row.completions) || 0
+    })),
+    platforms: analytics.platforms.map((row) => ({
+      platform: String(row.platform || "Unknown"),
+      clicks: Number(row.clicks) || 0
+    })),
+    countries: analytics.countries.map((row) => ({
+      countryCode: String(row.country_code || "XX"),
+      visitors: Number(row.visitors) || 0
+    })),
+    referrers: analytics.referrers.map((row) => ({
+      referrer: String(row.referrer || "Direct / unknown"),
+      visitors: Number(row.visitors) || 0
+    })),
+    campaigns: analytics.campaigns.map((row) => ({
+      campaignId: String(row.campaign_id || "unattributed"),
+      visitors: Number(row.visitors) || 0
+    })),
+    campaignFilter: analytics.campaignFilter || null
+  };
+};
+
+const zoneAnalyticsApi = (analytics) => {
+  if (!analytics) return null;
+
+  const items = analytics.rows.map((row) => {
+    const sessions = Number(row.sessions) || 0;
+    const plays = Number(row.plays) || 0;
+    const bounces = Number(row.bounces) || 0;
+    return {
+      zoneId: String(row.zone_id || "unattributed"),
+      sessions,
+      plays,
+      playbackRatePercent: sessions > 0 ? (plays / sessions) * 100 : 0,
+      milestones: Object.fromEntries(
+        PLAYBACK_MILESTONES.map((milestone) => [
+          String(milestone),
+          Number(row[`milestone_${milestone}`]) || 0
+        ])
+      ),
+      bounces,
+      bounceRatePercent: sessions > 0 ? (bounces / sessions) * 100 : 0
+    };
+  });
+  const totals = items.reduce(
+    (summary, item) => {
+      summary.sessions += item.sessions;
+      summary.plays += item.plays;
+      summary.bounces += item.bounces;
+      for (const milestone of PLAYBACK_MILESTONES) {
+        summary.milestones[String(milestone)] += item.milestones[String(milestone)];
+      }
+      return summary;
+    },
+    {
+      zones: items.length,
+      sessions: 0,
+      plays: 0,
+      bounces: 0,
+      milestones: Object.fromEntries(PLAYBACK_MILESTONES.map((milestone) => [String(milestone), 0]))
+    }
+  );
+  totals.playbackRatePercent = totals.sessions > 0 ? (totals.plays / totals.sessions) * 100 : 0;
+  totals.bounceRatePercent = totals.sessions > 0 ? (totals.bounces / totals.sessions) * 100 : 0;
+
+  return {
+    filters: {
+      zoneId: analytics.zoneFilter || null,
+      campaignId: analytics.campaignFilter || null,
+      minimumPlays: analytics.filters.minPlays,
+      maximumPlays: analytics.filters.maxPlays,
+      minimumBouncePercent: analytics.filters.minBounce,
+      maximumBouncePercent: analytics.filters.maxBounce,
+      minimumPlaybackRatePercent: analytics.filters.minPlayback,
+      maximumPlaybackRatePercent: analytics.filters.maxPlayback
+    },
+    availableZones: analytics.options.map((row) => ({
+      zoneId: String(row.zone_id || "unattributed"),
+      sessions: Number(row.sessions) || 0
+    })),
+    playbackMilestonesPercent: PLAYBACK_MILESTONES,
+    totals,
+    items
+  };
+};
 
 const monetizationPanel = (monetization, uploadMessage = "") => {
   const dailyRows = monetization?.days
@@ -1052,6 +1222,165 @@ export const handleSpreakerMonetizationUpload = async (request, env) => {
   }
 };
 
+export const handleSpreakerStatsApi = async (request, env, url) => {
+  if (!new Set(["GET", "HEAD"]).has(request.method)) {
+    return statsJsonResponse(
+      request,
+      { error: { code: "method_not_allowed", message: "Use GET for this endpoint." } },
+      405,
+      { allow: "GET, HEAD, OPTIONS" }
+    );
+  }
+
+  if (!configured(env)) {
+    return statsJsonResponse(request, {
+      error: {
+        code: "stats_not_configured",
+        message: "Spreaker statistics are not configured on this server."
+      }
+    }, 503);
+  }
+
+  const { from, to } = dashboardDates(url);
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(env);
+  } catch (error) {
+    console.error("Unable to refresh Spreaker access for stats API", error);
+    return statsJsonResponse(request, {
+      error: {
+        code: "spreaker_token_refresh_failed",
+        message: "Unable to refresh the Spreaker connection."
+      }
+    }, 502);
+  }
+
+  if (!accessToken) {
+    return statsJsonResponse(request, {
+      error: {
+        code: "spreaker_not_connected",
+        message: "Connect the Spreaker account before requesting statistics."
+      }
+    }, 503);
+  }
+
+  const query = new URLSearchParams({ from, to });
+  const rollingToDate = new Date();
+  const rollingFromDate = new Date(rollingToDate);
+  rollingFromDate.setUTCDate(rollingFromDate.getUTCDate() - 29);
+  const last30Range = {
+    from: dateString(rollingFromDate),
+    to: dateString(rollingToDate)
+  };
+  const last30Query = new URLSearchParams(last30Range);
+  const safe = async (path) => {
+    try {
+      return await apiRequest(path, accessToken);
+    } catch (error) {
+      console.error("Unable to load Spreaker stats API resource", { path, error });
+      return null;
+    }
+  };
+
+  const [show, overall, plays, last30Plays, listeners, episodes, sources, devices, countries, monetizationReport, siteAnalytics, zoneAnalytics] = await Promise.all([
+    safe(`/shows/${SHOW_ID}`),
+    safe(`/shows/${SHOW_ID}/statistics`),
+    safe(`/shows/${SHOW_ID}/statistics/plays?${query}&group=day`),
+    safe(`/shows/${SHOW_ID}/statistics/plays?${last30Query}&group=day`),
+    safe(`/shows/${SHOW_ID}/statistics/listeners?${query}&group=day`),
+    safe(`/shows/${SHOW_ID}/episodes/statistics/plays/totals?${query}&offset=0&limit=50`),
+    safe(`/shows/${SHOW_ID}/statistics/sources?${query}&group=day`),
+    safe(`/shows/${SHOW_ID}/statistics/devices?${query}&precision=1`),
+    safe(`/shows/${SHOW_ID}/statistics/geographics?${query}&precision=1`),
+    jsonFromR2(env, MONETIZATION_KEY).catch(() => null),
+    siteAnalyticsForRange(env, from, to, url.searchParams.get("campaignid")).catch((error) => {
+      console.error("Unable to load D1 site analytics for stats API", error);
+      return null;
+    }),
+    zoneAnalyticsForRange(
+      env,
+      from,
+      to,
+      url.searchParams.get("zoneid"),
+      url.searchParams.get("campaignid"),
+      {
+        minPlays: url.searchParams.get("minplays"),
+        maxPlays: url.searchParams.get("maxplays"),
+        minBounce: url.searchParams.get("minbounce"),
+        maxBounce: url.searchParams.get("maxbounce"),
+        minPlayback: url.searchParams.get("minplayback"),
+        maxPlayback: url.searchParams.get("maxplayback")
+      }
+    ).catch((error) => {
+      console.error("Unable to load D1 zone analytics for stats API", error);
+      return null;
+    })
+  ]);
+
+  const allTime = numericRecord(overall?.statistics);
+  const last30Days = sumPlayStats(last30Plays?.statistics);
+  const dailyListeners = (listeners?.statistics || []).map(numericRecord);
+  const totalListeners = dailyListeners.reduce(
+    (sum, row) => sum + (Number(row.listeners_count) || 0),
+    0
+  );
+  const showData = allTime.show || show?.show || {};
+  const monetization = monetizationSummary(monetizationReport, from, to);
+
+  return statsJsonResponse(request, {
+    apiVersion: "1.0",
+    generatedAt: new Date().toISOString(),
+    range: { from, to },
+    show: {
+      id: String(showData.show_id || showData.id || SHOW_ID),
+      title: String(showData.title || "The Last Known"),
+      imageUrl: showData.image_url || null,
+      siteUrl: showData.site_url || `https://www.spreaker.com/show/${SHOW_ID}`
+    },
+    availability: {
+      spreaker: Boolean(overall),
+      siteAnalytics: Boolean(siteAnalytics),
+      zones: Boolean(zoneAnalytics),
+      monetization: Boolean(monetization)
+    },
+    overview: {
+      atAGlance: {
+        allTimePlays: Number(allTime.plays_count) || 0,
+        allTimeDownloads: Number(allTime.downloads_count) || 0,
+        episodeCount: Number(allTime.episodes_count) || 0,
+        dailyListenersTotal: totalListeners
+      },
+      podcastStatistics: {
+        allTime: {
+          plays: Number(allTime.plays_count) || 0,
+          onDemandPlays: Number(allTime.plays_ondemand_count) || 0,
+          livePlays: Number(allTime.plays_live_count) || 0,
+          downloads: Number(allTime.downloads_count) || 0
+        },
+        last30Days: {
+          range: last30Range,
+          plays: last30Days.plays_count,
+          onDemandPlays: last30Days.plays_ondemand_count,
+          livePlays: last30Days.plays_live_count,
+          downloads: last30Days.downloads_count
+        }
+      },
+      dailyPerformance: (plays?.statistics || []).map(numericRecord),
+      dailyListeners,
+      episodes: (episodes?.items || []).map(numericRecord),
+      sources: (sources?.statistics?.overall || []).map(numericRecord),
+      devices: (Array.isArray(devices?.statistics) ? devices.statistics : []).map(numericRecord),
+      countries: (countries?.statistics?.country || []).map(numericRecord)
+    },
+    siteAnalytics: siteAnalyticsApi(siteAnalytics),
+    monetization,
+    zones: zoneAnalyticsApi(zoneAnalytics),
+    warnings: overall
+      ? []
+      : ["Spreaker did not return private statistics. Reconnect the account and confirm it owns this show."]
+  });
+};
+
 export const handleSpreakerDashboard = async (request, env, url) => {
   const { from, to } = dashboardDates(url);
   const isZonesTab = url.pathname === "/stats" && url.searchParams.get("tab") === "zones";
@@ -1061,6 +1390,7 @@ export const handleSpreakerDashboard = async (request, env, url) => {
       from,
       to,
       url.searchParams.get("zoneid"),
+      "",
       {
         minPlays: url.searchParams.get("minplays"),
         maxPlays: url.searchParams.get("maxplays"),

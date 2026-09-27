@@ -139,10 +139,11 @@ pixels. It does not fire on page load. The event includes the engagement source,
 featured episode, and episode count as parameters. Spreaker play, pause, and progress events remain
 separate custom events.
 
-PropellerAds traffic must pass its zone ID to the directory using the `zoneid` query parameter:
+PropellerAds traffic can pass its zone and campaign IDs to the directory using the `zoneid` and
+`campaignid` query parameters. Standard `utm_campaign` values are also accepted as campaign IDs:
 
 ```text
-GET /landing-page?zoneid=123456
+GET /landing-page?zoneid=123456&campaignid=fall_launch
 ```
 
 Directory visits, meaningful engagement, Spreaker playback, historical Acast playback, and Apple
@@ -164,8 +165,36 @@ country, sanitized referrer, and a session-scoped anonymous identifier; IP addre
 The page uses the same `ADMIN_USERNAME` and `ADMIN_PASSWORD` Basic Authentication credentials as
 the other admin tools. Its date controls filter both D1 and Spreaker results.
 
+Mobile and other native clients can load the complete stats-page data model as JSON from:
+
+```text
+GET /stats/api
+GET /stats/api?from=2026-08-01&to=2026-08-31
+```
+
+The endpoint uses the same HTTP Basic Authentication credentials as `/stats`, supports `GET`,
+`HEAD`, and CORS preflight requests, and always returns `Cache-Control: no-store`. Its response
+contains show metadata, availability flags, all-time and rolling-30-day totals, daily performance
+and listeners, episode/source/device/country rankings, first-party site engagement, monetization,
+and the complete filtered zone result set with aggregate totals.
+
+The zone filters use the same query parameters as the web page:
+
+```text
+campaignid, zoneid, minplays, maxplays, minbounce, maxbounce, minplayback, maxplayback
+```
+
+For example:
+
+```bash
+curl --user "$ADMIN_USERNAME:$ADMIN_PASSWORD" \
+  "https://www.thelastknownpodcast.com/stats/api?from=2026-08-01&to=2026-08-31&campaignid=fall_launch&minplays=5"
+```
+
 Episode listen pages accept a validated `zoneid` query parameter. Zone attribution is retained for
 the browser session and attached to page-view, playback, progress, and platform-link events. The
+same behavior applies to `campaignid` and its `utm_campaign` alias. Campaign IDs are saved in D1,
+included in the API's campaign breakdown, and can filter all first-party and zone analytics. The
 Zones tab at `/stats?tab=zones` reports play starts, playback rate (plays divided by sessions),
 playback-milestone counts, and bounce rate by zone; supports date, zone, play-count, playback-rate,
 and bounce-rate filters; and exports the current filtered

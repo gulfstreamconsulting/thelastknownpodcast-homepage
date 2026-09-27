@@ -6606,34 +6606,27 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
   const platformUrl = (label) =>
     podcast.links.find((link) => link.label === label)?.href || "";
   const countryCode = analytics.countryCode || "XX";
-  const spreakerEmbedUrl = episode.spreakerEpisodeId
-    ? `https://widget.spreaker.com/player?episode_id=${encodeURIComponent(
-        episode.spreakerEpisodeId
-      )}&theme=dark&playlist=false&autoplay=false`
-    : "";
   const additionalEpisodes = episodes
-    .filter((candidate) => candidate.slug !== episode.slug && candidate.spreakerEpisodeId)
+    .filter((candidate) => candidate.slug !== episode.slug && candidate.audioUrl)
     .slice(0, 3);
-  const spreakerPlayer = (playerEpisode, id = "") => {
-    const embedUrl = `https://widget.spreaker.com/player?episode_id=${encodeURIComponent(
-      playerEpisode.spreakerEpisodeId
-    )}&theme=dark&playlist=false&autoplay=false`;
-    return `<div class="player-card">
-      ${id ? "" : `<h2>${escapeHtml(playerEpisode.title)}</h2>`}
-      <iframe
-        ${id ? `id="${id}"` : ""}
-        class="spreaker-player"
-        data-spreaker-player
-        data-episode-id="${escapeHtml(playerEpisode.spreakerEpisodeId)}"
-        data-episode-slug="${escapeHtml(playerEpisode.slug)}"
-        data-episode-title="${escapeHtml(playerEpisode.title)}"
-        src="${escapeHtml(embedUrl)}"
-        loading="lazy"
-        allow="autoplay"
-        title="${escapeHtml(`${playerEpisode.title} Spreaker player`)}"
-      ></iframe>
-    </div>`;
-  };
+  const audioPlayer = (playerEpisode, id = `audio-${playerEpisode.slug}`) => `<div class="player-card">
+    ${id === "episode-audio-player" ? "" : `<h2>${escapeHtml(playerEpisode.title)}</h2>`}
+    <button class="main-play" data-play-button type="button" aria-controls="${escapeHtml(id)}"><span aria-hidden="true">▶</span><span>Play episode</span></button>
+    <p data-playback-status role="status" hidden></p>
+    <audio
+      id="${escapeHtml(id)}"
+      class="audio-player"
+      data-audio-player
+      data-episode-id="${escapeHtml(playerEpisode.spreakerEpisodeId || playerEpisode.id)}"
+      data-episode-slug="${escapeHtml(playerEpisode.slug)}"
+      data-episode-title="${escapeHtml(playerEpisode.title)}"
+      src="${escapeHtml(playerEpisode.audioUrl)}"
+      controls
+      ${!showLinks && id === "episode-audio-player" ? "autoplay" : ""}
+      preload="${!showLinks && id === "episode-audio-player" ? "auto" : "metadata"}"
+      aria-label="${escapeHtml(`${playerEpisode.title} audio player`)}"
+    ></audio>
+  </div>`;
   const links = [
     {
       label: "Listen on Spotify",
@@ -6674,11 +6667,14 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
       .eyebrow { margin: 0 0 8px; color: #1ed760; font-size: .78rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
       h1 { margin: 0; font-size: clamp(1.65rem, 7vw, 2.45rem); line-height: 1.1; }
       .show { margin: 12px 0 28px; color: #aaa; }
-      .spreaker-player { display: block; width: 100%; height: 200px; margin: 0 0 24px; border: 0; border-radius: 14px; }
+      .audio-player { display: block; width: 100%; height: 54px; margin: 0 0 24px; border: 0; border-radius: 14px; }
+      .main-play { display: flex; align-items: center; justify-content: center; gap: 14px; width: 100%; min-height: 88px; margin: 0 0 18px; padding: 20px; border: 0; border-radius: 18px; background: #1ed760; color: #071b0e; font: inherit; font-size: 1.5rem; font-weight: 850; cursor: pointer; }
+      .main-play:hover { filter: brightness(1.08); }
+      .main-play:focus-visible { outline: 3px solid #fff; outline-offset: 4px; }
       .more-players { display: grid; gap: 26px; margin-top: 36px; padding-top: 30px; border-top: 1px solid #383838; }
       .more-players > h2 { margin: 0; font-size: 1.35rem; }
       .player-card h2 { margin: 0 0 12px; font-size: 1.05rem; line-height: 1.3; }
-      .player-card .spreaker-player { margin-bottom: 0; }
+      .player-card .audio-player { margin-bottom: 0; }
       .links { display: grid; gap: 14px; }
       .platform { display: flex; align-items: center; justify-content: center; min-height: 60px; padding: 16px 22px; border-radius: 999px; color: #fff; font-size: 1.05rem; font-weight: 850; text-decoration: none; transition: transform .15s ease, filter .15s ease; }
       .platform:hover { transform: translateY(-2px); filter: brightness(1.08); }
@@ -6696,8 +6692,8 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
       <h1>${escapeHtml(episode.title)}</h1>
       <p class="show">${escapeHtml(podcast.name)}</p>
       ${
-        spreakerEmbedUrl
-          ? spreakerPlayer(episode, "episode-spreaker-player")
+        episode.audioUrl
+          ? audioPlayer(episode, "episode-audio-player")
           : ""
       }
       ${
@@ -6711,13 +6707,12 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
         additionalEpisodes.length
           ? `<section class="more-players" aria-labelledby="more-episodes-title">
               <h2 id="more-episodes-title">More episodes</h2>
-              ${additionalEpisodes.map((candidate) => spreakerPlayer(candidate)).join("")}
+              ${additionalEpisodes.map((candidate) => audioPlayer(candidate)).join("")}
             </section>`
           : ""
       }
       ${showLinks ? `<a class="back" href="${escapeHtml(episodePath(episode))}">Back to episode details</a>` : ""}
     </main>
-    ${spreakerEmbedUrl || additionalEpisodes.length ? '<script src="https://cdn.embed.ly/player-0.1.0.min.js"></script>' : ""}
     <script>
       const episodeLinkAnalytics = {
         episode_id: ${safeJson(episode.id)},
@@ -6809,14 +6804,14 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
         });
       });
 
-      const spreakerFrames = Array.from(document.querySelectorAll("[data-spreaker-player]"));
-      if (spreakerFrames.length && window.playerjs?.Player) {
+      const audioPlayers = Array.from(document.querySelectorAll("[data-audio-player]"));
+      if (audioPlayers.length) {
         const milestones = [10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100];
         const states = [];
 
         const playerEventParameters = (state, action, percent) => {
           const parameters = {
-            player: "spreaker",
+            player: "html5",
             player_action: action,
             episode_id: state.frame.dataset.episodeId || "unknown",
             episode_slug: state.frame.dataset.episodeSlug || "",
@@ -6866,7 +6861,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
               episodeSlug: parameters.episode_slug,
               episodeTitle: parameters.episode_title,
               mediaType: "audio",
-              playerProvider: "spreaker",
+              playerProvider: "html5",
               playbackPositionMs: Math.round((state.position || 0) * 1000),
               playbackDurationMs: Math.round((state.duration || 0) * 1000),
               playbackPercent: typeof percent === "number" ? percent : (state.duration > 0 ? (state.position || 0) / state.duration * 100 : 0),
@@ -6889,72 +6884,84 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
           });
         };
 
-        const updateProgress = (state) => {
-          state.player.getDuration((value) => {
-            const numericDuration = Number(value);
-            if (Number.isFinite(numericDuration) && numericDuration > 0) state.duration = numericDuration;
-          });
-          state.player.getCurrentTime((value) => {
-            const position = Number(value);
-            if (state.duration > 0 && Number.isFinite(position)) {
-              state.position = position;
-              checkMilestones(state, (position / state.duration) * 100);
-            }
-          });
+        let autoplayCancelled = false;
+        audioPlayers.forEach((audio) => {
+        const playbackStatus = audio.closest(".player-card").querySelector("[data-playback-status]");
+        const reportPlaybackError = (error) => {
+          if (error.name === "AbortError" || !playbackStatus) return;
+          playbackStatus.textContent = error.name === "NotAllowedError"
+            ? "Tap Play episode to start listening. Your browser requires a tap before playing audio."
+            : "Audio could not start. Tap Play episode to try again.";
+          playbackStatus.hidden = false;
         };
-
-        const startProgressTracking = (state) => {
-          if (state.progressTimer) return;
-          updateProgress(state);
-          state.progressTimer = window.setInterval(() => updateProgress(state), 1000);
-        };
-
-        const stopProgressTracking = (state) => {
-          if (!state.progressTimer) return;
-          window.clearInterval(state.progressTimer);
-          state.progressTimer = null;
-        };
-
-        spreakerFrames.forEach((frame) => {
           const state = {
-            frame: frame,
-            player: new window.playerjs.Player(frame),
+            frame: audio,
             reachedMilestones: new Set(),
             duration: 0,
             position: 0,
-            progressTimer: null,
             isPlaying: false
           };
           states.push(state);
-
-          state.player.on("ready", () => {
-            state.player.on("play", () => {
-              states.forEach((otherState) => {
-                if (otherState !== state && otherState.isPlaying) otherState.player.pause();
+          {
+            const playButton = audio.closest(".player-card").querySelector("[data-play-button]");
+            const updatePlayButton = () => {
+              const paused = audio.paused || audio.ended;
+              playButton.firstElementChild.textContent = paused ? "▶" : "❚❚";
+              playButton.lastElementChild.textContent = paused ? "Play episode" : "Pause episode";
+            };
+            playButton.addEventListener("click", () => {
+              autoplayCancelled = true;
+              if (audio.paused || audio.ended) audio.play().catch((error) => {
+                updatePlayButton();
+                reportPlaybackError(error);
               });
-              if (!state.isPlaying) trackPlayerEvent(state, "play");
-              state.isPlaying = true;
-              startProgressTracking(state);
+              else audio.pause();
             });
-            state.player.on("pause", () => {
-              if (state.isPlaying) trackPlayerEvent(state, "pause");
-              state.isPlaying = false;
-              stopProgressTracking(state);
-            });
-            state.player.on("ended", () => {
-              checkMilestones(state, 100);
-              trackPlayerEvent(state, "ended");
-              state.isPlaying = false;
-              stopProgressTracking(state);
+            ["play", "pause", "ended", "error"].forEach((event) => audio.addEventListener(event, updatePlayButton));
+            audio.addEventListener("playing", () => { playbackStatus.hidden = true; });
+            audio.addEventListener("error", () => reportPlaybackError(audio.error || {}));
+            updatePlayButton();
+          }
+          const updatePosition = () => {
+            state.duration = Number.isFinite(audio.duration) ? audio.duration : 0;
+            state.position = audio.currentTime || 0;
+          };
+          audio.addEventListener("play", () => {
+            autoplayCancelled = true;
+            audioPlayers.forEach((other) => {
+              if (other !== audio) other.pause();
             });
           });
+          audio.addEventListener("playing", () => {
+            updatePosition();
+            if (!state.isPlaying) trackPlayerEvent(state, "play");
+            state.isPlaying = true;
+          });
+          audio.addEventListener("pause", () => {
+            updatePosition();
+            if (state.isPlaying && !audio.ended) trackPlayerEvent(state, "pause");
+            state.isPlaying = false;
+          });
+          audio.addEventListener("timeupdate", () => {
+            updatePosition();
+            if (state.duration > 0) checkMilestones(state, state.position / state.duration * 100);
+          });
+          audio.addEventListener("ended", () => {
+            updatePosition();
+            checkMilestones(state, 100);
+            trackPlayerEvent(state, "ended");
+            state.isPlaying = false;
+          });
+          if (${safeJson(!showLinks)} && audio.id === "episode-audio-player") {
+            const startAutoplay = () => {
+              if (!autoplayCancelled && audioPlayers.every((player) => player.paused)) {
+                audio.play().catch(reportPlaybackError);
+              }
+            };
+            startAutoplay();
+          }
         });
-
-        window.addEventListener(
-          "pagehide",
-          () => states.forEach((state) => stopProgressTracking(state)),
-          { once: true }
-        );
+        window.addEventListener("pagehide", () => { autoplayCancelled = true; }, { once: true });
       }
     </script>
     ${renderPageViewNotification(0)}

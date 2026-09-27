@@ -3,8 +3,8 @@ import {
   handleSpreakerCallback,
   handleSpreakerConnect,
   handleSpreakerDashboard,
-  handleSpreakerStatsApi,
-  handleSpreakerMonetizationUpload
+  handleSpreakerMonetizationUpload,
+  handleSpreakerRealtime
 } from "./spreaker-dashboard.js";
 
 const escapeHtml = (value) =>
@@ -47,8 +47,9 @@ const SPREAKER_PLAYER_PLAY_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/spreaker
 const EPISODE_LINK_CLICK_ENDPOINT = "/episodes/link-click";
 const LANDING_PAGE_TRACK_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/track`;
 const SITE_ANALYTICS_EVENT_ENDPOINT = "/analytics/event";
+const PROPELLER_AUDIO_CONVERSION_URL = "https://ad.propellerads.com/conversion.php";
 const STATS_ENDPOINT = "/stats";
-const STATS_API_ENDPOINT = `${STATS_ENDPOINT}/api`;
+const STATS_REALTIME_ENDPOINT = `${STATS_ENDPOINT}/realtime`;
 const LEGACY_LANDING_PAGE_STATS_ENDPOINT = `${SPOTIFY_LANDING_PAGE_ENDPOINT}/stats`;
 const APPLE_PODCASTS_SHOW_URL =
   podcast.links.find((link) => link.label === "Apple Podcasts")?.href || "#";
@@ -1037,30 +1038,6 @@ const adminUnauthorized = (message = "Authentication required") =>
     }
   });
 
-const statsApiUnauthorized = (request) =>
-  new Response(
-    request.method === "HEAD"
-      ? null
-      : JSON.stringify({
-          error: {
-            code: "authentication_required",
-            message: "Valid stats API credentials are required."
-          }
-        }),
-    {
-      status: 401,
-      headers: {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET, HEAD, OPTIONS",
-        "access-control-allow-headers": "Authorization, Content-Type",
-        "content-type": "application/json;charset=UTF-8",
-        "cache-control": "no-store",
-        "www-authenticate": 'Basic realm="Stats API", charset="UTF-8"',
-        "x-content-type-options": "nosniff"
-      }
-    }
-  );
-
 const adminRedirect = (request, params = "") =>
   Response.redirect(new URL(`/admin/content${params}`, request.url), 303);
 
@@ -1136,6 +1113,77 @@ const boundedAnalyticsNumber = (value, minimum, maximum) => {
   return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : minimum;
 };
 
+const sendPropellerAudioPostback = async (env, sessionId, eventId, occurredAt) => {
+  await env.SITE_ANALYTICS.prepare(`
+    INSERT OR IGNORE INTO propeller_audio_postbacks (
+      session_id, click_id, status, created_at
+    )
+    SELECT session_id, click_id, 'pending', occurred_at
+    FROM site_events
+    WHERE event_id = ?1 AND event_type = 'audio_play' AND click_id <> 'unattributed'
+  `).bind(eventId).run();
+
+  const staleAttemptBefore = new Date(Date.now() - 5 * 60_000).toISOString();
+  const claim = await env.SITE_ANALYTICS.prepare(`
+    UPDATE propeller_audio_postbacks
+    SET status = 'sending', attempts = attempts + 1, last_attempt_at = ?2
+    WHERE session_id = ?1
+      AND (
+        status IN ('pending', 'failed')
+        OR (status = 'sending' AND last_attempt_at < ?3)
+      )
+  `).bind(sessionId, occurredAt, staleAttemptBefore).run();
+  if (Number(claim.meta?.changes) !== 1) return;
+
+  const postback = await env.SITE_ANALYTICS.prepare(`
+    SELECT click_id
+    FROM propeller_audio_postbacks
+    WHERE session_id = ?1 AND status = 'sending' AND last_attempt_at = ?2
+  `).bind(sessionId, occurredAt).first();
+  const clickId = String(postback?.click_id ?? "");
+  if (!/^[A-Za-z0-9._:-]{1,200}$/.test(clickId)) {
+    await env.SITE_ANALYTICS.prepare(`
+      UPDATE propeller_audio_postbacks
+      SET status = 'failed'
+      WHERE session_id = ?1 AND status = 'sending' AND last_attempt_at = ?2
+    `).bind(sessionId, occurredAt).run();
+    return;
+  }
+
+  const conversionUrl = new URL(PROPELLER_AUDIO_CONVERSION_URL);
+  conversionUrl.searchParams.set("aid", "3849328");
+  conversionUrl.searchParams.set("pid", "");
+  conversionUrl.searchParams.set("tid", "158887");
+  conversionUrl.searchParams.set("visitor_id", clickId);
+
+  try {
+    const response = await fetch(conversionUrl, {
+      method: "GET",
+      headers: { accept: "text/plain" },
+      redirect: "follow"
+    });
+    if (response.body) await response.body.cancel();
+    if (!response.ok) throw new Error(`Propeller postback returned HTTP ${response.status}`);
+
+    await env.SITE_ANALYTICS.prepare(`
+      UPDATE propeller_audio_postbacks
+      SET status = 'sent', sent_at = ?2
+      WHERE session_id = ?1 AND status = 'sending' AND last_attempt_at = ?3
+    `).bind(sessionId, new Date().toISOString(), occurredAt).run();
+  } catch (error) {
+    await env.SITE_ANALYTICS.prepare(`
+      UPDATE propeller_audio_postbacks
+      SET status = 'failed'
+      WHERE session_id = ?1 AND status = 'sending' AND last_attempt_at = ?2
+    `).bind(sessionId, occurredAt).run();
+    console.error(JSON.stringify({
+      message: "Propeller audio conversion postback failed",
+      session_id: sessionId,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+};
+
 const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
   if (!env.SITE_ANALYTICS || isLikelyBotRequest(request, "POST")) return;
 
@@ -1164,21 +1212,25 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
     ? zoneId
     : "unattributed";
   const campaignId = String(
-    input.campaignId ??
-      normalizedPage.searchParams.get("campaignid") ??
-      normalizedPage.searchParams.get("utm_campaign") ??
-      ""
+    input.campaignId ?? normalizedPage.searchParams.get("campaignid") ?? ""
   ).trim();
   const normalizedCampaignId = /^[A-Za-z0-9._:-]{1,100}$/.test(campaignId)
     ? campaignId
     : "unattributed";
+  const clickId = String(
+    input.clickId ?? normalizedPage.searchParams.get("clickid") ?? ""
+  ).trim();
+  const normalizedClickId = /^[A-Za-z0-9._:-]{1,200}$/.test(clickId)
+    ? clickId
+    : "unattributed";
+  const eventId = crypto.randomUUID();
 
   await env.SITE_ANALYTICS.prepare(`
     INSERT INTO site_events (
       event_id, occurred_at, session_id, event_type, page_path,
       episode_id, episode_slug, episode_title, media_type, player_provider,
       playback_position_ms, playback_duration_ms, playback_percent,
-      platform, referrer, country_code, zone_id, campaign_id, user_agent
+      platform, referrer, country_code, zone_id, campaign_id, click_id, user_agent
     ) VALUES (
       ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
       COALESCE(
@@ -1186,8 +1238,8 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
         (
           SELECT NULLIF(zone_id, 'unattributed')
           FROM site_events
-          WHERE session_id = ?3
-          ORDER BY occurred_at DESC
+          WHERE session_id = ?3 AND zone_id <> 'unattributed'
+          ORDER BY occurred_at DESC, id DESC
           LIMIT 1
         ),
         'unattributed'
@@ -1197,16 +1249,27 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
         (
           SELECT NULLIF(campaign_id, 'unattributed')
           FROM site_events
-          WHERE session_id = ?3
-          ORDER BY occurred_at DESC
+          WHERE session_id = ?3 AND campaign_id <> 'unattributed'
+          ORDER BY occurred_at DESC, id DESC
           LIMIT 1
         ),
         'unattributed'
       ),
-      ?19
+      COALESCE(
+        NULLIF(?19, 'unattributed'),
+        (
+          SELECT NULLIF(click_id, 'unattributed')
+          FROM site_events
+          WHERE session_id = ?3 AND click_id <> 'unattributed'
+          ORDER BY occurred_at DESC, id DESC
+          LIMIT 1
+        ),
+        'unattributed'
+      ),
+      ?20
     )
   `).bind(
-    crypto.randomUUID(), occurredAt, sessionId, eventType,
+    eventId, occurredAt, sessionId, eventType,
     `${normalizedPage.pathname}${normalizedPage.search}`.slice(0, 900),
     episodeId, episodeSlug, episodeTitle, mediaType, playerProvider,
     Math.round(boundedAnalyticsNumber(input.playbackPositionMs, 0, 86_400_000)),
@@ -1215,8 +1278,13 @@ const saveSiteAnalyticsEvent = async (env, request, input = {}) => {
     sanitizeAnalyticsReferrer(input.referrer), getCountryCode(request),
     normalizedZoneId,
     normalizedCampaignId,
+    normalizedClickId,
     String(request.headers.get("user-agent") ?? "").slice(0, 500)
   ).run();
+
+  if (eventType === "audio_play") {
+    await sendPropellerAudioPostback(env, sessionId, eventId, occurredAt);
+  }
 };
 
 const handleSiteAnalyticsEvent = async (request, env, ctx) => {
@@ -1347,6 +1415,7 @@ const handleEpisodeLinkClick = async (request, env, ctx) => {
     platform: input.platform,
     zoneId: input.zoneId,
     campaignId: input.campaignId,
+    clickId: input.clickId,
     referrer: input.referrer
   }).catch((error) => {
     console.error("Unable to save episode link analytics", error);
@@ -1727,10 +1796,17 @@ const landingPageZoneId = (url) => {
 };
 
 const landingPageCampaignId = (url) => {
-  const rawCampaignId = url.searchParams.get("campaignid") ?? url.searchParams.get("utm_campaign");
+  const rawCampaignId = url.searchParams.get("campaignid");
   const campaignId = String(rawCampaignId ?? "").trim();
 
   return /^[A-Za-z0-9._:-]{1,100}$/.test(campaignId) ? campaignId : "unattributed";
+};
+
+const landingPageClickId = (url) => {
+  const rawClickId = url.searchParams.get("clickid");
+  const clickId = String(rawClickId ?? "").trim();
+
+  return /^[A-Za-z0-9._:-]{1,200}$/.test(clickId) ? clickId : "unattributed";
 };
 
 const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) => {
@@ -1765,6 +1841,7 @@ const saveLandingPageDirectoryEvent = async (env, request, input, referrerUrl) =
     eventType,
     zoneId: landingPageZoneId(referrerUrl),
     campaignId: landingPageCampaignId(referrerUrl),
+    clickId: landingPageClickId(referrerUrl),
     episodeId,
     percentPlayed: eventType.endsWith("_progress") ? String(percentPlayed) : "",
     country: getCountryCode(request),
@@ -1840,6 +1917,7 @@ const handleLandingPageTrack = async (request, env, ctx) => {
       playbackPercent: input?.percentPlayed,
       zoneId: landingPageZoneId(referrerUrl),
       campaignId: landingPageCampaignId(referrerUrl),
+      clickId: landingPageClickId(referrerUrl),
       referrer: request.headers.get("referer")
     })
   ]).catch((error) => {
@@ -2098,6 +2176,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
       pageUrl.searchParams.get("source") === "facebook_ad" ? "facebook_ad" : "";
     const zoneId = landingPageZoneId(pageUrl);
     const campaignId = landingPageCampaignId(pageUrl);
+    const clickId = landingPageClickId(pageUrl);
     const countryCode = analytics.countryCode || "XX";
 
     if (!episodes.length) {
@@ -2138,10 +2217,11 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           if (attributionSource) outboundParams.set("source", attributionSource);
           if (zoneId !== "unattributed") outboundParams.set("zoneid", zoneId);
           if (campaignId !== "unattributed") outboundParams.set("campaignid", campaignId);
+          if (clickId !== "unattributed") outboundParams.set("clickid", clickId);
           const outboundQuery = outboundParams.size ? `?${outboundParams}` : "";
           const episodeHref = isColdAudience
             ? `${spotifyLandingPagePath(episode)}/spotify${outboundQuery}`
-            : spotifyLandingPagePath(episode);
+            : `${spotifyLandingPagePath(episode)}${outboundQuery}`;
           const appleHref = `${spotifyLandingPagePath(episode)}/apple${outboundQuery}`;
           const spreakerEmbedUrl = episode.spreakerEpisodeId
               ? `https://widget.spreaker.com/player?episode_id=${encodeURIComponent(
@@ -2194,6 +2274,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
     const body = `<!doctype html>
 <html lang="en">
   <head>
+    ${renderRtmarkPlaybackTrigger()}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex, nofollow">
@@ -2370,6 +2451,7 @@ const handlePublishedEpisodesLandingPage = async (request, analytics = {}, episo
           }
 
           if (action === "play") {
+            window.tlkFireRtmarkPlayback?.("spreaker:" + state.episodeId);
             trackLandingEvent("spreaker_play", state.episodeId);
             fetch("${escapeHtml(SPREAKER_PLAYER_PLAY_ENDPOINT)}", {
               method: "POST",
@@ -3549,7 +3631,24 @@ const renderPlaybackTracking = (episodes, countryCode) => {
           return created;
         }
 
+        function analyticsAttributionId(queryName, storageKey, maximumLength) {
+          var maxLength = maximumLength || 100;
+          var queryValue = new URLSearchParams(window.location.search).get(queryName) || '';
+          var queryIsValid = queryValue.length >= 1 && queryValue.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(queryValue);
+          var value = queryIsValid
+            ? queryValue
+            : (sessionStorage.getItem(storageKey) || '');
+          if (value.length >= 1 && value.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(value)) {
+            sessionStorage.setItem(storageKey, value);
+            return value;
+          }
+          return 'unattributed';
+        }
+
         function sendPlaybackEvent(type, episode, position, duration, mediaType, extraParameters) {
+          if (type === 'play' && typeof window.tlkFireRtmarkPlayback === 'function') {
+            window.tlkFireRtmarkPlayback(mediaType + ':' + episode.episodeId);
+          }
           var numericPosition = Number(position) || 0;
           var numericDuration = Number(duration) || 0;
           var playbackPercent =
@@ -3598,6 +3697,9 @@ const renderPlaybackTracking = (episodes, countryCode) => {
               playbackPositionMs: Math.round(numericPosition),
               playbackDurationMs: Math.round(numericDuration),
               playbackPercent: playbackPercent,
+              zoneId: analyticsAttributionId('zoneid', 'tlk_analytics_zone'),
+              campaignId: analyticsAttributionId('campaignid', 'tlk_analytics_campaign'),
+              clickId: analyticsAttributionId('clickid', 'tlk_analytics_click', 200),
               referrer: document.referrer
             })
           }).catch(function () {});
@@ -4222,8 +4324,7 @@ const renderPageViewNotification = (delayMs = 3000) => `
           zoneId = 'unattributed';
         }
         var campaignKey = 'tlk_analytics_campaign';
-        var pageParams = new URLSearchParams(window.location.search);
-        var queryCampaignId = pageParams.get('campaignid') || pageParams.get('utm_campaign') || '';
+        var queryCampaignId = new URLSearchParams(window.location.search).get('campaignid') || '';
         var campaignId = /^[A-Za-z0-9._:-]{1,100}$/.test(queryCampaignId)
           ? queryCampaignId
           : (sessionStorage.getItem(campaignKey) || '');
@@ -4232,11 +4333,22 @@ const renderPageViewNotification = (delayMs = 3000) => `
         } else {
           campaignId = 'unattributed';
         }
+        var clickKey = 'tlk_analytics_click';
+        var queryClickId = new URLSearchParams(window.location.search).get('clickid') || '';
+        var clickId = /^[A-Za-z0-9._:-]{1,200}$/.test(queryClickId)
+          ? queryClickId
+          : (sessionStorage.getItem(clickKey) || '');
+        if (/^[A-Za-z0-9._:-]{1,200}$/.test(clickId)) {
+          sessionStorage.setItem(clickKey, clickId);
+        } else {
+          clickId = 'unattributed';
+        }
         var endpoint = '/analytics/page-view?path=' + encodeURIComponent(viewedPath) +
           '&referrer=' + encodeURIComponent(referrer) +
           '&session=' + encodeURIComponent(sessionId) +
           '&zone=' + encodeURIComponent(zoneId) +
-          '&campaign=' + encodeURIComponent(campaignId);
+          '&campaign=' + encodeURIComponent(campaignId) +
+          '&click=' + encodeURIComponent(clickId);
 
         fetch(endpoint, {
           method: 'POST',
@@ -4684,6 +4796,20 @@ const renderGoogleAnalytics = (measurementId) => {
     </script>`;
 };
 
+const renderRtmarkPlaybackTrigger = () => `
+    <script>
+      window.tlkFireRtmarkPlayback = window.tlkFireRtmarkPlayback || function (playbackKey) {
+        window.tlkRtmarkPlaybackKeys = window.tlkRtmarkPlaybackKeys || {};
+        var key = String(playbackKey || 'default');
+        if (window.tlkRtmarkPlaybackKeys[key]) return;
+        window.tlkRtmarkPlaybackKeys[key] = true;
+        var script = document.createElement('script');
+        script.src = 'https://my.rtmark.net/p.js?f=sync&lr=1&partner=96ea59e998e22896e3d7e9a91360ff21e00a45975501dab7879f2c256c0f8b17';
+        script.defer = true;
+        (document.head || document.documentElement).appendChild(script);
+      };
+    </script>`;
+
 const renderFacebookPixel = (pixelId) => {
   if (!pixelId) {
     return "";
@@ -4711,6 +4837,7 @@ const renderHead = ({
   extraHead = ""
 }) => `
   <head>
+    ${renderRtmarkPlaybackTrigger()}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer-when-downgrade" />
@@ -6531,6 +6658,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
   return `<!doctype html>
 <html lang="en">
   <head>
+    ${renderRtmarkPlaybackTrigger()}
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Listen to ${escapeHtml(episode.title)} on your preferred podcast platform.">
@@ -6621,14 +6749,25 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
       })();
       const analyticsCampaignId = (() => {
         const key = "tlk_analytics_campaign";
-        const params = new URLSearchParams(window.location.search);
-        const queryCampaignId = params.get("campaignid") || params.get("utm_campaign") || "";
+        const queryCampaignId = new URLSearchParams(window.location.search).get("campaignid") || "";
         const campaignId = /^[A-Za-z0-9._:-]{1,100}$/.test(queryCampaignId)
           ? queryCampaignId
           : (sessionStorage.getItem(key) || "");
         if (/^[A-Za-z0-9._:-]{1,100}$/.test(campaignId)) {
           sessionStorage.setItem(key, campaignId);
           return campaignId;
+        }
+        return "unattributed";
+      })();
+      const analyticsClickId = (() => {
+        const key = "tlk_analytics_click";
+        const queryClickId = new URLSearchParams(window.location.search).get("clickid") || "";
+        const clickId = /^[A-Za-z0-9._:-]{1,200}$/.test(queryClickId)
+          ? queryClickId
+          : (sessionStorage.getItem(key) || "");
+        if (/^[A-Za-z0-9._:-]{1,200}$/.test(clickId)) {
+          sessionStorage.setItem(key, clickId);
+          return clickId;
         }
         return "unattributed";
       })();
@@ -6662,6 +6801,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
               episodeTitle: ${safeJson(episode.title)},
               zoneId: analyticsZoneId,
               campaignId: analyticsCampaignId,
+              clickId: analyticsClickId,
               referrer: document.referrer
             }),
             keepalive: true
@@ -6684,6 +6824,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
             country_code: ${safeJson(countryCode)},
             zone_id: analyticsZoneId,
             campaign_id: analyticsCampaignId,
+            click_id: analyticsClickId,
             page_path: window.location.pathname
           };
           if (typeof percent === "number") parameters.percent_listened = percent;
@@ -6696,6 +6837,10 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
             : "spreaker_player_" + action;
           const eventName = baseEventName + "_${escapeHtml(countryCode)}";
           const parameters = playerEventParameters(state, action, percent);
+
+          if (action === "play") {
+            window.tlkFireRtmarkPlayback?.("spreaker:" + parameters.episode_id);
+          }
 
           window.dataLayer = window.dataLayer || [];
           window.gtag = window.gtag || function(){window.dataLayer.push(arguments);};
@@ -6727,6 +6872,7 @@ const renderEpisodeListenPage = (episode, episodes, analytics = {}, options = {}
               playbackPercent: typeof percent === "number" ? percent : (state.duration > 0 ? (state.position || 0) / state.duration * 100 : 0),
               zoneId: analyticsZoneId,
               campaignId: analyticsCampaignId,
+              clickId: analyticsClickId,
               referrer: document.referrer
             })
           }).catch(() => {});
@@ -7994,29 +8140,25 @@ export default {
       return Response.redirect(destination.toString(), 308);
     }
 
-    if (url.pathname === STATS_API_ENDPOINT || url.pathname === `${STATS_API_ENDPOINT}/`) {
-      if (request.method === "OPTIONS") {
-        return new Response(null, {
-          status: 204,
-          headers: {
-            allow: "GET, HEAD, OPTIONS",
-            "access-control-allow-origin": "*",
-            "access-control-allow-methods": "GET, HEAD, OPTIONS",
-            "access-control-allow-headers": "Authorization, Content-Type",
-            "cache-control": "no-store"
-          }
-        });
-      }
-      if (!isAdmin(request, env)) return statsApiUnauthorized(request);
-      return handleSpreakerStatsApi(request, env, url);
-    }
-
     if (url.pathname === STATS_ENDPOINT) {
       try {
         return await handleLandingPageStats(request, env, url);
       } catch (error) {
         console.error("Landing-page stats failed", error);
         return new Response("Unable to load landing-page stats", {
+          status: 500,
+          headers: { "cache-control": "no-store" }
+        });
+      }
+    }
+
+    if (url.pathname === STATS_REALTIME_ENDPOINT) {
+      if (!isAdmin(request, env)) return adminUnauthorized();
+      try {
+        return await handleSpreakerRealtime(request, env, url);
+      } catch (error) {
+        console.error("Real-time stats failed", error);
+        return Response.json({ error: "Unable to load real-time stats" }, {
           status: 500,
           headers: { "cache-control": "no-store" }
         });
@@ -8087,6 +8229,7 @@ export default {
           pagePath: viewedPath,
           zoneId: url.searchParams.get("zone"),
           campaignId: url.searchParams.get("campaign"),
+          clickId: url.searchParams.get("click"),
           referrer: analyticsReferrer
         }).catch((error) => {
           console.error("Unable to save page-view analytics", error);
